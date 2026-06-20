@@ -1,0 +1,81 @@
+# AgentKit
+
+Docker build your agent into a standard OCI image that serves an OpenAI `/v1`
+Chat-Completions façade (plus MCP tools). AIKit is Docker-for-models; AgentKit is
+Docker-for-agents.
+
+AgentKit is a [BuildKit](https://github.com/moby/buildkit) gateway frontend. You
+write an `agentkitfile.yaml` (`kind: Agent`) describing a model, instructions,
+and tools; `docker build` turns it into a normal, runnable container image. No
+new runtime, no orchestration — the output is an OCI image you ship anywhere.
+
+## The v0 agent (four keys)
+
+```yaml
+#syntax=ghcr.io/sozercan/agentkit/agentkit:latest
+apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: url-summarizer
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+  apiKeyEnv: OPENAI_API_KEY        # NAME of an env var, never the secret value
+instructions: |
+  Summarize any URL the user gives you in three bullet points.
+expose:
+  openai: true
+```
+
+Build and run it:
+
+```sh
+docker buildx build . -f agentkitfile.yaml -t url-summarizer:latest --load
+docker run --rm -p 127.0.0.1:8080:8080 -e OPENAI_API_KEY=$OPENAI_API_KEY url-summarizer:latest
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"https://example.com"}]}'
+```
+
+Add stdio MCP tools with a `tools:` list (see `test/agentkitfile-tools.yaml`).
+
+> **First-boot note.** v0 tools are stdio MCP servers launched at runtime via
+> `uvx`/`npx`. The *first* launch downloads and installs the server package before
+> it speaks MCP, so the initial container start can take 30–90s. The init timeout
+> defaults to 120s; tune it with `-e AGENTKIT_MCP_TIMEOUT=<seconds>`. (Building the
+> tool package into the image for instant, offline starts is a v1 item —
+> `build.resolvers`.)
+
+## Local dev loop (3 steps)
+
+AgentKit is itself a frontend image, so iterating means rebuilding the frontend,
+the runtime adapter, and a test agent that uses both:
+
+```sh
+make build-agentkit      # 1. frontend (gateway) image -> agentkit:test
+make build-serve         # 2. runtime adapter image    -> agentkit-serve:test
+make build-test-agent    # 3. test/agentkitfile-hello.yaml using both locals
+make run-test-agent      # run it (needs OPENAI_API_KEY)
+```
+
+`build-test-agent` pins the gateway with `--build-arg BUILDKIT_SYNTAX=agentkit:test`
+and overrides the adapter base with `--build-arg adapter=agentkit-serve:test`.
+
+## Architecture
+
+The runtime adapter (`agentkit-serve`, Python / pydantic-ai) is used as the LLB
+**base** image. The frontend resolves your `instructions` and `tools` into the
+frozen `/agent/agent.yaml` ABI (see `docs/agent-abi.md`) and merges that single
+layer on top. At runtime `agentkit-serve` reads it and serves the façade.
+
+## v0 scope / not yet
+
+- **v0**: one runtime (pydantic-ai), `provider: openai-compatible` only, stdio
+  `command` MCP tools, the OpenAI `/v1` façade, single OCI image output.
+- **Not yet**: image-based MCP tools, evals, lock file / SBOM / signing,
+  agentpack, a second runtime, `extends`/patches, knowledge/RAG, memory/state,
+  model fallback, streaming, and embedded/BYO serving targets.
+
+Secrets are never baked: `apiKeyEnv` and tool `env:` carry env var **names**;
+values are injected at `docker run` time.

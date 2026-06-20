@@ -1,0 +1,17 @@
+#syntax=agentkit:test
+# Canonical v0 "four keys" fixture (plan §4.1): model + instructions + expose,
+# no tools — the simplest agent that builds and serves. Build it against the
+# LOCAL frontend and adapter with `make build-test-agent`.
+apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: url-summarizer
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+  apiKeyEnv: OPENAI_API_KEY
+instructions: |
+  Summarize any URL the user gives you in three bullet points.
+expose:
+  openai: true

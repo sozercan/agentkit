@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentkit-serve"
+version = "0.0.0"
+description = "AgentKit runtime adapter: serves an OpenAI Chat-Completions facade backed by a pydantic-ai agent with stdio MCP tools."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "AgentKit" }]
+dependencies = [
+    "pydantic-ai>=0.0.40",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+agentkit-serve = "agentkit_serve.__main__:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["agentkit_serve"]

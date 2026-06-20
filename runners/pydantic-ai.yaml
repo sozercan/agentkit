@@ -1,0 +1,11 @@
+# AgentKit runtime catalog entry (v0) — documentation only.
+#
+# Purpose: names the "pydantic-ai" runtime adapter and its default adapter image.
+# The converter uses this adapter image as the LLB BASE and merges the resolved
+# /agent/agent.yaml layer on top; the image then serves the OpenAI /v1 façade.
+# Override the adapter per build with `--build-arg adapter=<ref>` (the local dev
+# loop points it at `agentkit-serve:test`). Nothing parses this file in v0 — it
+# is the human-readable catalog of the one runtime AgentKit ships.
+apiVersion: v1alpha1
+runtime: pydantic-ai
+adapter: ghcr.io/sozercan/agentkit/serve-pydantic-ai:latest

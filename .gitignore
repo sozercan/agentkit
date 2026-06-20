@@ -1,0 +1,20 @@
+# Go
+/bin/
+*.test
+*.out
+coverage.txt
+
+# Python / agentkit-serve
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# Editors / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/

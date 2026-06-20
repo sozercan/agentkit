@@ -1,0 +1,50 @@
+version: "2"
+run:
+  go: "1.26"
+linters:
+  default: none
+  enable:
+    - copyloopvar
+    - errcheck
+    - errorlint
+    - forcetypeassert
+    - goconst
+    - gocritic
+    - godot
+    - gosec
+    - govet
+    - ineffassign
+    - misspell
+    - revive
+    - staticcheck
+    - unconvert
+    - unused
+    - whitespace
+  settings:
+    lll:
+      line-length: 200
+    misspell:
+      locale: US
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  enable:
+    - gci
+    - gofmt
+    - gofumpt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

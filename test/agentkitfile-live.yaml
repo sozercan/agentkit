@@ -1,0 +1,33 @@
+#syntax=agentkit:test
+#
+# Live end-to-end fixture (plan §6.5 — compose with a co-located model over /v1).
+#
+# This was used to drive a REAL prompt through a deployed agent image to a real
+# OpenAI-compatible model and back (a single collapsed chat.completion). The
+# baseURL points at a co-located OpenAI-compatible endpoint on a shared Docker
+# network — set it to wherever your model is:
+#   * a co-located AIKit model container (the canonical §6.5 story), or
+#   * any OpenAI-compatible gateway reachable from the agent container.
+#
+# Run (example):
+#   docker network create aknet
+#   # start your model/gateway on aknet, reachable as host `model:9000`
+#   docker buildx build --builder desktop-linux . -f test/agentkitfile-live.yaml \
+#     --build-arg BUILDKIT_SYNTAX=agentkit:test --build-arg adapter=agentkit-serve:test \
+#     --platform linux/amd64 -t live-agent:test --load --provenance=false
+#   docker run -d --name live-agent --network aknet -e MODEL_API_KEY=... live-agent:test
+#   # then POST /v1/chat/completions to the agent (binds container-loopback by default)
+apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: live-e2e-agent
+model:
+  provider: openai-compatible
+  baseURL: http://model:9000/v1      # a co-located OpenAI-compatible model on the shared network (§6.5)
+  name: gpt-4o-mini-2024-07-18
+  apiKeyEnv: MODEL_API_KEY            # NAME only; value injected at `docker run -e MODEL_API_KEY=...`
+instructions: |
+  SENTINEL_INSTRUCTION_42: You are the AgentKit live-e2e agent.
+  Always answer in exactly one short sentence, and end with the token DONE42.
+expose:
+  openai: true
