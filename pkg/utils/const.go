@@ -10,8 +10,14 @@ const (
 	// KindAgent is the config discriminator for an agent build (see §5.1).
 	KindAgent = "Agent"
 
-	// RuntimePydanticAI is the only runtime adapter wired in v0.
+	// RuntimePydanticAI is the default runtime adapter (the v0 runtime).
 	RuntimePydanticAI = "pydantic-ai"
+
+	// RuntimeMAF is the Microsoft Agent Framework runtime adapter (runtime #2).
+	RuntimeMAF = "microsoft-agent-framework"
+	// RuntimeMAFAlias is a short, convenient alias for RuntimeMAF that users may
+	// write in `runtime:`; it resolves to RuntimeMAF (see CanonicalRuntime).
+	RuntimeMAFAlias = "maf"
 
 	// ProviderOpenAICompatible is the only model provider supported in v0.
 	ProviderOpenAICompatible = "openai-compatible"

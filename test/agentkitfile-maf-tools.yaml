@@ -1,0 +1,25 @@
+#syntax=agentkit:test
+# The stdio-MCP tool fixture (plan §10.3 #6) under the Microsoft Agent Framework
+# runtime: the same four keys plus ONE stdio MCP server declared as a `command`
+# (v0 supports command tools only). agentkit-serve-maf spawns the subprocess at
+# runtime via MAF's MCPStdioTool; nothing is baked into the image but the tool's
+# argv and declared env var NAMES. Identical to test/agentkitfile-tools.yaml
+# except for the `runtime:` line.
+apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: fetch-summarizer
+runtime: microsoft-agent-framework   # alias: maf
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+  apiKeyEnv: OPENAI_API_KEY
+instructions: |
+  Summarize any URL the user gives you in three bullet points.
+  Use the fetch tool to retrieve the page contents first.
+tools:
+  - name: fetch
+    command: ["uvx", "mcp-server-fetch"]
+expose:
+  openai: true

@@ -168,3 +168,56 @@ expose:
 		t.Fatalf("expected v0 rejection of image-based tool, got: %v", verr)
 	}
 }
+
+// agentBaseYAML returns a minimal valid four-keys agentkitfile with the given
+// `runtime:` line spliced in (empty string omits it).
+func agentBaseYAML(runtimeLine string) []byte {
+	rt := ""
+	if runtimeLine != "" {
+		rt = "runtime: " + runtimeLine + "\n"
+	}
+	return []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: rt-agent
+` + rt + `model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+  apiKeyEnv: OPENAI_API_KEY
+instructions: hi
+expose:
+  openai: true
+`)
+}
+
+// TestValidateAcceptsRegisteredRuntimes proves the widened runtime gate (plan §8):
+// the canonical MAF name, its "maf" alias, the default runtime, and an omitted
+// runtime all validate.
+func TestValidateAcceptsRegisteredRuntimes(t *testing.T) {
+	for _, rt := range []string{"", "pydantic-ai", "microsoft-agent-framework", "maf"} {
+		cfg, err := NewFromBytes(agentBaseYAML(rt))
+		if err != nil {
+			t.Fatalf("runtime %q: parse error: %v", rt, err)
+		}
+		if verr := cfg.Validate(); verr != nil {
+			t.Errorf("runtime %q: expected valid, got: %v", rt, verr)
+		}
+	}
+}
+
+// TestValidateRejectsUnknownRuntime keeps the deterministic gate: an unregistered
+// runtime is a clear error that lists the supported set.
+func TestValidateRejectsUnknownRuntime(t *testing.T) {
+	cfg, err := NewFromBytes(agentBaseYAML("langchain"))
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	verr := cfg.Validate()
+	if verr == nil || !strings.Contains(verr.Error(), "runtime") {
+		t.Fatalf("expected unknown-runtime rejection, got: %v", verr)
+	}
+	if !strings.Contains(verr.Error(), "microsoft-agent-framework") {
+		t.Errorf("error should list supported runtimes; got: %v", verr)
+	}
+}

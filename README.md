@@ -47,6 +47,27 @@ Add stdio MCP tools with a `tools:` list (see `test/agentkitfile-tools.yaml`).
 > tool package into the image for instant, offline starts is a v1 item —
 > `build.resolvers`.)
 
+## Runtimes
+
+The agentkitfile is **target-neutral**: it describes the agent (model,
+instructions, tools), and *which agent library executes it* is a swappable
+implementation detail behind a frozen ABI (`docs/agent-abi.md`). Select one with
+the optional `runtime:` key:
+
+| `runtime:` value | Adapter | Framework |
+|---|---|---|
+| *(omitted)* / `pydantic-ai` | `agentkit-serve` | [pydantic-ai](https://ai.pydantic.dev) (default) |
+| `microsoft-agent-framework` (alias `maf`) | `agentkit-serve-maf` | [Microsoft Agent Framework](https://github.com/microsoft/agent-framework) |
+
+```yaml
+runtime: microsoft-agent-framework   # or: maf
+```
+
+Both runtimes consume the **same** baked `/agent/agent.yaml` and serve the
+**same** non-streaming OpenAI `/v1` façade with the same guards — so the same
+agentkitfile produces a behavior-compatible image under either. Only the in-image
+runtime adapter differs. The `AGENTKIT_MCP_TIMEOUT` knob applies to both.
+
 ## Local dev loop (3 steps)
 
 AgentKit is itself a frontend image, so iterating means rebuilding the frontend,
@@ -62,20 +83,32 @@ make run-test-agent      # run it (needs OPENAI_API_KEY)
 `build-test-agent` pins the gateway with `--build-arg BUILDKIT_SYNTAX=agentkit:test`
 and overrides the adapter base with `--build-arg adapter=agentkit-serve:test`.
 
+To iterate on the **Microsoft Agent Framework** runtime instead, build its adapter
+and target it with `RUNTIME=maf` (which also selects the MAF fixture and output
+tag):
+
+```sh
+make build-serve-maf                      # agentkit-serve-maf:test
+make build-test-agent RUNTIME=maf         # test/agentkitfile-maf-hello.yaml -> maf-agent:test
+```
+
 ## Architecture
 
-The runtime adapter (`agentkit-serve`, Python / pydantic-ai) is used as the LLB
-**base** image. The frontend resolves your `instructions` and `tools` into the
-frozen `/agent/agent.yaml` ABI (see `docs/agent-abi.md`) and merges that single
-layer on top. At runtime `agentkit-serve` reads it and serves the façade.
+The runtime adapter (`agentkit-serve`, Python) is used as the LLB **base** image.
+The frontend resolves your `instructions` and `tools` into the frozen
+`/agent/agent.yaml` ABI (see `docs/agent-abi.md`) and merges that single layer on
+top. At runtime the adapter reads it and serves the façade. Which adapter is used
+as the base is chosen by `runtime:` (see [Runtimes](#runtimes)); the baked
+`/agent/agent.yaml` is identical across runtimes.
 
 ## v0 scope / not yet
 
-- **v0**: one runtime (pydantic-ai), `provider: openai-compatible` only, stdio
-  `command` MCP tools, the OpenAI `/v1` façade, single OCI image output.
+- **v0**: two runtimes (pydantic-ai default + microsoft-agent-framework),
+  `provider: openai-compatible` only, stdio `command` MCP tools, the OpenAI `/v1`
+  façade, single OCI image output.
 - **Not yet**: image-based MCP tools, evals, lock file / SBOM / signing,
-  agentpack, a second runtime, `extends`/patches, knowledge/RAG, memory/state,
-  model fallback, streaming, and embedded/BYO serving targets.
+  agentpack, `extends`/patches, knowledge/RAG, memory/state, model fallback,
+  streaming, and embedded/BYO serving targets.
 
 Secrets are never baked: `apiKeyEnv` and tool `env:` carry env var **names**;
 values are injected at `docker run` time.

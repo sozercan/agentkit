@@ -30,6 +30,27 @@ BUILDER ?= desktop-linux
 # amd64-only), so the test agent is built for the same platform.
 PLATFORM ?= linux/amd64
 
+# RUNTIME selects which runtime adapter the test-agent targets: `pydantic-ai`
+# (default) or the Microsoft Agent Framework, named either `maf` (alias) or
+# `microsoft-agent-framework` (canonical) — both are accepted. build-test-agent
+# derives the adapter image, the fixture, and the output tag from it, so you can
+# build the SAME logical agent under either runtime (the §10.4 equivalence proof):
+#   make build-serve build-test-agent                 # pydantic-ai → hello-agent
+#   make build-serve-maf build-test-agent RUNTIME=maf # MAF         → maf-agent
+RUNTIME ?= pydantic-ai
+# Per-runtime adapter image, fixture, and output tag (overridable). The MAF branch
+# matches BOTH spellings via $(filter ...) so the canonical name does not silently
+# fall through to the pydantic-ai default.
+ifneq ($(filter maf microsoft-agent-framework,$(RUNTIME)),)
+SERVE_IMAGE ?= agentkit-serve-maf:$(TAG)
+FIXTURE     ?= test/agentkitfile-maf-hello.yaml
+AGENT_IMAGE ?= maf-agent:$(TAG)
+else
+SERVE_IMAGE ?= agentkit-serve:$(TAG)
+FIXTURE     ?= test/agentkitfile-hello.yaml
+AGENT_IMAGE ?= hello-agent:$(TAG)
+endif
+
 # LDFLAGS is passed into the frontend image build. Kept empty by default; the
 # Dockerfile always appends `-w -s -extldflags '-static'`. Override to inject
 # version stamping, e.g. `make build-agentkit LDFLAGS=-X main.version=$(TAG)`.
@@ -57,19 +78,27 @@ build-agentkit:
 build-serve:
 	docker buildx build agentkit-serve -t agentkit-serve:$(TAG) --load
 
-# Build the canonical test agent from test/agentkitfile-hello.yaml against the
-# LOCAL frontend (BUILDKIT_SYNTAX) and the LOCAL adapter (--build-arg adapter).
+# Build the Microsoft Agent Framework runtime adapter (agentkit-serve-maf) image.
+# This is the LLB base used when an agentkitfile selects
+# `runtime: microsoft-agent-framework` (alias `maf`).
+.PHONY: build-serve-maf
+build-serve-maf:
+	docker buildx build agentkit-serve-maf -t agentkit-serve-maf:$(TAG) --load
+
+# Build a test agent against the LOCAL frontend (BUILDKIT_SYNTAX) and the LOCAL
+# adapter (--build-arg adapter). The runtime, fixture, adapter image, and output
+# tag all derive from RUNTIME (default pydantic-ai; `RUNTIME=maf` for MAF).
 # --provenance=false keeps the output a plain single-platform image for --load.
 .PHONY: build-test-agent
 build-test-agent:
-	docker buildx build --builder $(BUILDER) . -f test/agentkitfile-hello.yaml \
+	docker buildx build --builder $(BUILDER) . -f $(FIXTURE) \
 		--build-arg BUILDKIT_SYNTAX=agentkit:$(TAG) \
-		--build-arg adapter=agentkit-serve:$(TAG) \
+		--build-arg adapter=$(SERVE_IMAGE) \
 		--platform $(PLATFORM) \
-		-t hello-agent:$(TAG) --load --provenance=false
+		-t $(AGENT_IMAGE) --load --provenance=false
 
 # Run the built test agent. Expects OPENAI_API_KEY in the environment; the agent
 # binds 127.0.0.1 inside the container and serves the OpenAI /v1 façade on :8080.
 .PHONY: run-test-agent
 run-test-agent:
-	docker run --rm --platform $(PLATFORM) -p 127.0.0.1:8080:8080 -e OPENAI_API_KEY=$$OPENAI_API_KEY hello-agent:$(TAG)
+	docker run --rm --platform $(PLATFORM) -p 127.0.0.1:8080:8080 -e OPENAI_API_KEY=$$OPENAI_API_KEY $(AGENT_IMAGE)

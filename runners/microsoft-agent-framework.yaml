@@ -1,0 +1,13 @@
+# AgentKit runtime catalog entry — documentation only.
+#
+# Purpose: names the "microsoft-agent-framework" runtime adapter (alias: "maf")
+# and its default adapter image. The converter uses this adapter image as the LLB
+# BASE and merges the resolved /agent/agent.yaml layer on top; the image then
+# serves the same OpenAI /v1 façade as the pydantic-ai runtime — byte-for-byte ABI
+# compatible. Select it from an agentkitfile with `runtime: microsoft-agent-framework`
+# (or `runtime: maf`). Override the adapter per build with `--build-arg adapter=<ref>`
+# (the local dev loop points it at `agentkit-serve-maf:test`). Nothing parses this
+# file in v0 — it is the human-readable catalog entry for this runtime.
+apiVersion: v1alpha1
+runtime: microsoft-agent-framework
+adapter: ghcr.io/sozercan/agentkit/serve-maf:latest

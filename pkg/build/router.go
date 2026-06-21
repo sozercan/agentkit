@@ -59,6 +59,37 @@ func init() {
 		Name:              utils.RuntimePydanticAI,
 		defaultAdapterRef: "ghcr.io/sozercan/agentkit/serve-pydantic-ai:latest",
 	})
+	registerRuntime(&RuntimeConfig{
+		Name:              utils.RuntimeMAF, // "microsoft-agent-framework" (alias: "maf")
+		defaultAdapterRef: "ghcr.io/sozercan/agentkit/serve-maf:latest",
+	})
+
+	// Lockstep guard: the wired adapter registry MUST match utils' canonical
+	// runtime set, so adding a name in one place but forgetting the other fails
+	// loudly at startup rather than producing a runtime that validates but has no
+	// adapter (or vice versa).
+	for _, name := range utils.KnownRuntimes() {
+		if _, ok := runtimes[name]; !ok {
+			panic("build: runtime " + name + " is in utils.KnownRuntimes but has no registered adapter")
+		}
+	}
+	for name := range runtimes {
+		if !utils.IsKnownRuntime(name) {
+			panic("build: registered adapter " + name + " is not in utils.KnownRuntimes")
+		}
+	}
+}
+
+// IsRegisteredRuntime reports whether name (after alias resolution) has a wired
+// runtime adapter in THIS package's registry. It is a build-package predicate
+// over the adapter set — NOT the validator's seam: pkg/agentkit/config validates
+// runtimes via utils.IsKnownRuntime instead, because config importing build would
+// form a config→build import cycle (build imports config). The init() lockstep
+// guard above keeps this registry and utils' canonical set in agreement, so the
+// two predicates never disagree about which runtimes exist (plan §8 / Open Q4).
+func IsRegisteredRuntime(name string) bool {
+	_, ok := runtimes[utils.CanonicalRuntime(name)]
+	return ok
 }
 
 // defaultRuntime returns the runtime to use when the config does not name one.
@@ -77,10 +108,19 @@ func lookupRoute(target, runtime string) (matched string, route Route, rc *Runti
 	if runtime == "" {
 		runtime = defaultRuntime()
 	}
+	// Resolve a user-written alias (e.g. "maf") to its canonical name so the
+	// registry lookup and the "<runtime>/image" route key always agree.
+	runtime = utils.CanonicalRuntime(runtime)
 	rc, rcOK := runtimes[runtime]
 	if !rcOK {
 		return "", Route{}, nil, false
 	}
+
+	// The target may ALSO name the runtime by alias — either bare ("maf") or as
+	// the leading route segment ("maf/image"). Route keys are canonical, so
+	// canonicalize the target's runtime segment before any comparison/lookup, or
+	// an alias target would miss every branch and fail to route.
+	target = canonicalizeTargetRuntime(target)
 
 	// Empty or bare-runtime target → the runtime's image route.
 	if target == "" || target == runtime {
@@ -107,4 +147,21 @@ func lookupRoute(target, runtime string) (matched string, route Route, rc *Runti
 	}
 
 	return "", Route{}, nil, false
+}
+
+// canonicalizeTargetRuntime rewrites the runtime portion of a build target to its
+// canonical name, so an alias target ("maf" or "maf/image") matches the
+// canonically-keyed routes. The first "/"-separated segment is the runtime; any
+// remainder (the output kind) is preserved verbatim. An empty target is returned
+// unchanged.
+func canonicalizeTargetRuntime(target string) string {
+	if target == "" {
+		return ""
+	}
+	seg, rest, hasRest := strings.Cut(target, "/")
+	canon := utils.CanonicalRuntime(seg)
+	if hasRest {
+		return canon + "/" + rest
+	}
+	return canon
 }

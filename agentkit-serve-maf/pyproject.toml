@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentkit-serve-maf"
+version = "0.0.0"
+description = "AgentKit runtime adapter (Microsoft Agent Framework): OpenAI /v1 facade over a MAF agent with stdio MCP tools."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "AgentKit" }]
+dependencies = [
+    # Microsoft Agent Framework — MINIMAL slice only (plan §12 lock-in boundary):
+    # core + the OpenAI chat client. NEVER an azure/foundry/copilotstudio package.
+    "agent-framework-core>=1.9,<2",
+    # NOTE: agent-framework-openai's latest is 1.8.2 (verified in the M0 spike);
+    # the plan's >=1.9 pin would fail to resolve. Pin >=1.8,<2.
+    "agent-framework-openai>=1.8,<2",
+    # The MCP SDK is NOT a transitive dependency of agent-framework-core — it is
+    # lazily imported by agent_framework._mcp and only bundled via the heavy
+    # `[all]` extra (which drags in azure/foundry). Declare it directly so stdio
+    # MCP tools work without crossing the lock-in boundary. (Verified in M0.)
+    "mcp>=1.24,<2",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+agentkit-serve = "agentkit_serve.__main__:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["agentkit_serve"]

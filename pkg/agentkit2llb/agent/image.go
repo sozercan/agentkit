@@ -54,11 +54,12 @@ func NewImageConfig(cfg *config.AgentConfig, platform *specs.Platform) *specs.Im
 	return img
 }
 
-// runtimeLabel returns the runtime name for the image label, defaulting to the
-// v0 runtime when unset.
+// runtimeLabel returns the canonical runtime name for the image label,
+// defaulting to the v0 runtime when unset and resolving any alias (e.g. "maf")
+// to its canonical form so the label is stable across spellings.
 func runtimeLabel(cfg *config.AgentConfig) string {
 	if cfg.Runtime != "" {
-		return cfg.Runtime
+		return utils.CanonicalRuntime(cfg.Runtime)
 	}
 	return utils.RuntimePydanticAI
 }

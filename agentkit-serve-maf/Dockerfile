@@ -1,17 +1,22 @@
 # syntax=docker/dockerfile:1
 #
-# agentkit-serve ADAPTER image.
+# agentkit-serve-maf ADAPTER image (Microsoft Agent Framework runtime).
 #
 # This is the runtime adapter the AgentKit Go converter uses as the LLB BASE
-# image: the converter pulls this image and merges the resolved /agent/agent.yaml
-# layer on top. It is also runnable standalone (ENTRYPOINT + CMD below).
+# image when an agentkitfile selects `runtime: microsoft-agent-framework`: the
+# converter pulls this image and merges the resolved /agent/agent.yaml layer on
+# top. It is also runnable standalone (ENTRYPOINT + CMD below).
 #
-# It bundles BOTH a Python runtime (for agentkit-serve / pydantic-ai) AND Node.js
-# + npx and uv/uvx, so stdio MCP servers distributed on npm (`npx -y ...`) or
-# PyPI (`uvx ...`) can be spawned as tool subprocesses.
+# It bundles BOTH a Python runtime (for the MAF agent) AND Node.js + npx and
+# uv/uvx, so stdio MCP servers distributed on npm (`npx -y ...`) or PyPI
+# (`uvx ...`) can be spawned as tool subprocesses.
 #
 # No secret is ever baked in: agent.yaml carries env var NAMES only; values are
 # injected at runtime via `docker run -e`.
+#
+# Dependency lock-in boundary (plan §12): the installed Python deps are MAF core +
+# the OpenAI chat client + the MCP SDK only — NEVER an azure/foundry/copilotstudio
+# package. The `pip install .` below resolves exactly pyproject.toml's deps.
 
 FROM python:3.12-slim-bookworm
 
@@ -36,8 +41,10 @@ ENV AGENTKIT_ROOT=/opt/agentkit \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-# --- install agentkit-serve into a dedicated venv at /opt/agentkit -----------
+# --- install agentkit-serve-maf into a dedicated venv at /opt/agentkit -------
 # The console script lands at /opt/agentkit/bin/agentkit-serve (== ServeBinary).
+# pyproject deps: agent-framework-core, agent-framework-openai, mcp, fastapi,
+# uvicorn, pydantic, pyyaml.
 WORKDIR /src
 COPY pyproject.toml README.md ./
 COPY agentkit_serve ./agentkit_serve
