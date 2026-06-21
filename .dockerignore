@@ -1,10 +1,20 @@
+# Build context excludes for the repo-root-context builds: the Go frontend image
+# (Dockerfile) AND both Python adapter images (agentkit-serve[-maf]/Dockerfile,
+# built with `-f` from repo root — see the Makefile). Keep the uploaded context
+# small and never ship local venvs/caches into an image layer.
 .git
 bin
 *.test
 coverage.txt
-agentkit-serve/.venv
+
+# Python virtualenvs (any adapter or the shared core) + byte/cache artifacts.
+**/.venv
 **/__pycache__
-**/*.pyc
+**/*.py[cod]
+**/*.egg-info
 .ruff_cache
 .mypy_cache
 .pytest_cache
+
+# Editor / OS noise.
+.DS_Store

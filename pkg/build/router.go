@@ -42,7 +42,8 @@ func (rc *RuntimeConfig) AdapterRef(opts map[string]string) string {
 }
 
 // routes maps "<runtime>/<outputkind>" to a handler. runtimes maps a runtime
-// name to its config. Both are populated in init() — dispatch as data.
+// name to its config. Both are DERIVED in init() from utils.Runtimes (the single
+// source of truth) — dispatch as data.
 var (
 	routes   = map[string]Route{}
 	runtimes = map[string]*RuntimeConfig{}
@@ -55,38 +56,24 @@ func registerRuntime(rc *RuntimeConfig) {
 }
 
 func init() {
-	registerRuntime(&RuntimeConfig{
-		Name:              utils.RuntimePydanticAI,
-		defaultAdapterRef: "ghcr.io/sozercan/agentkit/serve-pydantic-ai:latest",
-	})
-	registerRuntime(&RuntimeConfig{
-		Name:              utils.RuntimeMAF, // "microsoft-agent-framework" (alias: "maf")
-		defaultAdapterRef: "ghcr.io/sozercan/agentkit/serve-maf:latest",
-	})
-
-	// Lockstep guard: the wired adapter registry MUST match utils' canonical
-	// runtime set, so adding a name in one place but forgetting the other fails
-	// loudly at startup rather than producing a runtime that validates but has no
-	// adapter (or vice versa).
-	for _, name := range utils.KnownRuntimes() {
-		if _, ok := runtimes[name]; !ok {
-			panic("build: runtime " + name + " is in utils.KnownRuntimes but has no registered adapter")
-		}
-	}
-	for name := range runtimes {
-		if !utils.IsKnownRuntime(name) {
-			panic("build: registered adapter " + name + " is not in utils.KnownRuntimes")
-		}
+	// Derive the wiring from the single canonical declaration in pkg/utils. Adding
+	// a runtime is one RuntimeSpec literal there — nothing changes here. (No
+	// lockstep guard is needed: there is exactly one source of truth, not two
+	// registries to reconcile.)
+	for _, rt := range utils.Runtimes {
+		registerRuntime(&RuntimeConfig{
+			Name:              rt.Name,
+			defaultAdapterRef: rt.DefaultAdapterRef,
+		})
 	}
 }
 
 // IsRegisteredRuntime reports whether name (after alias resolution) has a wired
-// runtime adapter in THIS package's registry. It is a build-package predicate
-// over the adapter set — NOT the validator's seam: pkg/agentkit/config validates
-// runtimes via utils.IsKnownRuntime instead, because config importing build would
-// form a config→build import cycle (build imports config). The init() lockstep
-// guard above keeps this registry and utils' canonical set in agreement, so the
-// two predicates never disagree about which runtimes exist (plan §8 / Open Q4).
+// runtime adapter. The wiring is derived from utils.Runtimes, so this agrees with
+// utils.IsKnownRuntime by construction. It is a build-package predicate over the
+// adapter set; the config validator uses utils.IsKnownRuntime instead (config
+// importing build would form a config→build import cycle, since build imports
+// config).
 func IsRegisteredRuntime(name string) bool {
 	_, ok := runtimes[utils.CanonicalRuntime(name)]
 	return ok
@@ -94,7 +81,7 @@ func IsRegisteredRuntime(name string) bool {
 
 // defaultRuntime returns the runtime to use when the config does not name one.
 func defaultRuntime() string {
-	return utils.RuntimePydanticAI
+	return utils.DefaultRuntime()
 }
 
 // lookupRoute resolves a build target plus the effective runtime to a route and

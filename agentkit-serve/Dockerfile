@@ -38,11 +38,18 @@ ENV AGENTKIT_ROOT=/opt/agentkit \
 
 # --- install agentkit-serve into a dedicated venv at /opt/agentkit -----------
 # The console script lands at /opt/agentkit/bin/agentkit-serve (== ServeBinary).
+# Build context is the REPO ROOT (see Makefile `build-serve`), so paths are
+# repo-root-relative. The shared framework-neutral core (agentkit_serve_common,
+# brings fastapi/uvicorn/pydantic/pyyaml) is installed FIRST so the adapter's
+# `agentkit-serve-common` dependency is already satisfied; then the adapter adds
+# its framework dep (pydantic-ai).
 WORKDIR /src
-COPY pyproject.toml README.md ./
-COPY agentkit_serve ./agentkit_serve
+COPY agentkit_serve_common ./agentkit_serve_common
+COPY agentkit-serve/pyproject.toml agentkit-serve/README.md ./
+COPY agentkit-serve/agentkit_serve ./agentkit_serve
 RUN python -m venv /opt/agentkit \
     && /opt/agentkit/bin/pip install --upgrade pip \
+    && /opt/agentkit/bin/pip install ./agentkit_serve_common \
     && /opt/agentkit/bin/pip install . \
     && { /opt/agentkit/bin/agentkit-serve --help >/dev/null 2>&1 || true; }
 

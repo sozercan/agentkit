@@ -11,6 +11,14 @@ Verified against the INSTALLED pydantic-ai (1.107.x). Key facts baked in here:
 
 The agent OWNS its system prompt (spec.instructions) and its tools — request-side
 tools are rejected by the server, never merged here.
+
+This module is the ONLY framework-specific surface of the adapter. It exposes a
+NEUTRAL run contract that ``agentkit_serve_common.server`` consumes —
+``build_agent`` + ``run_agent`` (the :class:`RuntimeFactory` protocol) — so the
+shared server imports nothing from ``pydantic_ai``. That neutral seam is identical
+across runtimes (it matches the MAF adapter's), which is what lets the ABI loader,
+the ``/v1`` facade, and the CLI live in ``agentkit_serve_common`` (packaging
+option B).
 """
 
 from __future__ import annotations
@@ -22,12 +30,22 @@ from pydantic_ai.mcp import MCPServerStdio
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
-from .config import AgentSpec, ToolSpec
+from agentkit_serve_common.config import AgentSpec, ToolSpec
+from agentkit_serve_common.runtime import AgentRunError, RunResult
+
+# pydantic-ai surfaces upstream HTTP failures as ModelHTTPError (has .status_code).
+try:  # pragma: no cover - import shape guard across pydantic-ai versions
+    from pydantic_ai.exceptions import ModelHTTPError
+except Exception:  # pragma: no cover
+    ModelHTTPError = None  # type: ignore[assignment]
 
 # Placeholder API key for OpenAI-compatible endpoints that need no auth (many
 # local servers reject an EMPTY string but accept any non-empty token). Used only
 # when the spec declares no apiKeyEnv. Never a real secret.
 _NO_AUTH_PLACEHOLDER = "not-needed"
+
+# Roles forwarded from the request history into the pydantic-ai conversation.
+_FORWARDED_ROLES = frozenset({"system", "user", "assistant"})
 
 # Seconds to wait for a stdio MCP server's initialize handshake. pydantic-ai's
 # default is 5s, which is too tight for a COLD `uvx`/`npx` tool: the first launch
@@ -122,3 +140,92 @@ def build_agent(spec: AgentSpec) -> Agent:
         instructions=spec.instructions,
         toolsets=toolsets,
     )
+
+
+def _to_message_history(history: list[tuple[str, str]] | None) -> list:
+    """Map neutral ``(role, text)`` tuples to a pydantic-ai message_history list.
+
+    The agent's own ``instructions`` are applied by pydantic-ai; this mirrors the
+    server's previous inline ``_split_conversation`` mapping exactly.
+    """
+    # Imported lazily so config-only consumers don't pull the messages module.
+    from pydantic_ai.messages import (
+        ModelRequest,
+        ModelResponse,
+        SystemPromptPart,
+        TextPart,
+        UserPromptPart,
+    )
+
+    out: list = []
+    for role, text in history or []:
+        if not text or role not in _FORWARDED_ROLES:
+            continue
+        if role == "user":
+            out.append(ModelRequest(parts=[UserPromptPart(content=text)]))
+        elif role == "system":
+            out.append(ModelRequest(parts=[SystemPromptPart(content=text)]))
+        elif role == "assistant":
+            out.append(ModelResponse(parts=[TextPart(content=text)]))
+    return out
+
+
+def _status_of(exc: Exception) -> int:
+    """Best-effort upstream HTTP status from a model/SDK error (else 502).
+
+    pydantic-ai surfaces upstream HTTP failures as ``ModelHTTPError`` with a
+    ``.status_code``; map it through so a real upstream 4xx/5xx is preserved.
+    """
+    if ModelHTTPError is not None and isinstance(exc, ModelHTTPError):
+        code = getattr(exc, "status_code", 502)
+        return int(code) if code else 502
+    return 502
+
+
+def _result_text(result: object) -> str:
+    """Extract the final assistant text from a pydantic-ai run result."""
+    output = getattr(result, "output", None)
+    return output if isinstance(output, str) else str(output)
+
+
+def _result_usage(result: object) -> dict[str, int]:
+    """Best-effort OpenAI usage block from the pydantic-ai run result (zeros if unknown)."""
+    try:
+        usage = result.usage
+        # In current pydantic-ai ``usage`` is a property returning a RunUsage; in
+        # older builds it was a method. Prefer the property value; only call it if
+        # we got a bare callable WITHOUT the token attributes (the real method).
+        if not hasattr(usage, "input_tokens") and callable(usage):
+            usage = usage()
+        prompt_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+        completion_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+    except Exception:
+        prompt_tokens = completion_tokens = 0
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+
+
+async def run_agent(agent: Agent, prompt: str, history: list[tuple[str, str]] | None = None) -> RunResult:
+    """Framework-agnostic run helper so ``server.py`` stays identical across adapters.
+
+    Accepts the neutral ``(history, prompt)`` the server produces, runs the
+    pydantic-ai agent once (non-streaming), and returns a neutral :class:`RunResult`.
+    Any framework/model error is normalized to :class:`AgentRunError` carrying an
+    HTTP status, so the server never imports a framework or SDK exception type.
+    """
+    message_history = _to_message_history(history)
+    try:
+        result = await agent.run(prompt, message_history=message_history)
+    except Exception as exc:  # noqa: BLE001 — normalized for the façade
+        # Preserve the original framework exception's class name in error.code
+        # (the pre-shared-core behavior); _status_of maps ModelHTTPError → status.
+        raise AgentRunError(
+            f"agent run failed: {exc}",
+            status=_status_of(exc),
+            code=exc.__class__.__name__,
+        ) from exc
+    return RunResult(text=_result_text(result), usage=_result_usage(result))
+

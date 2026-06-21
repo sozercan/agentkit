@@ -101,6 +101,21 @@ top. At runtime the adapter reads it and serves the façade. Which adapter is us
 as the base is chosen by `runtime:` (see [Runtimes](#runtimes)); the baked
 `/agent/agent.yaml` is identical across runtimes.
 
+Each adapter is a thin shell over a shared core:
+
+- `agentkit_serve_common/` — the **framework-neutral** package: the `agent.yaml`
+  ABI loader, the OpenAI `/v1` façade, the CLI/network posture, and the neutral run
+  contract (`RunResult`, `AgentRunError`, the `RuntimeFactory` protocol). Imports no
+  agent framework.
+- `agentkit-serve/`, `agentkit-serve-maf/` — each ships only an `agent_factory.py`
+  (the one file that imports its framework) implementing `RuntimeFactory`, plus a
+  thin `__main__.py`. They stay **separate images** with disjoint framework deps —
+  that physical separation is what guarantees the lock-in boundary.
+
+Adding a single-agent runtime is therefore one `agent_factory.py` + one Go
+`utils.RuntimeSpec` entry; it inherits the shared `/v1` façade and the conformance
+test suite for free.
+
 ## v0 scope / not yet
 
 - **v0**: two runtimes (pydantic-ai default + microsoft-agent-framework),

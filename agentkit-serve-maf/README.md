@@ -20,10 +20,13 @@ agentkit-serve --config /agent/agent.yaml
 
 ## What is and isn't framework-specific
 
-Only `agent_factory.py` imports MAF. `config.py`, `server.py`, and `__main__.py`
-are framework-agnostic (identical in shape to the pydantic-ai adapter): the run is
-driven through `agent_factory.run_agent`, which returns a neutral `RunResult`. This
-is the seam that lets the common core be shared across runtimes later.
+This adapter ships ONLY `agent_factory.py` (which imports MAF) plus a thin
+`__main__.py`. The framework-neutral core — the `/agent/agent.yaml` ABI loader, the
+OpenAI `/v1` facade, and the CLI/network posture — lives in the shared
+`agentkit-serve-common` package. `agent_factory` satisfies that package's
+`RuntimeFactory` protocol (`build_agent` + `run_agent` → a neutral `RunResult`),
+which is the seam that keeps the shared core framework-agnostic.
+
 
 ## Lock-in boundary (plan §12)
 

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentkit-serve-common"
+version = "0.0.0"
+description = "Framework-neutral core shared by AgentKit runtime adapters: the agent.yaml ABI loader, the OpenAI /v1 facade, the CLI/network posture, and the neutral run contract. Imports NO agent framework."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "AgentKit" }]
+# Framework-neutral tail ONLY. A runtime adapter adds its own framework deps
+# (pydantic-ai, or agent-framework-*+mcp) on top of this. This package must never
+# depend on an agent framework — that is what keeps the lock-in boundary (plan
+# §12) inside each adapter's agent_factory.py.
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["agentkit_serve_common"]

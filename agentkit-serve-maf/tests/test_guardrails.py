@@ -17,7 +17,7 @@ from pathlib import Path
 from unittest import mock
 
 from agentkit_serve import agent_factory
-from agentkit_serve.config import ToolSpec
+from agentkit_serve_common.config import ToolSpec
 
 # Forbidden import SEGMENTS. A module is forbidden if ANY dotted segment matches
 # one of these. This catches BOTH spellings of MAF's cloud integrations:
@@ -112,19 +112,6 @@ def test_guardrail_actually_rejects_cloud_submodules():
         assert _is_allowed_framework_module(mod), f"{mod!r} should be allowed"
 
 
-def test_server_is_framework_agnostic():
-    """server.py must not import any framework/model-SDK symbol (option-B seam)."""
-    from agentkit_serve import server
-
-    mods = _imported_modules(Path(server.__file__))
-    for mod in mods:
-        root = mod.split(".")[0]
-        assert root not in ("agent_framework", "openai", "pydantic_ai"), (
-            f"server.py imports framework symbol {mod!r}; the run must go through "
-            f"agent_factory.run_agent so server.py stays shareable across runtimes"
-        )
-
-
 def test_tool_env_passes_only_declared_names():
     """_tool_env selects ONLY declared names that are present — never the full env."""
     tool = ToolSpec(name="fetch", command=["uvx", "mcp-server-fetch"], env=["FETCH_TOKEN", "ABSENT_VAR"])
@@ -187,7 +174,7 @@ def test_missing_api_key_env_fails_fast():
         "tools": [],
         "expose": {"openai": True, "port": 8080},
     }
-    from agentkit_serve.config import AgentSpec
+    from agentkit_serve_common.config import AgentSpec
 
     spec = AgentSpec.model_validate(spec_data)
     with mock.patch.dict(os.environ, {}, clear=True):
@@ -197,3 +184,34 @@ def test_missing_api_key_env_fails_fast():
             assert "DEFINITELY_UNSET_KEY_42" in str(exc)
         else:  # pragma: no cover
             raise AssertionError("expected AgentBuildError for missing key env")
+
+
+def test_status_of_unwraps_maf_wrapped_error():
+    """_status_of walks the exception chain so a real upstream 4xx passes through.
+
+    MAF wraps the OpenAI SDK error (which carries .status_code) inside its own
+    ChatClientException (which does not). Without unwrapping, every upstream 4xx
+    would flatten to 502 — diverging from the pydantic-ai adapter. Verified live
+    against a 400 model_not_supported; this locks it offline.
+    """
+
+    class _BadRequest(Exception):
+        status_code = 400
+
+    class _ChatClientExc(Exception):
+        def __init__(self, msg, inner=None):
+            super().__init__(msg)
+            self.inner_exception = inner
+
+    # direct status (the simple SDK case)
+    assert agent_factory._status_of(_BadRequest()) == 400
+    # MAF-style: wrapped via inner_exception AND `from` (__cause__)
+    try:
+        try:
+            raise _BadRequest("upstream 400")
+        except _BadRequest as ex:
+            raise _ChatClientExc("wrapped", inner=ex) from ex
+    except _ChatClientExc as e:
+        assert agent_factory._status_of(e) == 400
+    # no status anywhere → 502; out-of-range ignored → 502
+    assert agent_factory._status_of(ValueError("x")) == 502

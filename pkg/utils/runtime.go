@@ -2,22 +2,43 @@ package utils
 
 // Runtime identity lives here, in the dependency-light utils package, so BOTH
 // pkg/agentkit/config (the validator) and pkg/build (the adapter registry) can
-// agree on "what runtimes exist" without a config→build import cycle (plan §8 /
-// Open Q4). utils owns the canonical NAMES and aliases; build owns the WIRING
-// (adapter image refs, routes). A lockstep test keeps the two in sync.
+// agree on "what runtimes exist" without a config→build import cycle. utils owns
+// the WHOLE declaration — canonical name, aliases, and the default adapter image
+// ref — as a single source of truth; pkg/build merely DERIVES its route/registry
+// maps from it. Adding a runtime is therefore one RuntimeSpec literal here (plus
+// the adapter image itself); no second registry to keep in sync.
 
-// runtimeAliases maps user-writable aliases to their canonical runtime name.
-// The canonical names themselves are always accepted (see CanonicalRuntime).
-var runtimeAliases = map[string]string{
-	RuntimeMAFAlias: RuntimeMAF, // "maf" → "microsoft-agent-framework"
+// RuntimeSpec is the complete declaration of one runtime adapter.
+type RuntimeSpec struct {
+	// Name is the canonical runtime identifier used in agentkitfile `runtime:`,
+	// routes, and image labels.
+	Name string
+	// Aliases are alternate user-writable spellings that resolve to Name.
+	Aliases []string
+	// DefaultAdapterRef is the OCI ref of the serve adapter image used as the LLB
+	// base when no `--build-arg adapter=` override is supplied.
+	DefaultAdapterRef string
 }
 
-// canonicalRuntimes is the set of canonical runtime names AgentKit recognizes.
-// Adding a runtime here (plus its adapter registration in pkg/build) is the whole
-// frontend surface of a new runtime.
-var canonicalRuntimes = map[string]struct{}{
-	RuntimePydanticAI: {},
-	RuntimeMAF:        {},
+// Runtimes is the canonical, ordered list of runtime adapters AgentKit ships.
+// THE single source of truth — pkg/build derives its registry from this; the
+// validator and router consult the helpers below. Runtime #3 = one entry here.
+var Runtimes = []RuntimeSpec{
+	{
+		Name:              RuntimePydanticAI,
+		DefaultAdapterRef: "ghcr.io/sozercan/agentkit/serve-pydantic-ai:latest",
+	},
+	{
+		Name:              RuntimeMAF,
+		Aliases:           []string{RuntimeMAFAlias}, // "maf" → "microsoft-agent-framework"
+		DefaultAdapterRef: "ghcr.io/sozercan/agentkit/serve-maf:latest",
+	},
+}
+
+// DefaultRuntime is the runtime used when an agentkitfile does not name one. It is
+// the first entry in Runtimes (pydantic-ai, the v0 runtime).
+func DefaultRuntime() string {
+	return Runtimes[0].Name
 }
 
 // CanonicalRuntime resolves a user-supplied runtime name (which may be an alias)
@@ -28,8 +49,15 @@ func CanonicalRuntime(name string) string {
 	if name == "" {
 		return ""
 	}
-	if canonical, ok := runtimeAliases[name]; ok {
-		return canonical
+	for _, rt := range Runtimes {
+		if rt.Name == name {
+			return name
+		}
+		for _, alias := range rt.Aliases {
+			if alias == name {
+				return rt.Name
+			}
+		}
 	}
 	return name
 }
@@ -38,16 +66,36 @@ func CanonicalRuntime(name string) string {
 // runtime. The empty string is NOT known here — callers treat empty as "use the
 // default" before this check.
 func IsKnownRuntime(name string) bool {
-	_, ok := canonicalRuntimes[CanonicalRuntime(name)]
-	return ok
+	if name == "" {
+		return false
+	}
+	canonical := CanonicalRuntime(name)
+	for _, rt := range Runtimes {
+		if rt.Name == canonical {
+			return true
+		}
+	}
+	return false
 }
 
 // KnownRuntimes returns the canonical runtime names, for building human-readable
-// error messages ("supported: ..."). Order is not guaranteed; callers sort.
+// error messages ("supported: ..."). Order follows Runtimes.
 func KnownRuntimes() []string {
-	out := make([]string, 0, len(canonicalRuntimes))
-	for name := range canonicalRuntimes {
-		out = append(out, name)
+	out := make([]string, 0, len(Runtimes))
+	for _, rt := range Runtimes {
+		out = append(out, rt.Name)
 	}
 	return out
+}
+
+// RuntimeByName returns the RuntimeSpec for a name (canonical or alias), and
+// whether it was found.
+func RuntimeByName(name string) (RuntimeSpec, bool) {
+	canonical := CanonicalRuntime(name)
+	for _, rt := range Runtimes {
+		if rt.Name == canonical {
+			return rt, true
+		}
+	}
+	return RuntimeSpec{}, false
 }

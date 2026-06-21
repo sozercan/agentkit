@@ -1,0 +1,36 @@
+#syntax=agentkit:test
+#
+# LIVE stdio-MCP tool fixture for the MAF runtime (plan §10.3 #6) — drives a REAL
+# model that DECIDES to call a real stdio MCP tool (`uvx mcp-server-fetch`) which
+# is spawned as a subprocess, fetches a real URL, and loops its result back into a
+# single collapsed chat.completion. baseURL is the host-side proxy reachable from
+# the container via host.docker.internal; claude-haiku-4.5 supports tool calls.
+#
+#   docker buildx build --builder desktop-linux . -f test/agentkitfile-maf-tools-live.yaml \
+#     --build-arg BUILDKIT_SYNTAX=agentkit:test --build-arg adapter=agentkit-serve-maf:test \
+#     --platform linux/amd64 -t maf-tools-live:test --load --provenance=false
+#   docker run -d --name maf-tools -p 127.0.0.1:8092:8080 \
+#     -e AGENTKIT_BIND=0.0.0.0 -e AGENTKIT_AUTH_TOKEN=secret -e MODEL_API_KEY=not-needed \
+#     --add-host host.docker.internal:host-gateway maf-tools-live:test
+#
+# First boot is slow: uvx downloads + installs mcp-server-fetch before it speaks
+# MCP (the cold-start the request_timeout=None default tolerates).
+apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: maf-fetch-live
+runtime: microsoft-agent-framework
+model:
+  provider: openai-compatible
+  baseURL: http://host.docker.internal:1337/v1
+  name: claude-haiku-4.5
+  apiKeyEnv: MODEL_API_KEY
+instructions: |
+  SENTINEL_TOOLS_99: You are the AgentKit MAF live tool agent.
+  When asked about a URL, you MUST call the fetch tool to retrieve it before
+  answering. End every answer with the token TOOLDONE99.
+tools:
+  - name: fetch
+    command: ["uvx", "mcp-server-fetch"]
+expose:
+  openai: true

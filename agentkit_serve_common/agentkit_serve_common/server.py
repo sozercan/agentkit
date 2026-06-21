@@ -1,4 +1,4 @@
-"""FastAPI app: a NON-STREAMING OpenAI Chat-Completions facade over a pydantic-ai agent.
+"""FastAPI app: a NON-STREAMING OpenAI Chat-Completions facade over an agent.
 
 Endpoints (see ``docs/agent-abi.md`` §4):
 
@@ -10,6 +10,14 @@ Endpoints (see ``docs/agent-abi.md`` §4):
 
 The agent's MCP subprocesses are started ONCE in the lifespan (``async with
 agent:``) and reused across requests, then torn down on shutdown.
+
+THIS MODULE IS FRAMEWORK-AGNOSTIC and lives in the shared core. It imports nothing
+from a runtime framework (``agent_framework``, ``pydantic_ai``) or any model SDK:
+the run is driven through a :class:`~agentkit_serve_common.runtime.RuntimeFactory`
+passed into :func:`create_app`, which returns a neutral
+:class:`~agentkit_serve_common.runtime.RunResult` and raises a neutral
+:class:`~agentkit_serve_common.runtime.AgentRunError`. The lock-in import boundary
+(plan §12) therefore lives only in each adapter's ``agent_factory.py``.
 
 Secret hygiene: this module never logs the request body, the API key, or any tool
 env value.
@@ -26,14 +34,8 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
-from .agent_factory import build_agent
 from .config import AgentSpec
-
-# pydantic-ai surfaces upstream HTTP failures as ModelHTTPError (has .status_code).
-try:  # pragma: no cover - import shape guard across pydantic-ai versions
-    from pydantic_ai.exceptions import ModelHTTPError
-except Exception:  # pragma: no cover
-    ModelHTTPError = None  # type: ignore[assignment]
+from .runtime import AgentRunError, RunResult, RuntimeFactory
 
 
 # --------------------------------------------------------------------------- #
@@ -83,23 +85,15 @@ def _text_of(content: Any) -> str:
     return str(content)
 
 
-def _split_conversation(messages: list[ChatMessage]) -> tuple[list, str]:
-    """Map an OpenAI message list to (pydantic-ai message_history, final prompt).
+def _split_conversation(messages: list[ChatMessage]) -> tuple[list[tuple[str, str]], str]:
+    """Map an OpenAI message list to (neutral history, final prompt).
 
     Contract: the conversation must end with a ``user`` message; its text is the
-    prompt for this turn. Earlier messages become history. ``tool`` messages are
-    dropped — the agent owns its tools, so client-supplied tool results are not
-    meaningful in v0.
+    prompt for this turn. Earlier messages become history as neutral
+    ``(role, text)`` tuples (framework-agnostic — the agent_factory maps them onto
+    the runtime's message type). ``tool`` messages are dropped — the agent owns its
+    tools, so client-supplied tool results are not meaningful in v0.
     """
-    # Imported lazily so config-only consumers don't pull the messages module.
-    from pydantic_ai.messages import (
-        ModelRequest,
-        ModelResponse,
-        SystemPromptPart,
-        TextPart,
-        UserPromptPart,
-    )
-
     if not messages:
         raise HTTPException(status_code=400, detail="messages must be a non-empty array")
 
@@ -111,43 +105,20 @@ def _split_conversation(messages: list[ChatMessage]) -> tuple[list, str]:
         )
     prompt = _text_of(last.content)
 
-    history: list = []
+    history: list[tuple[str, str]] = []
     for msg in messages[:-1]:
         text = _text_of(msg.content)
         if text == "":
             continue
-        if msg.role == "user":
-            history.append(ModelRequest(parts=[UserPromptPart(content=text)]))
-        elif msg.role == "system":
-            history.append(ModelRequest(parts=[SystemPromptPart(content=text)]))
-        elif msg.role == "assistant":
-            history.append(ModelResponse(parts=[TextPart(content=text)]))
+        if msg.role in ("user", "system", "assistant"):
+            history.append((msg.role, text))
         # 'tool' and any other role: skipped by design.
     return history, prompt
 
 
-def _usage_block(result: Any) -> dict[str, int]:
-    """Best-effort OpenAI usage block from the pydantic-ai run result (zeros if unknown)."""
-    try:
-        usage = result.usage
-        # In current pydantic-ai ``usage`` is a property returning a RunUsage; in
-        # older builds it was a method. Prefer the property value; only call it if
-        # we got a bare callable WITHOUT the token attributes (the real method).
-        if not hasattr(usage, "input_tokens") and callable(usage):
-            usage = usage()
-        prompt_tokens = int(getattr(usage, "input_tokens", 0) or 0)
-        completion_tokens = int(getattr(usage, "output_tokens", 0) or 0)
-    except Exception:
-        prompt_tokens = completion_tokens = 0
-    return {
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": prompt_tokens + completion_tokens,
-    }
-
-
-def _completion_response(model_name: str, output: str, result: Any) -> dict:
-    """Assemble a single OpenAI ``chat.completion`` object."""
+def _completion_response(model_name: str, result: RunResult) -> dict:
+    """Assemble a single OpenAI ``chat.completion`` object from a neutral result."""
+    usage = result.usage or {}
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex}",
         "object": "chat.completion",
@@ -156,12 +127,16 @@ def _completion_response(model_name: str, output: str, result: Any) -> dict:
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": output},
+                "message": {"role": "assistant", "content": result.text},
                 "finish_reason": "stop",
                 "logprobs": None,
             }
         ],
-        "usage": _usage_block(result),
+        "usage": {
+            "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
+            "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
+            "total_tokens": int(usage.get("total_tokens", 0) or 0),
+        },
     }
 
 
@@ -195,9 +170,14 @@ def make_auth_dependency(auth_token: str | None):
     return _require_auth
 
 
-def create_app(spec: AgentSpec, auth_token: str | None = None) -> FastAPI:
-    """Construct the FastAPI app for one validated :class:`AgentSpec`."""
-    agent = build_agent(spec)
+def create_app(spec: AgentSpec, factory: RuntimeFactory, auth_token: str | None = None) -> FastAPI:
+    """Construct the FastAPI app for one validated :class:`AgentSpec`.
+
+    ``factory`` is the adapter's framework-specific runtime factory (its
+    ``agent_factory`` module): it builds the agent and runs it, returning neutral
+    results. This injection is what keeps THIS module framework-agnostic.
+    """
+    agent = factory.build_agent(spec)
     model_name = spec.model.name
 
     @asynccontextmanager
@@ -257,24 +237,22 @@ def create_app(spec: AgentSpec, auth_token: str | None = None) -> FastAPI:
 
         # --- map conversation & run the agent ------------------------------
         history, prompt = _split_conversation(req.messages)
-        run_agent = request.app.state.agent
+        agent = request.app.state.agent
         try:
-            result = await run_agent.run(prompt, message_history=history)
+            result = await factory.run_agent(agent, prompt, history)
         except HTTPException:
             raise
-        except Exception as exc:  # map runtime/model errors to OpenAI envelope
-            status = 502
-            if ModelHTTPError is not None and isinstance(exc, ModelHTTPError):
-                status = getattr(exc, "status_code", 502) or 502
+        except AgentRunError as exc:  # neutral error: framework/model failure
             return _error_response(
-                status,
-                f"agent run failed: {exc}",
+                exc.status,
+                str(exc),
                 "agent_error",
-                exc.__class__.__name__,
+                # Preserve the adapter's original framework exception class name
+                # when supplied; otherwise fall back to the neutral class name.
+                exc.code or exc.__class__.__name__,
             )
 
-        output = result.output if isinstance(result.output, str) else str(result.output)
-        return _completion_response(model_name, output, result)
+        return _completion_response(model_name, result)
 
     # Map HTTPExceptions raised in helpers to the OpenAI error envelope too.
     @app.exception_handler(HTTPException)

@@ -2,7 +2,8 @@
 
 This module is the ONLY net-new surface of the MAF runtime adapter: it is the
 framework-specific translation layer behind the frozen ``/agent/agent.yaml`` ABI.
-``config.py``, ``server.py`` and ``__main__.py`` are framework-agnostic.
+The ABI loader, the ``/v1`` facade, and the CLI live in ``agentkit_serve_common``
+(framework-neutral); this module satisfies its ``RuntimeFactory`` protocol.
 
 Verified firsthand against the INSTALLED packages (agent-framework-core 1.9.0,
 agent-framework-openai 1.8.2) — NOT from secondhand docs:
@@ -33,12 +34,11 @@ naive source grep is not relied upon — it would false-positive on this docstri
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
 
 from agent_framework import Agent, Message, MCPStdioTool
 from agent_framework.openai import OpenAIChatCompletionClient
-
-from .config import AgentSpec, ToolSpec
+from agentkit_serve_common.config import AgentSpec, ToolSpec
+from agentkit_serve_common.runtime import AgentRunError, RunResult
 
 # Placeholder API key for OpenAI-compatible endpoints that need no auth (many
 # local servers reject an EMPTY string but accept any non-empty token). Used only
@@ -53,26 +53,6 @@ _FORWARDED_ROLES = frozenset({"system", "user", "assistant"})
 
 class AgentBuildError(Exception):
     """Raised when the agent cannot be constructed (e.g. missing API key env)."""
-
-
-class AgentRunError(Exception):
-    """A runtime/model failure during ``agent.run``, carrying an HTTP status.
-
-    The server maps this to the OpenAI error envelope WITHOUT importing any
-    framework or model-SDK type — keeping ``server.py`` framework-agnostic.
-    """
-
-    def __init__(self, message: str, status: int = 502) -> None:
-        super().__init__(message)
-        self.status = status
-
-
-@dataclass(frozen=True)
-class RunResult:
-    """Framework-neutral result of one agent run (the seam ``server.py`` reads)."""
-
-    text: str
-    usage: dict[str, int] = field(default_factory=dict)
 
 
 def _mcp_request_timeout() -> int | None:
@@ -189,10 +169,26 @@ def _status_of(exc: Exception) -> int:
     Duck-typed on ``status_code`` (the OpenAI SDK's ``APIStatusError`` exposes it)
     so we map a real upstream 4xx/5xx through WITHOUT importing the SDK error type
     — keeping the dependency surface minimal and version-resilient.
+
+    MAF WRAPS the SDK error in its own ``ChatClientException`` (raised ``from`` the
+    original and also stored as ``inner_exception``), and that wrapper has no
+    ``status_code``. So we walk the exception chain — the exception itself, its
+    ``inner_exception``, then ``__cause__``/``__context__`` — and return the first
+    real HTTP status we find. This matches the pydantic-ai adapter's behavior
+    (its ``ModelHTTPError.status_code`` is top-level) so upstream 4xx pass through
+    identically across runtimes, verified live against a 400 ``model_not_supported``.
     """
-    code = getattr(exc, "status_code", None)
-    if isinstance(code, int) and 400 <= code <= 599:
-        return code
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    for _ in range(10):  # bounded walk; guards against pathological cycles
+        if cur is None or id(cur) in seen:
+            break
+        seen.add(id(cur))
+        code = getattr(cur, "status_code", None)
+        if isinstance(code, int) and 400 <= code <= 599:
+            return code
+        nxt = getattr(cur, "inner_exception", None) or cur.__cause__ or cur.__context__
+        cur = nxt
     return 502
 
 
@@ -250,5 +246,10 @@ async def run_agent(agent: Agent, prompt: str, history: list[tuple[str, str]] | 
     try:
         result = await agent.run(messages)
     except Exception as exc:  # noqa: BLE001 — normalized for the façade
-        raise AgentRunError(f"agent run failed: {exc}", status=_status_of(exc)) from exc
+        # Preserve the original framework exception's class name in error.code.
+        raise AgentRunError(
+            f"agent run failed: {exc}",
+            status=_status_of(exc),
+            code=exc.__class__.__name__,
+        ) from exc
     return RunResult(text=_result_text(result), usage=_result_usage(result))

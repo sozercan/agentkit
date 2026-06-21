@@ -12,11 +12,14 @@ license = { text = "MIT" }
 authors = [{ name = "AgentKit" }]
 dependencies = [
     "pydantic-ai>=0.0.40",
-    "fastapi>=0.110",
-    "uvicorn[standard]>=0.29",
-    "pydantic>=2.7",
-    "pyyaml>=6.0",
+    # The framework-neutral core (ABI loader, /v1 facade, CLI). Brings fastapi,
+    # uvicorn, pydantic, pyyaml transitively. Resolved from the sibling path in dev
+    # (see [tool.uv.sources]) and COPYed + installed in the Docker image build.
+    "agentkit-serve-common",
 ]
+
+[tool.uv.sources]
+agentkit-serve-common = { path = "../agentkit_serve_common", editable = true }
 
 [project.scripts]
 agentkit-serve = "agentkit_serve.__main__:main"
