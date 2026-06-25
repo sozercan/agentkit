@@ -103,6 +103,44 @@ make build-serve-langgraph                # agentkit-serve-langgraph:test
 make build-test-agent RUNTIME=langgraph   # test/agentkitfile-langgraph-hello.yaml -> langgraph-agent:test
 ```
 
+## CI
+
+GitHub Actions runs the full closeout loop on pushes and pull requests:
+
+- Go lint, formatting, vet, race tests, and frontend build.
+- Python compile, pytest, and wheel checks for `runtimes/common/`,
+  `runtimes/pydantic-ai/`, `runtimes/microsoft-agent-framework/`, and
+  `runtimes/langgraph/`.
+- Docker builds for the frontend and all three runtime adapters, followed by
+  offline `/healthz` smoke tests for generated pydantic-ai, MAF, and LangGraph
+  agent images.
+- Optional live Vekil-backed Copilot E2E, using the official pinned
+  `ghcr.io/sozercan/vekil` image and a repository secret named
+  `COPILOT_GITHUB_TOKEN`. If that secret is unavailable (for example on forks or
+  unconfigured repos), or Vekil reports that the token lacks Copilot access/
+  permissions, the live job is skipped while the offline checks still run.
+
+The Docker-heavy jobs enable Docker's containerd image store because AgentKit's
+BuildKit gateway frontend uses merge/diff operations that require it on
+GitHub-hosted runners.
+
+## Foundry Hosted Agents smoke test
+
+AgentKit images natively expose the OpenAI `/v1` façade on port `8080`. Microsoft
+Foundry Hosted Agents use a different container contract: a hosted protocol such
+as `/invocations`, a `/readiness` probe, and port `8088`. The fixture under
+`test/foundry-hosted-agent/` wraps a normal AgentKit image with that Foundry
+`invocations` surface without changing the baked `/agent/agent.yaml` ABI.
+
+The wrapper enters the same AgentKit agent async lifecycle as the native server,
+so stdio MCP tool subprocesses are started and kept warm before requests are
+handled. The fixture also includes a deterministic in-container
+OpenAI-compatible mock model, which makes local and hosted response-body
+comparison possible without external model credentials.
+
+See `test/foundry-hosted-agent/README.md` for the exact build, local validation,
+and `azd` deployment flow.
+
 ## Architecture
 
 The runtime adapter (`agentkit-serve`, Python) is used as the LLB **base** image.
