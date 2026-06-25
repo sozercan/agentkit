@@ -1,0 +1,331 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    paths-ignore:
+      - ".codex/**"
+      - ".claude/**"
+  pull_request:
+    paths-ignore:
+      - ".codex/**"
+      - ".claude/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: Go checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Setup Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Validate GitHub Actions and shell syntax
+        run: |
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/*.yml
+          bash -n scripts/live-copilot-agent-e2e.sh
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          bad = []
+          for path in sorted(Path('.github/workflows').glob('*.y*ml')):
+              for lineno, line in enumerate(path.read_text().splitlines(), start=1):
+                  match = re.match(r'^\s*uses:\s*([^#\s]+)', line)
+                  if not match:
+                      continue
+                  ref = match.group(1).strip('"\'')
+                  if ref.startswith('./'):
+                      continue
+                  if ref.startswith('docker://'):
+                      ok = re.fullmatch(r'docker://[^@]+@sha256:[0-9a-fA-F]{64}', ref) is not None
+                  else:
+                      ok = re.fullmatch(r'[^@]+@[0-9a-fA-F]{40}', ref) is not None
+                  if not ok:
+                      bad.append(f'{path}:{lineno}: {ref}')
+
+          if bad:
+              print('GitHub Actions uses: references must be pinned to immutable digests/full commit SHAs:', file=sys.stderr)
+              print('\n'.join(bad), file=sys.stderr)
+              sys.exit(1)
+          PY
+
+      - name: Verify go.mod/go.sum are tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Install golangci-lint
+        run: |
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          "$(go env GOPATH)/bin/golangci-lint" version
+
+      - name: Check Go formatting
+        run: golangci-lint fmt --diff
+
+      - name: Lint Go
+        run: make lint
+
+      - name: Vet Go
+        run: go vet ./...
+
+      - name: Test Go with race detector
+        run: make test
+
+      - name: Build frontend binary
+        run: go build -o /tmp/agentkit-frontend ./cmd/frontend
+
+  python:
+    name: Python checks (${{ matrix.package }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: common
+            path: agentkit_serve_common
+          - package: pydantic-ai adapter
+            path: agentkit-serve
+          - package: microsoft-agent-framework adapter
+            path: agentkit-serve-maf
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Setup Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Install package and test dependencies
+        working-directory: ${{ matrix.path }}
+        run: |
+          set -euxo pipefail
+          uv venv --python 3.12 .venv
+          if [ "${{ matrix.path }}" != "agentkit_serve_common" ]; then
+            uv pip install --python .venv/bin/python -e ../agentkit_serve_common
+          fi
+          uv pip install --python .venv/bin/python -e ".[dev]" build
+
+      - name: Compile Python modules
+        working-directory: ${{ matrix.path }}
+        run: |
+          set -euxo pipefail
+          targets=()
+          if [ -d agentkit_serve ]; then
+            targets+=(agentkit_serve)
+          fi
+          if [ -d agentkit_serve_common ]; then
+            targets+=(agentkit_serve_common)
+          fi
+          if [ -d ../agentkit_serve_common/agentkit_serve_common ]; then
+            targets+=(../agentkit_serve_common/agentkit_serve_common)
+          fi
+          .venv/bin/python -m compileall "${targets[@]}"
+
+      - name: Run Python tests
+        working-directory: ${{ matrix.path }}
+        run: |
+          set -euxo pipefail
+          if [ -d tests ]; then
+            .venv/bin/python -m pytest -q
+          else
+            echo "No package-local tests for ${{ matrix.package }}; compile and wheel checks cover it."
+          fi
+
+      - name: Build Python wheel
+        working-directory: ${{ matrix.path }}
+        run: .venv/bin/python -m build --wheel
+
+  container-build:
+    name: Container build and offline smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Free disk space for Docker-heavy checks
+        run: |
+          set -euxo pipefail
+          echo "Disk usage before cleanup"
+          df -h
+          docker system df || true
+
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/share/swift
+
+          docker system prune -af || true
+          docker builder prune -af || true
+
+          echo "Disk usage after cleanup"
+          df -h
+          docker system df || true
+
+      - name: Configure Docker Buildx daemon builder
+        run: |
+          docker buildx version
+          docker buildx inspect default --bootstrap
+          echo "BUILDER=default" >> "$GITHUB_ENV"
+          echo "BUILDX_BUILDER=default" >> "$GITHUB_ENV"
+
+      - name: Build AgentKit frontend and runtime adapters
+        run: |
+          set -euxo pipefail
+          make build-agentkit TAG=ci
+          make build-serve TAG=ci
+          make build-serve-maf TAG=ci
+
+      - name: Build test agent images for both runtimes
+        run: |
+          set -euxo pipefail
+          make build-test-agent TAG=ci BUILDER=default
+          make build-test-agent TAG=ci BUILDER=default RUNTIME=maf
+
+      - name: Smoke test built agent images
+        run: |
+          set -euo pipefail
+
+          cleanup() {
+            docker rm -f agentkit-smoke-pydantic agentkit-smoke-maf >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          smoke() {
+            local name="$1"
+            local image="$2"
+            local port="$3"
+
+            docker rm -f "$name" >/dev/null 2>&1 || true
+            docker run -d --name "$name" \
+              --platform linux/amd64 \
+              -p "127.0.0.1:${port}:8080" \
+              -e AGENTKIT_BIND=0.0.0.0 \
+              -e AGENTKIT_AUTH_TOKEN=ci-smoke-token \
+              -e OPENAI_API_KEY=ci-dummy-key \
+              "$image"
+
+            for _ in $(seq 1 60); do
+              if curl -fsS "http://127.0.0.1:${port}/healthz" >/dev/null; then
+                docker logs "$name"
+                return 0
+              fi
+              sleep 1
+            done
+
+            docker logs "$name" || true
+            return 1
+          }
+
+          smoke agentkit-smoke-pydantic hello-agent:ci 18080
+          smoke agentkit-smoke-maf maf-agent:ci 18081
+
+  live-copilot-e2e:
+    name: Live Copilot E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+      COPILOT_PROXY_IMAGE: docker.io/sozercan/copilot-proxy@sha256:792c0fd26e555550e8807705c7c00f676a9b13ae998514dfe227bddaaded67bb
+    steps:
+      - name: Decide whether live Copilot E2E can run
+        id: gate
+        env:
+          IS_FORK: ${{ github.event.pull_request.head.repo.fork || false }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ] && [ "${IS_FORK}" = "true" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "reason=Skipping live Copilot E2E for fork pull requests because repository secrets are not exposed." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "${ACTOR}" = "dependabot[bot]" ] && [ -z "${COPILOT_GITHUB_TOKEN}" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "reason=Skipping live Copilot E2E for Dependabot pull requests because repository secrets are not exposed." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -z "${COPILOT_GITHUB_TOKEN}" ]; then
+            echo "COPILOT_GITHUB_TOKEN repository secret is required for live Copilot E2E." >&2
+            exit 1
+          fi
+
+          echo "run=true" >> "$GITHUB_OUTPUT"
+
+      - name: Explain skipped live Copilot E2E
+        if: steps.gate.outputs.run != 'true'
+        run: echo "${{ steps.gate.outputs.reason }}"
+
+      - name: Checkout
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Free disk space for Docker-heavy live E2E
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          set -euxo pipefail
+          echo "Disk usage before cleanup"
+          df -h
+          docker system df || true
+
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/share/swift
+
+          docker system prune -af || true
+          docker builder prune -af || true
+
+          echo "Disk usage after cleanup"
+          df -h
+          docker system df || true
+
+      - name: Setup Go
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Configure Docker Buildx daemon builder
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          docker buildx version
+          docker buildx inspect default --bootstrap
+          echo "BUILDER=default" >> "$GITHUB_ENV"
+          echo "BUILDX_BUILDER=default" >> "$GITHUB_ENV"
+
+      - name: Run live Copilot-backed AgentKit E2E
+        if: steps.gate.outputs.run == 'true'
+        run: bash scripts/live-copilot-agent-e2e.sh

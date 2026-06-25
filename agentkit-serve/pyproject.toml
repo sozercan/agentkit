@@ -11,7 +11,8 @@ requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "AgentKit" }]
 dependencies = [
-    "pydantic-ai>=0.0.40",
+    # MCPServerStdio is available in pydantic-ai 1.x; 2.x removed/renamed it.
+    "pydantic-ai>=0.0.40,<2",
     # The framework-neutral core (ABI loader, /v1 facade, CLI). Brings fastapi,
     # uvicorn, pydantic, pyyaml transitively. Resolved from the sibling path in dev
     # (see [tool.uv.sources]) and COPYed + installed in the Docker image build.
