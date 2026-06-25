@@ -15,6 +15,7 @@ func TestCanonicalRuntime(t *testing.T) {
 		RuntimePydanticAI:  RuntimePydanticAI,  // canonical → itself
 		RuntimeMAF:         RuntimeMAF,         // canonical → itself
 		RuntimeMAFAlias:    RuntimeMAF,         // alias → canonical
+		RuntimeLangGraph:   RuntimeLangGraph,   // canonical → itself
 		nonexistentRuntime: nonexistentRuntime, // unknown returned verbatim
 	}
 	for in, want := range cases {
@@ -25,7 +26,7 @@ func TestCanonicalRuntime(t *testing.T) {
 }
 
 func TestIsKnownRuntime(t *testing.T) {
-	for _, name := range []string{RuntimePydanticAI, RuntimeMAF, RuntimeMAFAlias} {
+	for _, name := range []string{RuntimePydanticAI, RuntimeMAF, RuntimeMAFAlias, RuntimeLangGraph} {
 		if !IsKnownRuntime(name) {
 			t.Errorf("IsKnownRuntime(%q) = false, want true", name)
 		}
@@ -37,10 +38,10 @@ func TestIsKnownRuntime(t *testing.T) {
 	}
 }
 
-func TestKnownRuntimesContainsBoth(t *testing.T) {
+func TestKnownRuntimesContainsAll(t *testing.T) {
 	got := KnownRuntimes()
 	sort.Strings(got)
-	want := []string{RuntimeMAF, RuntimePydanticAI}
+	want := []string{RuntimeLangGraph, RuntimeMAF, RuntimePydanticAI}
 	if len(got) != len(want) {
 		t.Fatalf("KnownRuntimes() = %v, want %v", got, want)
 	}

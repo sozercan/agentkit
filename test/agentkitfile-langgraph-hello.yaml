@@ -1,0 +1,21 @@
+#syntax=agentkit:test
+# The "four keys" fixture (plan §4.1) under the LangGraph runtime. Identical to
+# test/agentkitfile-hello.yaml except for the `runtime:` line — so the baked
+# /agent/agent.yaml is byte-identical to the pydantic-ai version (the ABI is
+# runtime-neutral) and the two build the SAME logical agent. Build it against the
+# LOCAL frontend and LangGraph adapter with:
+#   make build-serve-langgraph build-test-agent RUNTIME=langgraph
+apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: url-summarizer
+runtime: langgraph
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+  apiKeyEnv: OPENAI_API_KEY
+instructions: |
+  Summarize any URL the user gives you in three bullet points.
+expose:
+  openai: true

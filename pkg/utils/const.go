@@ -19,6 +19,9 @@ const (
 	// write in `runtime:`; it resolves to RuntimeMAF (see CanonicalRuntime).
 	RuntimeMAFAlias = "maf"
 
+	// RuntimeLangGraph is the LangChain/LangGraph runtime adapter.
+	RuntimeLangGraph = "langgraph"
+
 	// ProviderOpenAICompatible is the only model provider supported in v0.
 	ProviderOpenAICompatible = "openai-compatible"
 

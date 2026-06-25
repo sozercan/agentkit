@@ -33,6 +33,10 @@ var Runtimes = []RuntimeSpec{
 		Aliases:           []string{RuntimeMAFAlias}, // "maf" → "microsoft-agent-framework"
 		DefaultAdapterRef: "ghcr.io/sozercan/agentkit/serve-maf:latest",
 	},
+	{
+		Name:              RuntimeLangGraph,
+		DefaultAdapterRef: "ghcr.io/sozercan/agentkit/serve-langgraph:latest",
+	},
 }
 
 // DefaultRuntime is the runtime used when an agentkitfile does not name one. It is

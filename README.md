@@ -58,15 +58,18 @@ the optional `runtime:` key:
 |---|---|---|
 | *(omitted)* / `pydantic-ai` | `agentkit-serve` | [pydantic-ai](https://ai.pydantic.dev) (default) |
 | `microsoft-agent-framework` (alias `maf`) | `agentkit-serve-maf` | [Microsoft Agent Framework](https://github.com/microsoft/agent-framework) |
+| `langgraph` | `agentkit-serve-langgraph` | [LangChain/LangGraph](https://docs.langchain.com/oss/python/langgraph/overview) |
 
 ```yaml
-runtime: microsoft-agent-framework   # or: maf
+runtime: langgraph
+# or: runtime: microsoft-agent-framework   # alias: maf
 ```
 
-Both runtimes consume the **same** baked `/agent/agent.yaml` and serve the
+All runtimes consume the **same** baked `/agent/agent.yaml` and serve the
 **same** non-streaming OpenAI `/v1` façade with the same guards — so the same
-agentkitfile produces a behavior-compatible image under either. Only the in-image
-runtime adapter differs. The `AGENTKIT_MCP_TIMEOUT` knob applies to both.
+agentkitfile produces a behavior-compatible image under any supported runtime.
+Only the in-image runtime adapter differs. The `AGENTKIT_MCP_TIMEOUT` knob
+applies to all runtimes.
 
 ## Local dev loop (3 steps)
 
@@ -92,6 +95,14 @@ make build-serve-maf                      # agentkit-serve-maf:test
 make build-test-agent RUNTIME=maf         # test/agentkitfile-maf-hello.yaml -> maf-agent:test
 ```
 
+To iterate on the **LangGraph** runtime, build its adapter and target it with
+`RUNTIME=langgraph`:
+
+```sh
+make build-serve-langgraph                # agentkit-serve-langgraph:test
+make build-test-agent RUNTIME=langgraph   # test/agentkitfile-langgraph-hello.yaml -> langgraph-agent:test
+```
+
 ## Architecture
 
 The runtime adapter (`agentkit-serve`, Python) is used as the LLB **base** image.
@@ -107,11 +118,11 @@ Each adapter is a thin shell over a shared core:
   ABI loader, the OpenAI `/v1` façade, the CLI/network posture, and the neutral run
   contract (`RunResult`, `AgentRunError`, the `RuntimeFactory` protocol). Imports no
   agent framework.
-- `runtimes/pydantic-ai/`, `runtimes/microsoft-agent-framework/` — each ships
-  only an `agent_factory.py` (the one file that imports its framework) plus a
-  thin `__main__.py`, implementing `RuntimeFactory`. They stay **separate images**
-  with disjoint framework deps; that physical separation is what guarantees the
-  lock-in boundary.
+- `runtimes/pydantic-ai/`, `runtimes/microsoft-agent-framework/`,
+  `runtimes/langgraph/` — each ships only an `agent_factory.py` (the one file
+  that imports its framework) plus a thin `__main__.py`, implementing
+  `RuntimeFactory`. They stay **separate images** with disjoint framework deps;
+  that physical separation is what guarantees the lock-in boundary.
 
 Adding a single-agent runtime is therefore one `agent_factory.py` + one Go
 `utils.RuntimeSpec` entry; it inherits the shared `/v1` façade and the conformance
@@ -119,9 +130,9 @@ test suite for free.
 
 ## v0 scope / not yet
 
-- **v0**: two runtimes (pydantic-ai default + microsoft-agent-framework),
-  `provider: openai-compatible` only, stdio `command` MCP tools, the OpenAI `/v1`
-  façade, single OCI image output.
+- **v0**: three runtimes (pydantic-ai default + microsoft-agent-framework +
+  langgraph), `provider: openai-compatible` only, stdio `command` MCP tools, the
+  OpenAI `/v1` façade, single OCI image output.
 - **Not yet**: image-based MCP tools, evals, lock file / SBOM / signing,
   agentpack, `extends`/patches, knowledge/RAG, memory/state, model fallback,
   streaming, and embedded/BYO serving targets.

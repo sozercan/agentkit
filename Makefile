@@ -31,17 +31,22 @@ BUILDER ?= desktop-linux
 PLATFORM ?= linux/amd64
 
 # RUNTIME selects which runtime adapter the test-agent targets: `pydantic-ai`
-# (default) or the Microsoft Agent Framework, named either `maf` (alias) or
-# `microsoft-agent-framework` (canonical) — both are accepted. build-test-agent
-# derives the adapter image, the fixture, and the output tag from it, so you can
-# build the SAME logical agent under either runtime (the §10.4 equivalence proof):
-#   make build-serve build-test-agent                 # pydantic-ai → hello-agent
-#   make build-serve-maf build-test-agent RUNTIME=maf # MAF         → maf-agent
+# (default), Microsoft Agent Framework (`maf` alias or canonical name), or
+# LangGraph (`langgraph`). build-test-agent derives the adapter image, fixture,
+# and output tag from it, so you can build the SAME logical agent under any
+# supported runtime (the §10.4 equivalence proof):
+#   make build-serve build-test-agent                        # pydantic-ai → hello-agent
+#   make build-serve-maf build-test-agent RUNTIME=maf        # MAF         → maf-agent
+#   make build-serve-langgraph build-test-agent RUNTIME=langgraph # LangGraph → langgraph-agent
 RUNTIME ?= pydantic-ai
-# Per-runtime adapter image, fixture, and output tag (overridable). The MAF branch
-# matches BOTH spellings via $(filter ...) so the canonical name does not silently
-# fall through to the pydantic-ai default.
-ifneq ($(filter maf microsoft-agent-framework,$(RUNTIME)),)
+# Per-runtime adapter image, fixture, and output tag (overridable). Branches
+# match all accepted spellings so a canonical name does not silently fall through
+# to the pydantic-ai default.
+ifneq ($(filter langgraph,$(RUNTIME)),)
+SERVE_IMAGE ?= agentkit-serve-langgraph:$(TAG)
+FIXTURE     ?= test/agentkitfile-langgraph-hello.yaml
+AGENT_IMAGE ?= langgraph-agent:$(TAG)
+else ifneq ($(filter maf microsoft-agent-framework,$(RUNTIME)),)
 SERVE_IMAGE ?= agentkit-serve-maf:$(TAG)
 FIXTURE     ?= test/agentkitfile-maf-hello.yaml
 AGENT_IMAGE ?= maf-agent:$(TAG)
@@ -88,9 +93,16 @@ build-serve:
 build-serve-maf:
 	docker buildx build . -f runtimes/microsoft-agent-framework/Dockerfile -t agentkit-serve-maf:$(TAG) --load
 
+# Build the LangGraph runtime adapter (agentkit-serve-langgraph) image.
+# This is the LLB base used when an agentkitfile selects `runtime: langgraph`.
+.PHONY: build-serve-langgraph
+build-serve-langgraph:
+	docker buildx build . -f runtimes/langgraph/Dockerfile -t agentkit-serve-langgraph:$(TAG) --load
+
 # Build a test agent against the LOCAL frontend (BUILDKIT_SYNTAX) and the LOCAL
 # adapter (--build-arg adapter). The runtime, fixture, adapter image, and output
-# tag all derive from RUNTIME (default pydantic-ai; `RUNTIME=maf` for MAF).
+# tag all derive from RUNTIME (default pydantic-ai; `RUNTIME=maf` for MAF;
+# `RUNTIME=langgraph` for LangGraph).
 # --provenance=false keeps the output a plain single-platform image for --load.
 .PHONY: build-test-agent
 build-test-agent:

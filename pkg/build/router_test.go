@@ -3,11 +3,13 @@ package build
 import "testing"
 
 const (
-	wantImageRoute = "pydantic-ai/image"
-	runtimePydca   = "pydantic-ai"
-	runtimeMAFName = "microsoft-agent-framework"
-	runtimeMAFAls  = "maf"
-	wantMAFRoute   = "microsoft-agent-framework/image"
+	wantImageRoute     = "pydantic-ai/image"
+	runtimePydca       = "pydantic-ai"
+	runtimeMAFName     = "microsoft-agent-framework"
+	runtimeMAFAls      = "maf"
+	wantMAFRoute       = "microsoft-agent-framework/image"
+	runtimeLangGraph   = "langgraph"
+	wantLangGraphRoute = "langgraph/image"
 )
 
 func TestLookupRouteEmptyTargetDefaults(t *testing.T) {
@@ -40,6 +42,27 @@ func TestLookupRouteExact(t *testing.T) {
 func TestLookupRouteUnknownRuntime(t *testing.T) {
 	if _, _, _, ok := lookupRoute("", "nonexistent"); ok {
 		t.Fatal("unknown runtime should not resolve")
+	}
+}
+
+// TestLookupRouteLangGraph proves the LangGraph runtime resolves through the
+// same data-derived router as pydantic-ai and MAF.
+func TestLookupRouteLangGraph(t *testing.T) {
+	// empty target + LangGraph runtime → LangGraph image route.
+	matched, _, rc, ok := lookupRoute("", runtimeLangGraph)
+	if !ok || matched != wantLangGraphRoute {
+		t.Fatalf("LangGraph empty target: matched=%q ok=%v, want %s", matched, ok, wantLangGraphRoute)
+	}
+	if rc == nil || rc.Name != runtimeLangGraph {
+		t.Fatalf("rc = %+v, want langgraph", rc)
+	}
+	// exact target match.
+	if m, _, _, okExact := lookupRoute(wantLangGraphRoute, runtimeLangGraph); !okExact || m != wantLangGraphRoute {
+		t.Fatalf("LangGraph exact target: matched=%q ok=%v", m, okExact)
+	}
+	// bare runtime target.
+	if m, _, _, okBare := lookupRoute(runtimeLangGraph, runtimeLangGraph); !okBare || m != wantLangGraphRoute {
+		t.Fatalf("LangGraph bare target: matched=%q ok=%v", m, okBare)
 	}
 }
 
@@ -116,7 +139,7 @@ func TestLookupRouteAliasTargetEmptyRuntime(t *testing.T) {
 // TestIsRegisteredRuntime locks the validator's seam: every canonical runtime and
 // the alias are registered; an unknown name is not.
 func TestIsRegisteredRuntime(t *testing.T) {
-	for _, name := range []string{runtimePydca, runtimeMAFName, runtimeMAFAls} {
+	for _, name := range []string{runtimePydca, runtimeMAFName, runtimeMAFAls, runtimeLangGraph} {
 		if !IsRegisteredRuntime(name) {
 			t.Errorf("IsRegisteredRuntime(%q) = false, want true", name)
 		}
