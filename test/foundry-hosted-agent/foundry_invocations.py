@@ -21,8 +21,9 @@ from azure.ai.agentserver.invocations import InvocationAgentServerHost
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-from agentkit_serve.agent_factory import build_agent, run_agent
+from agentkit_serve.agent_factory import build_runtime
 from agentkit_serve_common.config import load
+from agentkit_serve_common.conversation import RunRequest
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agentkit-foundry-wrapper")
@@ -112,19 +113,19 @@ os.environ.setdefault("MODEL_API_KEY", "not-needed")
 _start_mock_openai()
 
 spec = load("/agent/agent.yaml")
-agent = build_agent(spec)
+runtime = build_runtime(spec)
 app = InvocationAgentServerHost()
 _original_lifespan = app.router.lifespan_context
 
 
 @asynccontextmanager
 async def _lifespan_with_agent(starlette_app):
-    # Match agentkit_serve_common.server.create_app: enter the adapter agent
-    # context once for the server lifetime so MCP tool subprocesses are started
-    # and kept warm before any invocation is handled.
+    # Match agentkit_serve_common.server.create_app: enter the runtime session
+    # once for the server lifetime so MCP tool subprocesses are started and kept
+    # warm before any invocation is handled.
     async with _original_lifespan(starlette_app):
-        async with agent:
-            starlette_app.state.agent = agent
+        async with runtime:
+            starlette_app.state.runtime = runtime
             yield
 
 
@@ -145,7 +146,7 @@ async def handle_invoke(request: Request):
         message = json.dumps(message, separators=(",", ":"), sort_keys=True)
 
     try:
-        result = await run_agent(request.app.state.agent, message, history=None)
+        result = await request.app.state.runtime.run(RunRequest(prompt=message))
     except Exception as exc:  # noqa: BLE001 - expose smoke-test failure clearly.
         logger.exception("AgentKit run failed")
         return JSONResponse({"error": str(exc)}, status_code=502)
