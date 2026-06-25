@@ -44,8 +44,10 @@ ENV AGENTKIT_ROOT=/opt/agentkit \
 # `agentkit-serve-common` dependency is already satisfied; then the adapter adds
 # its framework dep (pydantic-ai).
 WORKDIR /src
-COPY runtimes/common ./common
-COPY runtimes/pydantic-ai ./pydantic-ai
+COPY runtimes/common/pyproject.toml runtimes/common/README.md ./common/
+COPY runtimes/common/agentkit_serve_common ./common/agentkit_serve_common
+COPY runtimes/pydantic-ai/pyproject.toml runtimes/pydantic-ai/README.md ./pydantic-ai/
+COPY runtimes/pydantic-ai/agentkit_serve ./pydantic-ai/agentkit_serve
 
 RUN python -m venv /opt/agentkit \
     && /opt/agentkit/bin/pip install --upgrade pip \

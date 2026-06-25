@@ -50,8 +50,10 @@ ENV AGENTKIT_ROOT=/opt/agentkit \
 # its framework deps (agent-framework-core/-openai, mcp). The adapter image stays
 # separate from the pydantic-ai one — disjoint framework deps, same shared core.
 WORKDIR /src
-COPY runtimes/common ./common
-COPY runtimes/microsoft-agent-framework ./microsoft-agent-framework
+COPY runtimes/common/pyproject.toml runtimes/common/README.md ./common/
+COPY runtimes/common/agentkit_serve_common ./common/agentkit_serve_common
+COPY runtimes/microsoft-agent-framework/pyproject.toml runtimes/microsoft-agent-framework/README.md ./microsoft-agent-framework/
+COPY runtimes/microsoft-agent-framework/agentkit_serve ./microsoft-agent-framework/agentkit_serve
 
 RUN python -m venv /opt/agentkit \
     && /opt/agentkit/bin/pip install --upgrade pip \

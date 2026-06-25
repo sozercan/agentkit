@@ -148,6 +148,9 @@ def build_tool_server(tool: ToolSpec) -> Any:
         command=tool.command[0],
         args=list(tool.command[1:]),
         env=_tool_env(tool),
+        # Match the agent lifespan: when pydantic-ai exits the toolset context,
+        # the stdio subprocess should be torn down instead of kept alive.
+        keep_alive=False,
     )
     return MCPToolset(transport, init_timeout=timeout).prefixed(tool.name)
 
