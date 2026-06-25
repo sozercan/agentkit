@@ -5,6 +5,7 @@ import (
 
 	"github.com/moby/buildkit/util/system"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/sozercan/agentkit/pkg/agentkit/abi"
 	"github.com/sozercan/agentkit/pkg/agentkit/config"
 	"github.com/sozercan/agentkit/pkg/utils"
 )
@@ -29,7 +30,7 @@ func NewImageConfig(cfg *config.AgentConfig, platform *specs.Platform) *specs.Im
 	img.Config.User = "1000:1000" // NON-ROOT (plan §10)
 	img.Config.WorkingDir = "/"
 	img.Config.Entrypoint = []string{utils.ServeBinary}
-	img.Config.Cmd = []string{"--config", utils.AgentConfigPath}
+	img.Config.Cmd = []string{"--config", abi.Path}
 
 	img.Config.Env = []string{
 		"PATH=" + utils.AgentKitRoot + "/bin:" + system.DefaultPathEnv(utils.PlatformLinux),
@@ -44,7 +45,7 @@ func NewImageConfig(cfg *config.AgentConfig, platform *specs.Platform) *specs.Im
 	img.Config.Labels = map[string]string{
 		utils.LabelPrefix + ".runtime":   runtimeLabel(cfg),
 		utils.LabelPrefix + ".name":      cfg.Metadata.Name,
-		utils.LabelPrefix + ".abi":       abiVersion,
+		utils.LabelPrefix + ".abi":       abi.Version,
 		"org.opencontainers.image.title": cfg.Metadata.Name,
 	}
 	for k, v := range cfg.Metadata.Labels {

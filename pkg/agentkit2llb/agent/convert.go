@@ -10,6 +10,7 @@ import (
 
 	"github.com/moby/buildkit/client/llb"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/sozercan/agentkit/pkg/agentkit/abi"
 	"github.com/sozercan/agentkit/pkg/agentkit/config"
 	"github.com/sozercan/agentkit/pkg/utils"
 )
@@ -22,7 +23,7 @@ func Agentkit2LLB(cfg *config.AgentConfig, adapterRef, instructions string, plat
 		return llb.State{}, nil, os.ErrInvalid
 	}
 
-	agentYAML, err := renderAgentYAML(cfg, instructions)
+	agentYAML, err := abi.Render(cfg, instructions)
 	if err != nil {
 		return llb.State{}, nil, err
 	}
@@ -34,7 +35,7 @@ func Agentkit2LLB(cfg *config.AgentConfig, adapterRef, instructions string, plat
 		Run: func(s llb.State) (llb.State, error) {
 			return s.File(
 				llb.Mkdir("/agent", 0o755, llb.WithParents(true)).
-					Mkfile(utils.AgentConfigPath, 0o644, agentYAML),
+					Mkfile(abi.Path, 0o644, agentYAML),
 			), nil
 		},
 	}

@@ -1,4 +1,6 @@
-package agent
+// Package abi renders the frozen agent.yaml writer contract shared by the Go
+// frontend and Python runtime readers.
+package abi
 
 import (
 	"github.com/goccy/go-yaml"
@@ -6,9 +8,12 @@ import (
 	"github.com/sozercan/agentkit/pkg/utils"
 )
 
-// abiVersion is the schema version of the baked agent.yaml (docs/agent-abi.md).
+// Version is the schema version of the baked agent.yaml (docs/agent-abi.md).
 // It MUST equal agentkit-serve's config.ABI_VERSION ("v0").
-const abiVersion = "v0"
+const Version = "v0"
+
+// Path is where the rendered agent.yaml is baked into the agent image.
+const Path = utils.AgentConfigPath
 
 // The following types are the WRITER half of the frozen agent.yaml ABI
 // (docs/agent-abi.md). agentkit-serve reads this file with pydantic
@@ -47,17 +52,17 @@ type abiAgent struct {
 	Expose       abiExpose   `yaml:"expose"`
 }
 
-// renderAgentYAML produces the baked /agent/agent.yaml from the validated config
-// and the already-resolved instructions scalar. The output is byte-compatible
-// with agentkit-serve's strict (extra=forbid) reader.
-func renderAgentYAML(cfg *config.AgentConfig, instructions string) ([]byte, error) {
+// Render produces the baked /agent/agent.yaml from the validated config and the
+// already-resolved instructions scalar. The output is byte-compatible with
+// agentkit-serve's strict (extra=forbid) reader.
+func Render(cfg *config.AgentConfig, instructions string) ([]byte, error) {
 	port := cfg.Expose.Port
 	if port == 0 {
 		port = utils.DefaultPort
 	}
 
 	out := abiAgent{
-		ABIVersion: abiVersion,
+		ABIVersion: Version,
 		Metadata:   abiMetadata{Name: cfg.Metadata.Name},
 		Model: abiModel{
 			Provider:  cfg.Model.Provider,
