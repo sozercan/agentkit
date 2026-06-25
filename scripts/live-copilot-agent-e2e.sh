@@ -90,6 +90,33 @@ wait_for_http() {
   die "${description} never became available at ${url}"
 }
 
+wait_for_vekil_ready() {
+  local url="http://127.0.0.1:${vekil_host_port}/readyz"
+  local attempts="${1:-90}"
+
+  for _ in $(seq 1 "${attempts}"); do
+    if curl -fsS "${url}" >/dev/null 2>&1; then
+      return 0
+    fi
+
+    # Vekil exits quickly when the supplied GitHub token cannot be exchanged for
+    # a Copilot token. Treat that as an environment/credential skip for this
+    # optional live job; real build, networking, and agent failures still fail.
+    if ! docker inspect -f '{{.State.Running}}' "${vekil_container_name}" 2>/dev/null | grep -qx true; then
+      logs="$(docker logs "${vekil_container_name}" 2>&1 || true)"
+      if printf '%s' "${logs}" | grep -Eq 'copilot token request failed with status 403|authentication failed:.*status 403'; then
+        log "Skipping live Vekil/Copilot E2E: COPILOT_GITHUB_TOKEN was rejected by Vekil's Copilot token exchange (HTTP 403)."
+        log "Update the repository secret to a token for a Copilot-enabled user with the Copilot Requests permission to run this live check."
+        return 2
+      fi
+    fi
+
+    sleep 2
+  done
+
+  die "Vekil /readyz never became available at ${url}"
+}
+
 main() {
   require_cmd curl
   require_cmd docker
@@ -119,7 +146,9 @@ main() {
     "${vekil_image}" >/dev/null
 
   log "Waiting for Vekil /readyz"
-  wait_for_http "http://127.0.0.1:${vekil_host_port}/readyz" "Vekil /readyz"
+  if ! wait_for_vekil_ready; then
+    exit 0
+  fi
 
   log "Validating Vekil /v1/models"
   curl -fsS "http://127.0.0.1:${vekil_host_port}/v1/models" >"${work_dir}/models.json"

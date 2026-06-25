@@ -103,7 +103,8 @@ GitHub Actions runs the full closeout loop on pushes and pull requests:
   `/healthz` smoke tests for generated pydantic-ai and MAF agent images.
 - Optional live Vekil-backed Copilot E2E, using the official pinned `ghcr.io/sozercan/vekil` image and a repository secret named
   `COPILOT_GITHUB_TOKEN`. If that secret is unavailable (for example on forks or
-  unconfigured repos), the live job is skipped while the offline checks still run.
+  unconfigured repos), or Vekil reports that the token lacks Copilot access/
+  permissions, the live job is skipped while the offline checks still run.
 
 The Docker-heavy jobs enable Docker's containerd image store because AgentKit's
 BuildKit gateway frontend uses merge/diff operations that require it on
