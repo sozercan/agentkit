@@ -18,6 +18,12 @@ build-time defaults/sources are resolved. It carries canonical runtime identity,
 the effective serve port, and fully-resolved instructions so ABI and image writers
 do not reinterpret raw authoring defaults.
 
+### Instruction Source
+The authored source of an Agent's system prompt. v0 supports inline instructions
+and file-backed instructions in the BuildKit context. The build resolves an
+Instruction Source into the Effective Agent's instruction scalar before rendering
+the Agent YAML ABI.
+
 ### Agent YAML ABI
 The frozen `/agent/agent.yaml` contract between the Go frontend writer and the
 Python runtime Reader. The writer renders it from an Effective Agent; every

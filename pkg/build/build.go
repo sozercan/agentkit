@@ -261,39 +261,6 @@ func getAgentkitfileConfig(ctx context.Context, c client.Client) (*config.AgentC
 	return cfg, nil
 }
 
-// resolveInstructions returns the fully-resolved system prompt: inline content
-// as-is, or the contents of the referenced file read from the build context.
-func resolveInstructions(ctx context.Context, c client.Client, cfg *config.AgentConfig) (string, error) {
-	if cfg.Instructions.File == "" {
-		return cfg.Instructions.Inline, nil
-	}
-
-	file := cfg.Instructions.File
-	localSt := llb.Local(localNameContext,
-		llb.IncludePatterns([]string{file}),
-		llb.SessionID(c.BuildOpts().SessionID),
-		llb.SharedKeyHint("agentkit-instructions"),
-		dockerui.WithInternalName("load instructions "+file),
-	)
-	def, err := localSt.Marshal(ctx)
-	if err != nil {
-		return "", errors.Wrap(err, "failed to marshal instructions source")
-	}
-	res, err := c.Solve(ctx, client.SolveRequest{Definition: def.ToPB()})
-	if err != nil {
-		return "", errors.Wrapf(err, "failed to resolve instructions file %s", file)
-	}
-	ref, err := res.SingleRef()
-	if err != nil {
-		return "", err
-	}
-	dt, err := ref.ReadFile(ctx, client.ReadRequest{Filename: file})
-	if err != nil {
-		return "", errors.Wrapf(err, "failed to read instructions file %s", file)
-	}
-	return string(dt), nil
-}
-
 // getBuildArg returns the value of build-arg:<k>, or "".
 func getBuildArg(opts map[string]string, k string) string {
 	if opts != nil {
