@@ -102,11 +102,11 @@ jobs:
       matrix:
         include:
           - package: common
-            path: agentkit_serve_common
+            path: runtimes/common
           - package: pydantic-ai adapter
-            path: agentkit-serve
+            path: runtimes/pydantic-ai
           - package: microsoft-agent-framework adapter
-            path: agentkit-serve-maf
+            path: runtimes/microsoft-agent-framework
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -126,8 +126,8 @@ jobs:
         run: |
           set -euxo pipefail
           uv venv --python 3.12 .venv
-          if [ "${{ matrix.path }}" != "agentkit_serve_common" ]; then
-            uv pip install --python .venv/bin/python -e ../agentkit_serve_common
+          if [ "${{ matrix.path }}" != "runtimes/common" ]; then
+            uv pip install --python .venv/bin/python -e ../common
           fi
           uv pip install --python .venv/bin/python -e ".[dev]" build
 
@@ -142,8 +142,8 @@ jobs:
           if [ -d agentkit_serve_common ]; then
             targets+=(agentkit_serve_common)
           fi
-          if [ -d ../agentkit_serve_common/agentkit_serve_common ]; then
-            targets+=(../agentkit_serve_common/agentkit_serve_common)
+          if [ -d ../common/agentkit_serve_common ]; then
+            targets+=(../common/agentkit_serve_common)
           fi
           .venv/bin/python -m compileall "${targets[@]}"
 

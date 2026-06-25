@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-agentkit-serve-common = { path = "../agentkit_serve_common", editable = true }
+agentkit-serve-common = { path = "../common", editable = true }
 
 [project.scripts]
 agentkit-serve = "agentkit_serve.__main__:main"

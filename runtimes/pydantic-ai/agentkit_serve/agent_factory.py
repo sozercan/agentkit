@@ -1,11 +1,12 @@
 """Build a pydantic-ai :class:`Agent` from a validated :class:`AgentSpec`.
 
-Verified against the INSTALLED pydantic-ai (1.107.x). Key facts baked in here:
+Verified against modern pydantic-ai (1.107.x through 2.x). Key facts baked in here:
 
 * The OpenAI-compatible model class is ``OpenAIChatModel`` (``OpenAIModel`` is a
   deprecated alias); its base_url/api_key come from an ``OpenAIProvider``.
-* stdio MCP servers are ``MCPServerStdio(command, args, *, env=...)`` and are
-  passed to the agent as ``toolsets`` (the old ``mcp_servers=`` kwarg is gone).
+* stdio MCP servers are passed to the agent as ``toolsets`` (the old
+  ``mcp_servers=`` kwarg is gone). pydantic-ai 1.x exposes ``MCPServerStdio``;
+  pydantic-ai 2.x uses ``MCPToolset(StdioTransport(...))``.
 * The agent is itself an async context manager: ``async with agent:`` starts the
   MCP subprocesses; that is the modern replacement for ``run_mcp_servers()``.
 
@@ -24,9 +25,15 @@ option B).
 from __future__ import annotations
 
 import os
+from typing import Any
 
 from pydantic_ai import Agent
-from pydantic_ai.mcp import MCPServerStdio
+
+try:  # pydantic-ai 1.x
+    from pydantic_ai.mcp import MCPServerStdio
+except ImportError:  # pydantic-ai 2.x
+    MCPServerStdio = None  # type: ignore[assignment]
+    from pydantic_ai.mcp import MCPToolset, StdioTransport
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
@@ -110,8 +117,8 @@ def _tool_env(tool: ToolSpec) -> dict[str, str]:
     return {name: os.environ[name] for name in tool.env if name in os.environ}
 
 
-def build_tool_server(tool: ToolSpec) -> MCPServerStdio:
-    """Create a stdio MCP server for one tool spec."""
+def build_tool_server(tool: ToolSpec) -> Any:
+    """Create a stdio MCP toolset for one tool spec."""
     if not tool.command:
         # config.AgentSpec allows an empty command shape; the writer never emits
         # one, but guard anyway so a hand-rolled agent.yaml fails clearly.
@@ -119,16 +126,33 @@ def build_tool_server(tool: ToolSpec) -> MCPServerStdio:
             f"tool {tool.name!r} has an empty command; a stdio MCP server needs "
             f"at least the executable, e.g. command: [\"npx\", \"-y\", \"...\"]"
         )
-    return MCPServerStdio(
+
+    # Generous init timeout: a cold uvx/npx tool installs its package before
+    # speaking MCP, which exceeds pydantic-ai's 5s default (see above).
+    timeout = _mcp_init_timeout()
+
+    if MCPServerStdio is not None:
+        return MCPServerStdio(
+            command=tool.command[0],
+            args=list(tool.command[1:]),
+            env=_tool_env(tool),
+            timeout=timeout,
+            # tool_prefix namespaces tool names so two servers can't collide.
+            tool_prefix=tool.name,
+        )
+
+    # pydantic-ai 2.x replaced MCPServerStdio with a transport + toolset pair.
+    # Prefixing moved to Toolset.prefixed(...), preserving the same namespacing
+    # interface as the 1.x tool_prefix argument.
+    transport = StdioTransport(
         command=tool.command[0],
         args=list(tool.command[1:]),
         env=_tool_env(tool),
-        # Generous init timeout: a cold uvx/npx tool installs its package before
-        # speaking MCP, which exceeds pydantic-ai's 5s default (see above).
-        timeout=_mcp_init_timeout(),
-        # tool_prefix namespaces tool names so two servers can't collide.
-        tool_prefix=tool.name,
+        # Match the agent lifespan: when pydantic-ai exits the toolset context,
+        # the stdio subprocess should be torn down instead of kept alive.
+        keep_alive=False,
     )
+    return MCPToolset(transport, init_timeout=timeout).prefixed(tool.name)
 
 
 def build_agent(spec: AgentSpec) -> Agent:
