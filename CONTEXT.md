@@ -40,6 +40,11 @@ Conversation turns plus the final user prompt, with client-owned tool turns and
 unsupported roles removed. Runtime Adapters consume Run Requests instead of raw
 OpenAI messages.
 
+### Runtime Session
+The live runtime Adapter handle used by the shared server during its lifespan. It
+owns framework-specific agent lifecycle and runs normalized Run Requests, keeping
+raw framework agent objects behind the Runtime Adapter Interface.
+
 ### Runtime Adapter
 A concrete in-image implementation that reads the Agent YAML ABI and serves the
 OpenAI-compatible `/v1` facade using a particular agent framework, such as

@@ -105,13 +105,13 @@ Each adapter is a thin shell over a shared core:
 
 - `runtimes/common/` — the **framework-neutral** package: the `agent.yaml`
   ABI loader, the OpenAI `/v1` façade, the CLI/network posture, and the neutral run
-  contract (`RunResult`, `AgentRunError`, the `RuntimeFactory` protocol). Imports no
-  agent framework.
+  contract (`RunResult`, `AgentRunError`, `RuntimeSession`, the
+  `RuntimeFactory` protocol). Imports no agent framework.
 - `runtimes/pydantic-ai/`, `runtimes/microsoft-agent-framework/` — each ships
   only an `agent_factory.py` (the one file that imports its framework) plus a
-  thin `__main__.py`, implementing `RuntimeFactory`. They stay **separate images**
-  with disjoint framework deps; that physical separation is what guarantees the
-  lock-in boundary.
+  thin `__main__.py`, implementing `RuntimeFactory` / `RuntimeSession`. They stay
+  **separate images** with disjoint framework deps; that physical separation is
+  what guarantees the lock-in boundary.
 
 Adding a single-agent runtime is therefore one `agent_factory.py` + one Go
 `utils.RuntimeSpec` entry; it inherits the shared `/v1` façade and the conformance

@@ -82,7 +82,7 @@ def make_failing_client():
     """Factory: a TestClient whose agent run RAISES, to exercise the error path.
 
     ``make_failing_client(exc)`` patches the live agent's ``run`` to raise ``exc``,
-    so ``agent_factory.run_agent`` normalizes it into an ``AgentRunError`` (carrying
+    so the runtime session normalizes it into an ``AgentRunError`` (carrying
     the original class name as ``code``) and the server maps it to the envelope.
     """
 
@@ -92,14 +92,12 @@ def make_failing_client():
             "agentkit_serve.agent_factory.build_client",
             return_value=_EchoClient(),
         ):
-            app = create_app(_spec(), agent_factory, auth_token=auth_token)
-            with TestClient(app) as client:
-                agent = app.state.agent
+            async def _raise(*args, **kwargs):
+                raise exc
 
-                async def _raise(*args, **kwargs):
-                    raise exc
-
-                with mock.patch.object(agent, "run", _raise):
+            with mock.patch.object(agent_factory.Agent, "run", _raise):
+                app = create_app(_spec(), agent_factory, auth_token=auth_token)
+                with TestClient(app) as client:
                     yield client
 
     return _make

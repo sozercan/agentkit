@@ -15,7 +15,7 @@ tools are rejected by the server, never merged here.
 
 This module is the ONLY framework-specific surface of the adapter. It exposes a
 NEUTRAL run contract that ``agentkit_serve_common.server`` consumes —
-``build_agent`` + ``run_agent`` (the :class:`RuntimeFactory` protocol) — so the
+``build_runtime`` (the :class:`RuntimeFactory` protocol) — so the
 shared server imports nothing from ``pydantic_ai``. Cross-runtime invariants such
 as API-key resolution, secret-safe tool env projection, MCP timeout parsing, and
 error normalization live in ``agentkit_serve_common.adapter_support``.
@@ -23,6 +23,7 @@ error normalization live in ``agentkit_serve_common.adapter_support``.
 
 from __future__ import annotations
 
+from types import TracebackType
 from typing import Any
 
 from pydantic_ai import Agent
@@ -47,7 +48,7 @@ from agentkit_serve_common.adapter_support import (
 )
 from agentkit_serve_common.config import AgentSpec, ToolSpec
 from agentkit_serve_common.conversation import RunRequest
-from agentkit_serve_common.runtime import RunResult
+from agentkit_serve_common.runtime import RunResult, RuntimeSession
 
 # Seconds to wait for a stdio MCP server's initialize handshake. pydantic-ai's
 # default is 5s, which is too tight for a COLD `uvx`/`npx` tool: the first launch
@@ -122,6 +123,33 @@ def build_agent(spec: AgentSpec) -> Agent:
         instructions=spec.instructions,
         toolsets=toolsets,
     )
+
+
+class PydanticRuntime:
+    """RuntimeSession Adapter around a pydantic-ai Agent."""
+
+    def __init__(self, agent: Agent) -> None:
+        self.agent = agent
+
+    async def __aenter__(self) -> RuntimeSession:
+        await self.agent.__aenter__()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool | None:
+        return await self.agent.__aexit__(exc_type, exc, tb)
+
+    async def run(self, request: RunRequest) -> RunResult:
+        return await run_agent(self.agent, request)
+
+
+def build_runtime(spec: AgentSpec) -> PydanticRuntime:
+    """Build the runtime session consumed by the shared server."""
+    return PydanticRuntime(build_agent(spec))
 
 
 def _to_message_history(request: RunRequest) -> list:

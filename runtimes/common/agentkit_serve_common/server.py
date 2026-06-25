@@ -8,8 +8,8 @@ Endpoints (see ``docs/agent-abi.md`` §4):
 * ``GET  /v1/models``           — SDK-compatibility listing of the one model.
 * ``GET  /healthz``             — liveness (always open, even under auth).
 
-The agent's MCP subprocesses are started ONCE in the lifespan (``async with
-agent:``) and reused across requests, then torn down on shutdown.
+The runtime Adapter session is entered ONCE in the lifespan and reused across
+requests, then torn down on shutdown.
 
 THIS MODULE IS FRAMEWORK-AGNOSTIC and lives in the shared core. It imports nothing
 from a runtime framework (``agent_framework``, ``pydantic_ai``) or any model SDK:
@@ -123,18 +123,19 @@ def create_app(spec: AgentSpec, factory: RuntimeFactory, auth_token: str | None 
     """Construct the FastAPI app for one validated :class:`AgentSpec`.
 
     ``factory`` is the adapter's framework-specific runtime factory (its
-    ``agent_factory`` module): it builds the agent and runs it, returning neutral
-    results. This injection is what keeps THIS module framework-agnostic.
+    ``agent_factory`` module): it builds a RuntimeSession that owns framework
+    lifecycle and returns neutral results. This injection is what keeps THIS
+    module framework-agnostic.
     """
-    agent = factory.build_agent(spec)
+    runtime = factory.build_runtime(spec)
     model_name = spec.model.name
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # Enter the agent context ONCE: starts the stdio MCP subprocesses and keeps
+        # Enter the runtime context ONCE: starts stdio MCP subprocesses and keeps
         # them warm for the life of the server. Torn down on shutdown.
-        async with agent:
-            app.state.agent = agent
+        async with runtime as live_runtime:
+            app.state.runtime = live_runtime
             yield
 
     app = FastAPI(title="agentkit-serve", lifespan=lifespan)
@@ -190,9 +191,9 @@ def create_app(spec: AgentSpec, factory: RuntimeFactory, auth_token: str | None 
         except ConversationError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        agent = request.app.state.agent
+        runtime = request.app.state.runtime
         try:
-            result = await factory.run_agent(agent, run_request)
+            result = await runtime.run(run_request)
         except HTTPException:
             raise
         except AgentRunError as exc:  # neutral error: framework/model failure

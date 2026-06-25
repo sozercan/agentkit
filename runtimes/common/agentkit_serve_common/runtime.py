@@ -11,8 +11,10 @@ imported, which is what keeps the lock-in boundary (plan §12) per-adapter.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Protocol, runtime_checkable
+from types import TracebackType
+from typing import Protocol, runtime_checkable
 
+from .config import AgentSpec
 from .conversation import RunRequest
 
 
@@ -42,19 +44,37 @@ class RunResult:
 
 
 @runtime_checkable
+class RuntimeSession(Protocol):
+    """A live runtime Adapter session owned by the adapter implementation.
+
+    The shared server enters this session once for the FastAPI lifespan and calls
+    :meth:`run` for each normalized RunRequest. Framework-specific agent objects
+    and lifecycle quirks stay behind this Interface.
+    """
+
+    async def __aenter__(self) -> "RuntimeSession":
+        ...
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool | None:
+        ...
+
+    async def run(self, request: RunRequest) -> RunResult:
+        ...
+
+
+@runtime_checkable
 class RuntimeFactory(Protocol):
     """The interface an adapter's ``agent_factory`` module must satisfy.
 
     ``server.py`` is handed a value of this shape (the adapter's module) and uses
-    only these two members, so it never imports a framework:
-
-    * ``build_agent(spec)`` → an async-context-manager agent (the lifespan enters
-      it once: ``async with agent:``), reused across requests.
-    * ``run_agent(agent, request)`` → a :class:`RunResult`; raises
-      :class:`AgentRunError` (with an HTTP status) on a framework/model failure.
+    only ``build_runtime(spec)``, so it never imports a framework or touches raw
+    framework agent lifecycle.
     """
 
-    def build_agent(self, spec: Any) -> Any:  # returns an async context manager
+    def build_runtime(self, spec: AgentSpec) -> RuntimeSession:
         ...
-
-    async def run_agent(self, agent: Any, request: RunRequest) -> RunResult: ...

@@ -3,7 +3,8 @@
 This module is the ONLY net-new surface of the MAF runtime adapter: it is the
 framework-specific translation layer behind the frozen ``/agent/agent.yaml`` ABI.
 The ABI loader, the ``/v1`` facade, and the CLI live in ``agentkit_serve_common``
-(framework-neutral); this module satisfies its ``RuntimeFactory`` protocol.
+(framework-neutral); this module satisfies its ``RuntimeFactory`` protocol by
+building a RuntimeSession.
 
 Verified firsthand against the INSTALLED packages (agent-framework-core 1.9.0,
 agent-framework-openai 1.8.2) — NOT from secondhand docs:
@@ -38,6 +39,8 @@ concrete Adapter shape.
 
 from __future__ import annotations
 
+from types import TracebackType
+
 from agent_framework import Agent, MCPStdioTool, Message
 from agent_framework.openai import OpenAIChatCompletionClient
 from agentkit_serve_common.adapter_support import (
@@ -52,7 +55,7 @@ from agentkit_serve_common.adapter_support import (
 )
 from agentkit_serve_common.config import AgentSpec, ToolSpec
 from agentkit_serve_common.conversation import RunRequest
-from agentkit_serve_common.runtime import RunResult
+from agentkit_serve_common.runtime import RunResult, RuntimeSession
 
 
 def _mcp_request_timeout() -> int | None:
@@ -127,6 +130,33 @@ def build_agent(spec: AgentSpec) -> Agent:
         name=spec.metadata.name,
         tools=[build_tool(t) for t in spec.tools],
     )
+
+
+class MAFRuntime:
+    """RuntimeSession Adapter around a Microsoft Agent Framework Agent."""
+
+    def __init__(self, agent: Agent) -> None:
+        self.agent = agent
+
+    async def __aenter__(self) -> RuntimeSession:
+        await self.agent.__aenter__()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool | None:
+        return await self.agent.__aexit__(exc_type, exc, tb)
+
+    async def run(self, request: RunRequest) -> RunResult:
+        return await run_agent(self.agent, request)
+
+
+def build_runtime(spec: AgentSpec) -> MAFRuntime:
+    """Build the runtime session consumed by the shared server."""
+    return MAFRuntime(build_agent(spec))
 
 
 def _status_of(exc: Exception) -> int:

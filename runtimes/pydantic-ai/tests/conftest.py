@@ -50,19 +50,20 @@ def model_name() -> str:
 
 @pytest.fixture
 def make_client():
-    """Factory: a TestClient whose agent model is overridden to an offline TestModel.
+    """Factory: a TestClient whose agent model is an offline TestModel.
 
-    The agent is created inside ``create_app`` and published on ``app.state.agent``
-    when the lifespan runs (inside the ``with TestClient`` block). We grab that
-    instance and override *its* model so ``agent.run`` never touches the network.
+    Patching ``build_model`` keeps the shared server tests behind the RuntimeSession
+    Interface; they do not reach through ``app.state`` to the raw framework agent.
     """
 
     @contextmanager
     def _make(auth_token: str | None = None, output: str = "ok"):
-        app = create_app(_spec(), agent_factory, auth_token=auth_token)
-        with TestClient(app) as client:
-            agent = app.state.agent
-            with agent.override(model=TestModel(custom_output_text=output)):
+        with mock.patch(
+            "agentkit_serve.agent_factory.build_model",
+            return_value=TestModel(custom_output_text=output),
+        ):
+            app = create_app(_spec(), agent_factory, auth_token=auth_token)
+            with TestClient(app) as client:
                 yield client
 
     return _make
@@ -73,20 +74,21 @@ def make_failing_client():
     """Factory: a TestClient whose agent run RAISES, to exercise the error path.
 
     ``make_failing_client(exc)`` patches the live agent's ``run`` to raise ``exc``,
-    so ``agent_factory.run_agent`` normalizes it into an ``AgentRunError`` (carrying
+    so the runtime session normalizes it into an ``AgentRunError`` (carrying
     the original class name as ``code``) and the server maps it to the envelope.
     """
 
     @contextmanager
     def _make(exc: Exception, auth_token: str | None = None):
-        app = create_app(_spec(), agent_factory, auth_token=auth_token)
-        with TestClient(app) as client:
-            agent = app.state.agent
+        async def _raise(*args, **kwargs):
+            raise exc
 
-            async def _raise(*args, **kwargs):
-                raise exc
-
-            with mock.patch.object(agent, "run", _raise):
+        with mock.patch(
+            "agentkit_serve.agent_factory.build_model",
+            return_value=TestModel(custom_output_text="unused"),
+        ), mock.patch.object(agent_factory.Agent, "run", _raise):
+            app = create_app(_spec(), agent_factory, auth_token=auth_token)
+            with TestClient(app) as client:
                 yield client
 
     return _make
