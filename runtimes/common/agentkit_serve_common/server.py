@@ -134,8 +134,8 @@ def create_app(spec: AgentSpec, factory: RuntimeFactory, auth_token: str | None 
     async def lifespan(app: FastAPI):
         # Enter the runtime context ONCE: starts stdio MCP subprocesses and keeps
         # them warm for the life of the server. Torn down on shutdown.
-        async with runtime as live_runtime:
-            app.state.runtime = live_runtime
+        async with runtime:
+            app.state.runtime = runtime
             yield
 
     app = FastAPI(title="agentkit-serve", lifespan=lifespan)

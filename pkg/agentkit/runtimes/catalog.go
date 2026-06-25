@@ -8,7 +8,6 @@
 // pkg/build merely DERIVES its route/registry maps from it. Adding a runtime is
 // therefore one RuntimeSpec literal here (plus the adapter image itself); no
 // second registry to keep in sync.
-
 package runtimes
 
 const (

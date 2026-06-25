@@ -38,13 +38,11 @@ from pydantic_ai.providers.openai import OpenAIProvider
 
 from agentkit_serve_common.adapter_support import (
     FORWARDED_ROLES,
-    AgentBuildError,
     declared_tool_env,
     normalize_agent_run_error,
     positive_float_env,
     resolve_api_key,
     split_tool_command,
-    upstream_status_code,
 )
 from agentkit_serve_common.config import AgentSpec, ToolSpec
 from agentkit_serve_common.conversation import RunRequest
@@ -62,11 +60,6 @@ def _mcp_init_timeout() -> float:
     return positive_float_env(default=_DEFAULT_MCP_INIT_TIMEOUT)
 
 
-def _resolve_api_key(spec: AgentSpec) -> str:
-    """Compatibility wrapper around the shared adapter support Module."""
-    return resolve_api_key(spec)
-
-
 def build_model(spec: AgentSpec) -> OpenAIChatModel:
     """Construct the OpenAI-compatible chat model pointed at ``model.baseURL``."""
     provider = OpenAIProvider(
@@ -74,11 +67,6 @@ def build_model(spec: AgentSpec) -> OpenAIChatModel:
         api_key=resolve_api_key(spec),
     )
     return OpenAIChatModel(spec.model.name, provider=provider)
-
-
-def _tool_env(tool: ToolSpec) -> dict[str, str]:
-    """Compatibility wrapper around the shared secret-safe tool env projection."""
-    return declared_tool_env(tool)
 
 
 def build_tool_server(tool: ToolSpec) -> Any:
@@ -178,11 +166,6 @@ def _to_message_history(request: RunRequest) -> list:
         elif turn.role == "assistant":
             out.append(ModelResponse(parts=[TextPart(content=turn.text)]))
     return out
-
-
-def _status_of(exc: Exception) -> int:
-    """Compatibility wrapper around shared upstream status extraction."""
-    return upstream_status_code(exc)
 
 
 def _result_text(result: object) -> str:

@@ -22,7 +22,7 @@ type fakeContextReader struct {
 	err   error
 }
 
-func (r *fakeContextReader) ReadFile(ctx context.Context, path string) ([]byte, error) {
+func (r *fakeContextReader) ReadFile(_ context.Context, path string) ([]byte, error) {
 	r.calls = append(r.calls, path)
 	if r.err != nil {
 		return nil, r.err

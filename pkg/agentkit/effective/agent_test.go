@@ -8,6 +8,8 @@ import (
 	"github.com/sozercan/agentkit/pkg/utils"
 )
 
+const testAPIKeyEnvName = "OPENAI_API_KEY" //nolint:gosec // G101: env var NAME, not a credential
+
 func baseConfig() *config.AgentConfig {
 	return &config.AgentConfig{
 		Metadata: config.Metadata{
@@ -18,7 +20,7 @@ func baseConfig() *config.AgentConfig {
 			Provider:  utils.ProviderOpenAICompatible,
 			BaseURL:   "https://api.openai.com/v1",
 			Name:      "gpt-4o-mini",
-			APIKeyEnv: "OPENAI_API_KEY",
+			APIKeyEnv: testAPIKeyEnvName,
 		},
 		Tools: []config.Tool{
 			{Name: "fetch", Command: []string{"uvx", "mcp-server-fetch"}, Env: []string{"FETCH_TIMEOUT"}},
