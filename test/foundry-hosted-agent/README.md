@@ -14,12 +14,12 @@ The smoke test intentionally uses an in-container OpenAI-compatible mock model a
 ## Runtime lifecycle
 
 The wrapper must mirror the native `agentkit-serve` lifecycle: it enters the
-built AgentKit agent's async context once during server startup and stores that
-running agent on `app.state`. This is important for real AgentKit images that
-declare stdio MCP tools, because the adapter lifecycle starts tool subprocesses
-and keeps them warm for request handling. Calling `run_agent` on an un-entered
-agent only works for trivial no-tool smoke images and is not equivalent to the
-native `/v1` server.
+built AgentKit runtime session once during server startup and stores that running
+runtime on `app.state`. This is important for real AgentKit images that declare
+stdio MCP tools, because the adapter lifecycle starts tool subprocesses and keeps
+them warm for request handling. Calling the underlying framework agent without an
+entered runtime session only works for trivial no-tool smoke images and is not
+equivalent to the native `/v1` server.
 
 ## Build locally
 

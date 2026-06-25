@@ -15,16 +15,15 @@ tools are rejected by the server, never merged here.
 
 This module is the ONLY framework-specific surface of the adapter. It exposes a
 NEUTRAL run contract that ``agentkit_serve_common.server`` consumes —
-``build_agent`` + ``run_agent`` (the :class:`RuntimeFactory` protocol) — so the
-shared server imports nothing from ``pydantic_ai``. That neutral seam is identical
-across runtimes (it matches the MAF adapter's), which is what lets the ABI loader,
-the ``/v1`` facade, and the CLI live in ``agentkit_serve_common`` (packaging
-option B).
+``build_runtime`` (the :class:`RuntimeFactory` protocol) — so the
+shared server imports nothing from ``pydantic_ai``. Cross-runtime invariants such
+as API-key resolution, secret-safe tool env projection, MCP timeout parsing, and
+error normalization live in ``agentkit_serve_common.adapter_support``.
 """
 
 from __future__ import annotations
 
-import os
+from types import TracebackType
 from typing import Any
 
 from pydantic_ai import Agent
@@ -37,22 +36,17 @@ except ImportError:  # pydantic-ai 2.x
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
+from agentkit_serve_common.adapter_support import (
+    FORWARDED_ROLES,
+    declared_tool_env,
+    normalize_agent_run_error,
+    positive_float_env,
+    resolve_api_key,
+    split_tool_command,
+)
 from agentkit_serve_common.config import AgentSpec, ToolSpec
-from agentkit_serve_common.runtime import AgentRunError, RunResult
-
-# pydantic-ai surfaces upstream HTTP failures as ModelHTTPError (has .status_code).
-try:  # pragma: no cover - import shape guard across pydantic-ai versions
-    from pydantic_ai.exceptions import ModelHTTPError
-except Exception:  # pragma: no cover
-    ModelHTTPError = None  # type: ignore[assignment]
-
-# Placeholder API key for OpenAI-compatible endpoints that need no auth (many
-# local servers reject an EMPTY string but accept any non-empty token). Used only
-# when the spec declares no apiKeyEnv. Never a real secret.
-_NO_AUTH_PLACEHOLDER = "not-needed"
-
-# Roles forwarded from the request history into the pydantic-ai conversation.
-_FORWARDED_ROLES = frozenset({"system", "user", "assistant"})
+from agentkit_serve_common.conversation import RunRequest
+from agentkit_serve_common.runtime import RunResult, RuntimeSession
 
 # Seconds to wait for a stdio MCP server's initialize handshake. pydantic-ai's
 # default is 5s, which is too tight for a COLD `uvx`/`npx` tool: the first launch
@@ -63,79 +57,32 @@ _DEFAULT_MCP_INIT_TIMEOUT = 120.0
 
 def _mcp_init_timeout() -> float:
     """MCP stdio init timeout (seconds), overridable via AGENTKIT_MCP_TIMEOUT."""
-    raw = os.environ.get("AGENTKIT_MCP_TIMEOUT")
-    if not raw:
-        return _DEFAULT_MCP_INIT_TIMEOUT
-    try:
-        val = float(raw)
-    except ValueError:
-        return _DEFAULT_MCP_INIT_TIMEOUT
-    return val if val > 0 else _DEFAULT_MCP_INIT_TIMEOUT
-
-
-class AgentBuildError(Exception):
-    """Raised when the agent cannot be constructed (e.g. missing API key env)."""
-
-
-def _resolve_api_key(spec: AgentSpec) -> str:
-    """Resolve the model API key from the env var NAMED in the spec.
-
-    Per the ABI, ``model.apiKeyEnv`` is the NAME of an env var; the value is
-    injected at runtime (``docker run -e``). If the name is declared but the var
-    is absent, fail fast with a clear, SECRET-FREE message.
-    """
-    name = spec.model.api_key_env
-    if not name:
-        # No auth declared — e.g. a co-located local model over baseURL.
-        return _NO_AUTH_PLACEHOLDER
-    value = os.environ.get(name)
-    if value is None or value == "":
-        raise AgentBuildError(
-            f"model.apiKeyEnv {name!r} is declared in agent.yaml but env var "
-            f"{name!r} is not set; inject it at runtime, e.g. "
-            f"`docker run -e {name}=...`"
-        )
-    return value
+    return positive_float_env(default=_DEFAULT_MCP_INIT_TIMEOUT)
 
 
 def build_model(spec: AgentSpec) -> OpenAIChatModel:
     """Construct the OpenAI-compatible chat model pointed at ``model.baseURL``."""
     provider = OpenAIProvider(
         base_url=spec.model.base_url,
-        api_key=_resolve_api_key(spec),
+        api_key=resolve_api_key(spec),
     )
     return OpenAIChatModel(spec.model.name, provider=provider)
 
 
-def _tool_env(tool: ToolSpec) -> dict[str, str]:
-    """Select ONLY the env vars NAMED in ``tool.env`` (plan §10 secret-bleed rule).
-
-    The MCP subprocess must never inherit the full container environment — that
-    would bleed the model API key (and every other secret) into every tool. We
-    pass through exactly the declared names that are actually present.
-    """
-    return {name: os.environ[name] for name in tool.env if name in os.environ}
-
-
 def build_tool_server(tool: ToolSpec) -> Any:
     """Create a stdio MCP toolset for one tool spec."""
-    if not tool.command:
-        # config.AgentSpec allows an empty command shape; the writer never emits
-        # one, but guard anyway so a hand-rolled agent.yaml fails clearly.
-        raise AgentBuildError(
-            f"tool {tool.name!r} has an empty command; a stdio MCP server needs "
-            f"at least the executable, e.g. command: [\"npx\", \"-y\", \"...\"]"
-        )
+    command, args = split_tool_command(tool, example='["npx", "-y", "..."]')
 
     # Generous init timeout: a cold uvx/npx tool installs its package before
     # speaking MCP, which exceeds pydantic-ai's 5s default (see above).
     timeout = _mcp_init_timeout()
+    env = declared_tool_env(tool)
 
     if MCPServerStdio is not None:
         return MCPServerStdio(
-            command=tool.command[0],
-            args=list(tool.command[1:]),
-            env=_tool_env(tool),
+            command=command,
+            args=args,
+            env=env,
             timeout=timeout,
             # tool_prefix namespaces tool names so two servers can't collide.
             tool_prefix=tool.name,
@@ -145,9 +92,9 @@ def build_tool_server(tool: ToolSpec) -> Any:
     # Prefixing moved to Toolset.prefixed(...), preserving the same namespacing
     # interface as the 1.x tool_prefix argument.
     transport = StdioTransport(
-        command=tool.command[0],
-        args=list(tool.command[1:]),
-        env=_tool_env(tool),
+        command=command,
+        args=args,
+        env=env,
         # Match the agent lifespan: when pydantic-ai exits the toolset context,
         # the stdio subprocess should be torn down instead of kept alive.
         keep_alive=False,
@@ -166,11 +113,38 @@ def build_agent(spec: AgentSpec) -> Agent:
     )
 
 
-def _to_message_history(history: list[tuple[str, str]] | None) -> list:
-    """Map neutral ``(role, text)`` tuples to a pydantic-ai message_history list.
+class PydanticRuntime:
+    """RuntimeSession Adapter around a pydantic-ai Agent."""
 
-    The agent's own ``instructions`` are applied by pydantic-ai; this mirrors the
-    server's previous inline ``_split_conversation`` mapping exactly.
+    def __init__(self, agent: Agent) -> None:
+        self.agent = agent
+
+    async def __aenter__(self) -> RuntimeSession:
+        await self.agent.__aenter__()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool | None:
+        return await self.agent.__aexit__(exc_type, exc, tb)
+
+    async def run(self, request: RunRequest) -> RunResult:
+        return await run_agent(self.agent, request)
+
+
+def build_runtime(spec: AgentSpec) -> PydanticRuntime:
+    """Build the runtime session consumed by the shared server."""
+    return PydanticRuntime(build_agent(spec))
+
+
+def _to_message_history(request: RunRequest) -> list:
+    """Map a neutral RunRequest to a pydantic-ai message_history list.
+
+    The agent's own ``instructions`` are applied by pydantic-ai; this function
+    handles only prior conversation turns.
     """
     # Imported lazily so config-only consumers don't pull the messages module.
     from pydantic_ai.messages import (
@@ -182,28 +156,16 @@ def _to_message_history(history: list[tuple[str, str]] | None) -> list:
     )
 
     out: list = []
-    for role, text in history or []:
-        if not text or role not in _FORWARDED_ROLES:
+    for turn in request.history:
+        if not turn.text or turn.role not in FORWARDED_ROLES:
             continue
-        if role == "user":
-            out.append(ModelRequest(parts=[UserPromptPart(content=text)]))
-        elif role == "system":
-            out.append(ModelRequest(parts=[SystemPromptPart(content=text)]))
-        elif role == "assistant":
-            out.append(ModelResponse(parts=[TextPart(content=text)]))
+        if turn.role == "user":
+            out.append(ModelRequest(parts=[UserPromptPart(content=turn.text)]))
+        elif turn.role == "system":
+            out.append(ModelRequest(parts=[SystemPromptPart(content=turn.text)]))
+        elif turn.role == "assistant":
+            out.append(ModelResponse(parts=[TextPart(content=turn.text)]))
     return out
-
-
-def _status_of(exc: Exception) -> int:
-    """Best-effort upstream HTTP status from a model/SDK error (else 502).
-
-    pydantic-ai surfaces upstream HTTP failures as ``ModelHTTPError`` with a
-    ``.status_code``; map it through so a real upstream 4xx/5xx is preserved.
-    """
-    if ModelHTTPError is not None and isinstance(exc, ModelHTTPError):
-        code = getattr(exc, "status_code", 502)
-        return int(code) if code else 502
-    return 502
 
 
 def _result_text(result: object) -> str:
@@ -232,24 +194,11 @@ def _result_usage(result: object) -> dict[str, int]:
     }
 
 
-async def run_agent(agent: Agent, prompt: str, history: list[tuple[str, str]] | None = None) -> RunResult:
-    """Framework-agnostic run helper so ``server.py`` stays identical across adapters.
-
-    Accepts the neutral ``(history, prompt)`` the server produces, runs the
-    pydantic-ai agent once (non-streaming), and returns a neutral :class:`RunResult`.
-    Any framework/model error is normalized to :class:`AgentRunError` carrying an
-    HTTP status, so the server never imports a framework or SDK exception type.
-    """
-    message_history = _to_message_history(history)
+async def run_agent(agent: Agent, request: RunRequest) -> RunResult:
+    """Run the pydantic-ai agent and return the neutral result shape."""
+    message_history = _to_message_history(request)
     try:
-        result = await agent.run(prompt, message_history=message_history)
+        result = await agent.run(request.prompt, message_history=message_history)
     except Exception as exc:  # noqa: BLE001 — normalized for the façade
-        # Preserve the original framework exception's class name in error.code
-        # (the pre-shared-core behavior); _status_of maps ModelHTTPError → status.
-        raise AgentRunError(
-            f"agent run failed: {exc}",
-            status=_status_of(exc),
-            code=exc.__class__.__name__,
-        ) from exc
+        raise normalize_agent_run_error(exc) from exc
     return RunResult(text=_result_text(result), usage=_result_usage(result))
-

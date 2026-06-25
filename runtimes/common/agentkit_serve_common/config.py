@@ -1,7 +1,7 @@
 """Typed loader for the frozen ``/agent/agent.yaml`` ABI.
 
 This mirrors ``docs/agent-abi.md`` EXACTLY — it is the Python (reader) half of the
-contract whose Go (writer) half lives in ``pkg/agentkit2llb``. The shape here is
+contract whose Go (writer) half lives in ``pkg/agentkit/abi``. The shape here is
 the *baked* file: ``instructions`` is already a fully-resolved scalar string and
 ``model.provider`` is always ``openai-compatible`` in v0. Do not add fields that
 the writer does not emit.
@@ -9,14 +9,17 @@ the writer does not emit.
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 # The ABI schema version this reader understands (agent-abi.md: ``abiVersion: v0``).
 ABI_VERSION = "v0"
+_PROVIDER_OPENAI_COMPATIBLE = "openai-compatible"
+_ENV_NAME_RE = re.compile(r"^[A-Z0-9_]+$")
 
 
 class _Strict(BaseModel):
@@ -25,34 +28,83 @@ class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+def _validate_env_name(value: str, *, field: str) -> str:
+    """Validate an env var NAME from the ABI, never a secret value."""
+    if not value or not _ENV_NAME_RE.fullmatch(value):
+        raise ValueError(f"{field} must be an env var NAME matching [A-Z0-9_]+")
+    return value
+
+
 class Metadata(_Strict):
-    name: str
+    name: str = Field(min_length=1)
 
 
 class ModelSpec(_Strict):
     """The hosted, OpenAI-compatible model the agent talks to."""
 
-    provider: str
-    base_url: str = Field(alias="baseURL")
-    name: str
+    provider: str = Field(min_length=1)
+    base_url: str = Field(alias="baseURL", min_length=1)
+    name: str = Field(min_length=1)
     # NAME of the env var holding the API key (never the value). agent-abi.md §2.
     api_key_env: str | None = Field(default=None, alias="apiKeyEnv")
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
+    @field_validator("provider")
+    @classmethod
+    def _provider_supported(cls, value: str) -> str:
+        if value != _PROVIDER_OPENAI_COMPATIBLE:
+            raise ValueError(
+                f"unsupported provider {value!r}; expected {_PROVIDER_OPENAI_COMPATIBLE!r}"
+            )
+        return value
+
+    @field_validator("api_key_env")
+    @classmethod
+    def _api_key_env_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        return _validate_env_name(value, field="model.apiKeyEnv")
+
 
 class ToolSpec(_Strict):
     """A stdio MCP server (v0's only tool transport)."""
 
-    name: str
-    command: list[str] = Field(default_factory=list)
+    name: str = Field(min_length=1)
+    command: list[str] = Field(min_length=1)
     # NAMES only — serve passes ONLY these into the subprocess env (secret-bleed rule).
     env: list[str] = Field(default_factory=list)
 
+    @field_validator("command")
+    @classmethod
+    def _command_non_empty_parts(cls, value: list[str]) -> list[str]:
+        if any(part == "" for part in value):
+            raise ValueError("command entries must be non-empty strings")
+        return value
+
+    @field_validator("env")
+    @classmethod
+    def _env_names(cls, value: list[str]) -> list[str]:
+        return [_validate_env_name(name, field="tools[].env") for name in value]
+
 
 class ExposeSpec(_Strict):
-    openai: bool = False
-    port: int = 8080
+    openai: bool
+    port: int
+
+    @field_validator("openai")
+    @classmethod
+    def _openai_required(cls, value: bool) -> bool:
+        if not value:
+            raise ValueError("expose.openai must be true in v0")
+        return value
+
+    @field_validator("port")
+    @classmethod
+    def _port_range(cls, value: int) -> int:
+        if value < 1 or value > 65535:
+            raise ValueError("expose.port must be between 1 and 65535")
+        return value
 
 
 class AgentSpec(_Strict):
@@ -64,7 +116,7 @@ class AgentSpec(_Strict):
     # Fully-resolved system prompt scalar (writer resolves inline|file -> string).
     instructions: str
     tools: list[ToolSpec] = Field(default_factory=list)
-    expose: ExposeSpec = Field(default_factory=ExposeSpec)
+    expose: ExposeSpec
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 

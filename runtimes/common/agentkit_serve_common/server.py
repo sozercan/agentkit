@@ -8,8 +8,8 @@ Endpoints (see ``docs/agent-abi.md`` §4):
 * ``GET  /v1/models``           — SDK-compatibility listing of the one model.
 * ``GET  /healthz``             — liveness (always open, even under auth).
 
-The agent's MCP subprocesses are started ONCE in the lifespan (``async with
-agent:``) and reused across requests, then torn down on shutdown.
+The runtime Adapter session is entered ONCE in the lifespan and reused across
+requests, then torn down on shutdown.
 
 THIS MODULE IS FRAMEWORK-AGNOSTIC and lives in the shared core. It imports nothing
 from a runtime framework (``agent_framework``, ``pydantic_ai``) or any model SDK:
@@ -35,6 +35,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
 from .config import AgentSpec
+from .conversation import ConversationError, run_request_from_messages
 from .runtime import AgentRunError, RunResult, RuntimeFactory
 
 
@@ -62,58 +63,6 @@ class ChatCompletionRequest(BaseModel):
 # tool_choice values that mean "no specific tool requested" — treated as absent so
 # generic OpenAI SDK clients that always attach one are not rejected outright.
 _EMPTY_TOOL_CHOICE = (None, "", "none", "auto")
-
-
-def _text_of(content: Any) -> str:
-    """Flatten OpenAI message content into plain text.
-
-    Accepts a string, a list of content parts (``{"type":"text","text":...}``),
-    or ``None``. Non-text parts (images, etc.) are ignored in v0.
-    """
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        out: list[str] = []
-        for part in content:
-            if isinstance(part, str):
-                out.append(part)
-            elif isinstance(part, dict) and part.get("type") == "text":
-                out.append(str(part.get("text", "")))
-        return "".join(out)
-    return str(content)
-
-
-def _split_conversation(messages: list[ChatMessage]) -> tuple[list[tuple[str, str]], str]:
-    """Map an OpenAI message list to (neutral history, final prompt).
-
-    Contract: the conversation must end with a ``user`` message; its text is the
-    prompt for this turn. Earlier messages become history as neutral
-    ``(role, text)`` tuples (framework-agnostic — the agent_factory maps them onto
-    the runtime's message type). ``tool`` messages are dropped — the agent owns its
-    tools, so client-supplied tool results are not meaningful in v0.
-    """
-    if not messages:
-        raise HTTPException(status_code=400, detail="messages must be a non-empty array")
-
-    last = messages[-1]
-    if last.role != "user":
-        raise HTTPException(
-            status_code=400,
-            detail="the final message must have role 'user'",
-        )
-    prompt = _text_of(last.content)
-
-    history: list[tuple[str, str]] = []
-    for msg in messages[:-1]:
-        text = _text_of(msg.content)
-        if text == "":
-            continue
-        if msg.role in ("user", "system", "assistant"):
-            history.append((msg.role, text))
-        # 'tool' and any other role: skipped by design.
-    return history, prompt
 
 
 def _completion_response(model_name: str, result: RunResult) -> dict:
@@ -174,18 +123,19 @@ def create_app(spec: AgentSpec, factory: RuntimeFactory, auth_token: str | None 
     """Construct the FastAPI app for one validated :class:`AgentSpec`.
 
     ``factory`` is the adapter's framework-specific runtime factory (its
-    ``agent_factory`` module): it builds the agent and runs it, returning neutral
-    results. This injection is what keeps THIS module framework-agnostic.
+    ``agent_factory`` module): it builds a RuntimeSession that owns framework
+    lifecycle and returns neutral results. This injection is what keeps THIS
+    module framework-agnostic.
     """
-    agent = factory.build_agent(spec)
+    runtime = factory.build_runtime(spec)
     model_name = spec.model.name
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # Enter the agent context ONCE: starts the stdio MCP subprocesses and keeps
+        # Enter the runtime context ONCE: starts stdio MCP subprocesses and keeps
         # them warm for the life of the server. Torn down on shutdown.
-        async with agent:
-            app.state.agent = agent
+        async with runtime:
+            app.state.runtime = runtime
             yield
 
     app = FastAPI(title="agentkit-serve", lifespan=lifespan)
@@ -236,10 +186,14 @@ def create_app(spec: AgentSpec, factory: RuntimeFactory, auth_token: str | None 
             )
 
         # --- map conversation & run the agent ------------------------------
-        history, prompt = _split_conversation(req.messages)
-        agent = request.app.state.agent
         try:
-            result = await factory.run_agent(agent, prompt, history)
+            run_request = run_request_from_messages(req.messages)
+        except ConversationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        runtime = request.app.state.runtime
+        try:
+            result = await runtime.run(run_request)
         except HTTPException:
             raise
         except AgentRunError as exc:  # neutral error: framework/model failure

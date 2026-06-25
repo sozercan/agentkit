@@ -14,7 +14,8 @@ import (
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/sozercan/agentkit/pkg/agentkit/config"
-	"github.com/sozercan/agentkit/pkg/agentkit2llb/agent"
+	"github.com/sozercan/agentkit/pkg/agentkit/effective"
+	agentllb "github.com/sozercan/agentkit/pkg/agentkit2llb/agent"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -77,6 +78,8 @@ func HandleAgent(ctx context.Context, c client.Client, cfg *config.AgentConfig, 
 		return nil, errors.Wrap(err, "resolving instructions")
 	}
 
+	agentSpec := effective.FromConfig(cfg, instructions)
+
 	adapterRef := rc.AdapterRef(opts)
 
 	// Default the build platform to the buildkit host's os/arch, preferring the
@@ -104,7 +107,7 @@ func HandleAgent(ctx context.Context, c client.Client, cfg *config.AgentConfig, 
 	for i, tp := range targetPlatforms {
 		func(i int, platform *specs.Platform) {
 			eg.Go(func() (err error) {
-				result, err := buildImage(ctx, c, cfg, adapterRef, instructions, platform, isMultiPlatform, cacheImports)
+				result, err := buildImage(ctx, c, agentSpec, adapterRef, platform, isMultiPlatform, cacheImports)
 				if err != nil {
 					return errors.Wrap(err, "failed to build image")
 				}
@@ -149,11 +152,11 @@ func (br *buildResult) AddToClientResult(cr *client.Result) {
 	}
 }
 
-// buildImage converts the agent config to LLB for one platform and solves it.
-func buildImage(ctx context.Context, c client.Client, cfg *config.AgentConfig, adapterRef, instructions string, platform *specs.Platform, multiPlatform bool, cacheImports []client.CacheOptionsEntry) (*buildResult, error) {
+// buildImage converts the effective Agent to LLB for one platform and solves it.
+func buildImage(ctx context.Context, c client.Client, agentSpec effective.Agent, adapterRef string, platform *specs.Platform, multiPlatform bool, cacheImports []client.CacheOptionsEntry) (*buildResult, error) {
 	result := buildResult{Platform: platform, MultiPlatform: multiPlatform}
 
-	state, image, err := agent.Agentkit2LLB(cfg, adapterRef, instructions, platform)
+	state, image, err := agentllb.Agentkit2LLB(agentSpec, adapterRef, platform)
 	if err != nil {
 		return nil, err
 	}
@@ -256,39 +259,6 @@ func getAgentkitfileConfig(ctx context.Context, c client.Client) (*config.AgentC
 		return nil, errors.Wrap(err, "parsing build args")
 	}
 	return cfg, nil
-}
-
-// resolveInstructions returns the fully-resolved system prompt: inline content
-// as-is, or the contents of the referenced file read from the build context.
-func resolveInstructions(ctx context.Context, c client.Client, cfg *config.AgentConfig) (string, error) {
-	if cfg.Instructions.File == "" {
-		return cfg.Instructions.Inline, nil
-	}
-
-	file := cfg.Instructions.File
-	localSt := llb.Local(localNameContext,
-		llb.IncludePatterns([]string{file}),
-		llb.SessionID(c.BuildOpts().SessionID),
-		llb.SharedKeyHint("agentkit-instructions"),
-		dockerui.WithInternalName("load instructions "+file),
-	)
-	def, err := localSt.Marshal(ctx)
-	if err != nil {
-		return "", errors.Wrap(err, "failed to marshal instructions source")
-	}
-	res, err := c.Solve(ctx, client.SolveRequest{Definition: def.ToPB()})
-	if err != nil {
-		return "", errors.Wrapf(err, "failed to resolve instructions file %s", file)
-	}
-	ref, err := res.SingleRef()
-	if err != nil {
-		return "", err
-	}
-	dt, err := ref.ReadFile(ctx, client.ReadRequest{Filename: file})
-	if err != nil {
-		return "", errors.Wrapf(err, "failed to read instructions file %s", file)
-	}
-	return string(dt), nil
 }
 
 // getBuildArg returns the value of build-arg:<k>, or "".

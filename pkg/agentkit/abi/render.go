@@ -1,14 +1,18 @@
-package agent
+// Package abi renders the frozen agent.yaml writer contract shared by the Go
+// frontend and Python runtime readers.
+package abi
 
 import (
 	"github.com/goccy/go-yaml"
-	"github.com/sozercan/agentkit/pkg/agentkit/config"
-	"github.com/sozercan/agentkit/pkg/utils"
+	"github.com/sozercan/agentkit/pkg/agentkit/effective"
 )
 
-// abiVersion is the schema version of the baked agent.yaml (docs/agent-abi.md).
+// Version is the schema version of the baked agent.yaml (docs/agent-abi.md).
 // It MUST equal agentkit-serve's config.ABI_VERSION ("v0").
-const abiVersion = "v0"
+const Version = "v0"
+
+// Path is where the rendered agent.yaml is baked into the agent image.
+const Path = "/agent/agent.yaml"
 
 // The following types are the WRITER half of the frozen agent.yaml ABI
 // (docs/agent-abi.md). agentkit-serve reads this file with pydantic
@@ -47,29 +51,23 @@ type abiAgent struct {
 	Expose       abiExpose   `yaml:"expose"`
 }
 
-// renderAgentYAML produces the baked /agent/agent.yaml from the validated config
-// and the already-resolved instructions scalar. The output is byte-compatible
-// with agentkit-serve's strict (extra=forbid) reader.
-func renderAgentYAML(cfg *config.AgentConfig, instructions string) ([]byte, error) {
-	port := cfg.Expose.Port
-	if port == 0 {
-		port = utils.DefaultPort
-	}
-
+// Render produces the baked /agent/agent.yaml from an effective Agent. The
+// output is byte-compatible with agentkit-serve's strict (extra=forbid) reader.
+func Render(agent effective.Agent) ([]byte, error) {
 	out := abiAgent{
-		ABIVersion: abiVersion,
-		Metadata:   abiMetadata{Name: cfg.Metadata.Name},
+		ABIVersion: Version,
+		Metadata:   abiMetadata{Name: agent.Metadata.Name},
 		Model: abiModel{
-			Provider:  cfg.Model.Provider,
-			BaseURL:   cfg.Model.BaseURL,
-			Name:      cfg.Model.Name,
-			APIKeyEnv: cfg.Model.APIKeyEnv,
+			Provider:  agent.Model.Provider,
+			BaseURL:   agent.Model.BaseURL,
+			Name:      agent.Model.Name,
+			APIKeyEnv: agent.Model.APIKeyEnv,
 		},
-		Instructions: instructions,
-		Tools:        make([]abiTool, 0, len(cfg.Tools)),
-		Expose:       abiExpose{OpenAI: cfg.Expose.OpenAI, Port: port},
+		Instructions: agent.Instructions,
+		Tools:        make([]abiTool, 0, len(agent.Tools)),
+		Expose:       abiExpose{OpenAI: agent.Expose.OpenAI, Port: agent.Expose.Port},
 	}
-	for _, t := range cfg.Tools {
+	for _, t := range agent.Tools {
 		out.Tools = append(out.Tools, abiTool{Name: t.Name, Command: t.Command, Env: t.Env})
 	}
 

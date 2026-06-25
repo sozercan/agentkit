@@ -1,17 +1,22 @@
-package agent
+package abi
 
 import (
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/goccy/go-yaml"
 	"github.com/sozercan/agentkit/pkg/agentkit/config"
+	"github.com/sozercan/agentkit/pkg/agentkit/effective"
 )
 
 // testAPIKeyEnvName is the NAME of an env var (not a secret). Hoisted to a const
 // so gosec's G101 string-literal credential heuristic does not false-positive on
 // the struct literal below.
-const testAPIKeyEnvName = "OPENAI_API_KEY" //nolint:gosec // G101: env var NAME, not a credential
+const (
+	testAPIKeyEnvName = "OPENAI_API_KEY" //nolint:gosec // G101: env var NAME, not a credential
+	testInstructions  = "Be helpful and cite sources."
+)
 
 func sampleConfig() *config.AgentConfig {
 	return &config.AgentConfig{
@@ -32,8 +37,35 @@ func sampleConfig() *config.AgentConfig {
 	}
 }
 
+func sampleAgent() effective.Agent {
+	return effective.FromConfig(sampleConfig(), testInstructions)
+}
+
+func TestVersionAndPath(t *testing.T) {
+	if Version != "v0" {
+		t.Fatalf("Version = %q, want v0", Version)
+	}
+	if Path != "/agent/agent.yaml" {
+		t.Fatalf("Path = %q, want /agent/agent.yaml", Path)
+	}
+}
+
+func TestRenderAgentYAMLMatchesGolden(t *testing.T) {
+	out, err := Render(sampleAgent())
+	if err != nil {
+		t.Fatalf("render error: %v", err)
+	}
+	want, err := os.ReadFile("testdata/agent.yaml")
+	if err != nil {
+		t.Fatalf("read golden: %v", err)
+	}
+	if string(out) != string(want) {
+		t.Fatalf("rendered agent.yaml drifted from golden\n--- got ---\n%s\n--- want ---\n%s", out, want)
+	}
+}
+
 func TestRenderAgentYAMLShape(t *testing.T) {
-	out, err := renderAgentYAML(sampleConfig(), "Be helpful and cite sources.")
+	out, err := Render(sampleAgent())
 	if err != nil {
 		t.Fatalf("render error: %v", err)
 	}
@@ -61,10 +93,11 @@ func TestRenderAgentYAMLShape(t *testing.T) {
 
 // TestRenderAgentYAMLRoundTrips renders the agent.yaml and parses it back with a
 // strict (DisallowUnknownField) decoder to guard against the writer emitting any
-// key the extra=forbid Python reader would reject. (The cross-language proof —
-// loading Go output through agentkit_serve.config.load — is run separately.)
+// key the extra=forbid Python reader would reject. The cross-language proof —
+// loading this package's golden with agentkit_serve_common.config.load — lives
+// in runtimes/common/tests/test_abi_contract.py.
 func TestRenderAgentYAMLRoundTrips(t *testing.T) {
-	out, err := renderAgentYAML(sampleConfig(), "Be helpful and cite sources.")
+	out, err := Render(sampleAgent())
 	if err != nil {
 		t.Fatalf("render error: %v", err)
 	}

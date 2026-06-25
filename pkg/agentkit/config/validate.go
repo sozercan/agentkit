@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/sozercan/agentkit/pkg/agentkit/runtimes"
 	"github.com/sozercan/agentkit/pkg/utils"
 )
 
@@ -38,10 +39,10 @@ func (c *AgentConfig) Validate() error {
 
 	// --- runtime (empty defaults to pydantic-ai; otherwise must be a runtime
 	// AgentKit knows, after alias resolution). The canonical set lives in
-	// pkg/utils so this validator and pkg/build's adapter registry agree without
-	// a config→build import cycle (plan §8 / Open Q4). -----------------------
-	if c.Runtime != "" && !utils.IsKnownRuntime(c.Runtime) {
-		supported := utils.KnownRuntimes()
+	// pkg/agentkit/runtimes so this validator and pkg/build's adapter registry
+	// agree without a config→build import cycle (plan §8 / Open Q4). ----------
+	if c.Runtime != "" && !runtimes.IsKnownRuntime(c.Runtime) {
+		supported := runtimes.KnownRuntimes()
 		sort.Strings(supported)
 		add("runtime %q is not supported (supported: %s)", c.Runtime, strings.Join(supported, ", "))
 	}
@@ -92,8 +93,16 @@ func (c *AgentConfig) Validate() error {
 			add("tools[%d] (%s): sets multiple sources %v; exactly one is allowed", i, t.Name, set)
 		}
 
+		for j, part := range t.Command {
+			if part == "" {
+				add("tools[%d] (%s): command[%d] must be non-empty", i, t.Name, j)
+			}
+		}
+
 		for _, e := range t.Env {
-			if looksLikeSecretLiteral(e) {
+			if e == "" {
+				add("tools[%d] (%s): env entry is empty; list env var NAMES only", i, t.Name)
+			} else if looksLikeSecretLiteral(e) {
 				add("tools[%d] (%s): env entry %q looks like a secret value; list env var NAMES only", i, t.Name, e)
 			}
 		}
