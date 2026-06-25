@@ -190,6 +190,16 @@ jobs:
           df -h
           docker system df || true
 
+      - name: Setup Docker daemon with containerd image store
+        uses: docker/setup-docker-action@e61617a16c407a86262fb923c35a616ddbe070b3 # v4.6.0
+        with:
+          daemon-config: |
+            {
+              "features": {
+                "containerd-snapshotter": true
+              }
+            }
+
       - name: Configure Docker Buildx daemon builder
         run: |
           docker buildx version
@@ -275,8 +285,9 @@ jobs:
           fi
 
           if [ -z "${COPILOT_GITHUB_TOKEN}" ]; then
-            echo "COPILOT_GITHUB_TOKEN repository secret is required for live Copilot E2E." >&2
-            exit 1
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "reason=Skipping live Copilot E2E because COPILOT_GITHUB_TOKEN is not configured for this run." >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
           echo "run=true" >> "$GITHUB_OUTPUT"
@@ -317,6 +328,17 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+
+      - name: Setup Docker daemon with containerd image store
+        if: steps.gate.outputs.run == 'true'
+        uses: docker/setup-docker-action@e61617a16c407a86262fb923c35a616ddbe070b3 # v4.6.0
+        with:
+          daemon-config: |
+            {
+              "features": {
+                "containerd-snapshotter": true
+              }
+            }
 
       - name: Configure Docker Buildx daemon builder
         if: steps.gate.outputs.run == 'true'
