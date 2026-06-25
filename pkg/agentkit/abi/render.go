@@ -5,7 +5,6 @@ package abi
 import (
 	"github.com/goccy/go-yaml"
 	"github.com/sozercan/agentkit/pkg/agentkit/effective"
-	"github.com/sozercan/agentkit/pkg/utils"
 )
 
 // Version is the schema version of the baked agent.yaml (docs/agent-abi.md).
@@ -13,7 +12,7 @@ import (
 const Version = "v0"
 
 // Path is where the rendered agent.yaml is baked into the agent image.
-const Path = utils.AgentConfigPath
+const Path = "/agent/agent.yaml"
 
 // The following types are the WRITER half of the frozen agent.yaml ABI
 // (docs/agent-abi.md). agentkit-serve reads this file with pydantic

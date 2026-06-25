@@ -11,7 +11,7 @@ minimal; new fields are additive.
 
 ## Location
 
-`/agent/agent.yaml` (constant `utils.AgentConfigPath`).
+`/agent/agent.yaml` (constant `abi.Path`).
 
 ## Schema
 

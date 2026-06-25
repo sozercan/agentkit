@@ -114,7 +114,7 @@ Each adapter is a thin shell over a shared core:
   what guarantees the lock-in boundary.
 
 Adding a single-agent runtime is therefore one `agent_factory.py` + one Go
-`utils.RuntimeSpec` entry; it inherits the shared `/v1` façade and the conformance
+`runtimes.RuntimeSpec` entry; it inherits the shared `/v1` façade and the conformance
 test suite for free.
 
 ## v0 scope / not yet

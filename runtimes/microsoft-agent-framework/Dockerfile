@@ -35,7 +35,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
 # AgentKit layout constants (must match pkg/utils/const.go):
 #   AgentKitRoot = /opt/agentkit ; ServeBinary = /opt/agentkit/bin/agentkit-serve
-#   AgentConfigPath = /agent/agent.yaml
+#   abi.Path = /agent/agent.yaml
 ENV AGENTKIT_ROOT=/opt/agentkit \
     PATH=/opt/agentkit/bin:$PATH \
     PYTHONUNBUFFERED=1 \

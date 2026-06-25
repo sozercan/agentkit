@@ -1,6 +1,4 @@
-// Package utils holds small, dependency-light helpers shared across the
-// AgentKit frontend: shell-command constructors, URL helpers, and the
-// canonical BuildKit Diff/Merge idiom used by the LLB converter.
+// Package utils holds dependency-light constants shared across the AgentKit frontend.
 package utils
 
 const (
@@ -20,10 +18,6 @@ const (
 	PlatformLinux = "linux"
 	PlatformAMD64 = "amd64"
 	PlatformARM64 = "arm64"
-
-	// AgentConfigPath is where the resolved agent.yaml is baked in the image.
-	// It is the ABI boundary between the frontend (writer) and agentkit-serve (reader).
-	AgentConfigPath = "/agent/agent.yaml"
 
 	// AgentKitRoot is where the runtime adapter (agentkit-serve) is staged.
 	AgentKitRoot = "/opt/agentkit"
