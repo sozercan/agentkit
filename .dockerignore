@@ -1,7 +1,7 @@
-# Build context excludes for the repo-root-context builds: the Go frontend image
-# (Dockerfile) AND both Python adapter images (agentkit-serve[-maf]/Dockerfile,
-# built with `-f` from repo root — see the Makefile). Keep the uploaded context
-# small and never ship local venvs/caches into an image layer.
+# Build context excludes for repo-root-context builds: the Go frontend image
+# (Dockerfile) and Python runtime adapter images (runtimes/*/Dockerfile) are
+# built with `-f` from repo root. Keep the uploaded context small and never ship
+# local venvs/caches into an image layer.
 .git
 bin
 *.test

@@ -72,21 +72,21 @@ build-agentkit:
 		--build-arg LDFLAGS="$(LDFLAGS)" \
 		--load
 
-# Build the runtime adapter (agentkit-serve) image from agentkit-serve/Dockerfile.
+# Build the runtime adapter (agentkit-serve) image from runtimes/pydantic-ai/Dockerfile.
 # This is the image the converter uses as the LLB base. The build context is the
 # REPO ROOT (not the adapter subdir) so the Dockerfile can COPY the shared
-# `agentkit_serve_common/` package alongside the adapter (the root .dockerignore
+# `runtimes/common/` package alongside the adapter (the root .dockerignore
 # keeps the context small).
 .PHONY: build-serve
 build-serve:
-	docker buildx build . -f agentkit-serve/Dockerfile -t agentkit-serve:$(TAG) --load
+	docker buildx build . -f runtimes/pydantic-ai/Dockerfile -t agentkit-serve:$(TAG) --load
 
 # Build the Microsoft Agent Framework runtime adapter (agentkit-serve-maf) image.
 # This is the LLB base used when an agentkitfile selects
 # `runtime: microsoft-agent-framework` (alias `maf`).
 .PHONY: build-serve-maf
 build-serve-maf:
-	docker buildx build . -f agentkit-serve-maf/Dockerfile -t agentkit-serve-maf:$(TAG) --load
+	docker buildx build . -f runtimes/microsoft-agent-framework/Dockerfile -t agentkit-serve-maf:$(TAG) --load
 
 # Build a test agent against the LOCAL frontend (BUILDKIT_SYNTAX) and the LOCAL
 # adapter (--build-arg adapter). The runtime, fixture, adapter image, and output

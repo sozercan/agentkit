@@ -50,13 +50,15 @@ ENV AGENTKIT_ROOT=/opt/agentkit \
 # its framework deps (agent-framework-core/-openai, mcp). The adapter image stays
 # separate from the pydantic-ai one — disjoint framework deps, same shared core.
 WORKDIR /src
-COPY agentkit_serve_common ./agentkit_serve_common
-COPY agentkit-serve-maf/pyproject.toml agentkit-serve-maf/README.md ./
-COPY agentkit-serve-maf/agentkit_serve ./agentkit_serve
+COPY runtimes/common/pyproject.toml runtimes/common/README.md ./common/
+COPY runtimes/common/agentkit_serve_common ./common/agentkit_serve_common
+COPY runtimes/microsoft-agent-framework/pyproject.toml runtimes/microsoft-agent-framework/README.md ./microsoft-agent-framework/
+COPY runtimes/microsoft-agent-framework/agentkit_serve ./microsoft-agent-framework/agentkit_serve
+
 RUN python -m venv /opt/agentkit \
     && /opt/agentkit/bin/pip install --upgrade pip \
-    && /opt/agentkit/bin/pip install ./agentkit_serve_common \
-    && /opt/agentkit/bin/pip install . \
+    && /opt/agentkit/bin/pip install ./common \
+    && /opt/agentkit/bin/pip install ./microsoft-agent-framework \
     && { /opt/agentkit/bin/agentkit-serve --help >/dev/null 2>&1 || true; }
 
 # --- non-root user + agent config mount point --------------------------------
