@@ -180,8 +180,8 @@ def test_run_failure_error_envelope(make_failing_client):
     code that PRESERVES the adapter's original framework exception class name.
 
     ``make_failing_client(exc)`` wires the offline double to raise ``exc`` from the
-    agent run. The adapter's ``run_agent`` normalizes it to an ``AgentRunError``
-    whose ``code`` carries the original class name (e.g. ``RuntimeError`` here), so
+    agent run. The runtime session normalizes it to an ``AgentRunError`` whose
+    ``code`` carries the original class name (e.g. ``RuntimeError`` here), so
     ``error.code`` is NOT the generic neutral class name — locking the behavior the
     shared-core refactor must preserve.
     """

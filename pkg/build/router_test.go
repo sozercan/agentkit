@@ -85,7 +85,7 @@ func TestLookupRouteMAF(t *testing.T) {
 }
 
 // TestLookupRouteMAFAlias proves the "maf" alias resolves to the canonical MAF
-// route (alias handling lives in utils.CanonicalRuntime, consumed by lookupRoute).
+// route (alias handling lives in runtimes.CanonicalRuntime, consumed by lookupRoute).
 func TestLookupRouteMAFAlias(t *testing.T) {
 	matched, _, rc, ok := lookupRoute("", runtimeMAFAls)
 	if !ok || matched != wantMAFRoute {

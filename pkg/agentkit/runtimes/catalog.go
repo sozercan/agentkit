@@ -1,12 +1,28 @@
-package utils
+// Package runtimes declares the runtime Adapter catalog used by validation, routing,
+// and image labeling.
+//
+// Runtime identity lives here so BOTH pkg/agentkit/config (the validator) and
+// pkg/build (the adapter registry) can agree on "what runtimes exist" without a
+// config→build import cycle. This package owns the WHOLE declaration — canonical
+// name, aliases, and the default adapter image ref — as a single source of truth;
+// pkg/build merely DERIVES its route/registry maps from it. Adding a runtime is
+// therefore one RuntimeSpec literal here (plus the adapter image itself); no
+// second registry to keep in sync.
+package runtimes
 
-// Runtime identity lives here, in the dependency-light utils package, so BOTH
-// pkg/agentkit/config (the validator) and pkg/build (the adapter registry) can
-// agree on "what runtimes exist" without a config→build import cycle. utils owns
-// the WHOLE declaration — canonical name, aliases, and the default adapter image
-// ref — as a single source of truth; pkg/build merely DERIVES its route/registry
-// maps from it. Adding a runtime is therefore one RuntimeSpec literal here (plus
-// the adapter image itself); no second registry to keep in sync.
+const (
+	// PydanticAI is the default runtime adapter (the v0 runtime).
+	PydanticAI = "pydantic-ai"
+
+	// MAF is the Microsoft Agent Framework runtime adapter (runtime #2).
+	MAF = "microsoft-agent-framework"
+	// MAFAlias is a short, convenient alias for MAF that users may write in
+	// `runtime:`; it resolves to MAF (see CanonicalRuntime).
+	MAFAlias = "maf"
+
+	// LangGraph is the LangChain/LangGraph runtime adapter.
+	LangGraph = "langgraph"
+)
 
 // RuntimeSpec is the complete declaration of one runtime adapter.
 type RuntimeSpec struct {
@@ -25,16 +41,16 @@ type RuntimeSpec struct {
 // validator and router consult the helpers below. Runtime #3 = one entry here.
 var Runtimes = []RuntimeSpec{
 	{
-		Name:              RuntimePydanticAI,
+		Name:              PydanticAI,
 		DefaultAdapterRef: "ghcr.io/sozercan/agentkit/serve-pydantic-ai:latest",
 	},
 	{
-		Name:              RuntimeMAF,
-		Aliases:           []string{RuntimeMAFAlias}, // "maf" → "microsoft-agent-framework"
+		Name:              MAF,
+		Aliases:           []string{MAFAlias}, // "maf" → "microsoft-agent-framework"
 		DefaultAdapterRef: "ghcr.io/sozercan/agentkit/serve-maf:latest",
 	},
 	{
-		Name:              RuntimeLangGraph,
+		Name:              LangGraph,
 		DefaultAdapterRef: "ghcr.io/sozercan/agentkit/serve-langgraph:latest",
 	},
 }

@@ -7,6 +7,7 @@ import (
 
 	"github.com/moby/buildkit/frontend/gateway/client"
 	"github.com/sozercan/agentkit/pkg/agentkit/config"
+	"github.com/sozercan/agentkit/pkg/agentkit/runtimes"
 	"github.com/sozercan/agentkit/pkg/utils"
 )
 
@@ -41,26 +42,26 @@ func (rc *RuntimeConfig) AdapterRef(opts map[string]string) string {
 	return rc.defaultAdapterRef
 }
 
-// routes maps "<runtime>/<outputkind>" to a handler. runtimes maps a runtime
-// name to its config. Both are DERIVED in init() from utils.Runtimes (the single
-// source of truth) — dispatch as data.
+// routes maps "<runtime>/<outputkind>" to a handler. runtimeConfigs maps a
+// runtime name to its config. Both are DERIVED in init() from runtimes.Runtimes
+// (the single source of truth) — dispatch as data.
 var (
-	routes   = map[string]Route{}
-	runtimes = map[string]*RuntimeConfig{}
+	routes         = map[string]Route{}
+	runtimeConfigs = map[string]*RuntimeConfig{}
 )
 
 // registerRuntime wires a runtime adapter and its image output route.
 func registerRuntime(rc *RuntimeConfig) {
-	runtimes[rc.Name] = rc
+	runtimeConfigs[rc.Name] = rc
 	routes[rc.Name+"/"+utils.OutputKindImage] = Route{Handler: HandleAgent}
 }
 
 func init() {
-	// Derive the wiring from the single canonical declaration in pkg/utils. Adding
-	// a runtime is one RuntimeSpec literal there — nothing changes here. (No
-	// lockstep guard is needed: there is exactly one source of truth, not two
+	// Derive the wiring from the single canonical declaration in pkg/agentkit/runtimes.
+	// Adding a runtime is one RuntimeSpec literal there — nothing changes here.
+	// (No lockstep guard is needed: there is exactly one source of truth, not two
 	// registries to reconcile.)
-	for _, rt := range utils.Runtimes {
+	for _, rt := range runtimes.Runtimes {
 		registerRuntime(&RuntimeConfig{
 			Name:              rt.Name,
 			defaultAdapterRef: rt.DefaultAdapterRef,
@@ -69,19 +70,19 @@ func init() {
 }
 
 // IsRegisteredRuntime reports whether name (after alias resolution) has a wired
-// runtime adapter. The wiring is derived from utils.Runtimes, so this agrees with
-// utils.IsKnownRuntime by construction. It is a build-package predicate over the
-// adapter set; the config validator uses utils.IsKnownRuntime instead (config
+// runtime adapter. The wiring is derived from runtimes.Runtimes, so this agrees with
+// runtimes.IsKnownRuntime by construction. It is a build-package predicate over the
+// adapter set; the config validator uses runtimes.IsKnownRuntime instead (config
 // importing build would form a config→build import cycle, since build imports
 // config).
 func IsRegisteredRuntime(name string) bool {
-	_, ok := runtimes[utils.CanonicalRuntime(name)]
+	_, ok := runtimeConfigs[runtimes.CanonicalRuntime(name)]
 	return ok
 }
 
 // defaultRuntime returns the runtime to use when the config does not name one.
 func defaultRuntime() string {
-	return utils.DefaultRuntime()
+	return runtimes.DefaultRuntime()
 }
 
 // lookupRoute resolves a build target plus the effective runtime to a route and
@@ -97,8 +98,8 @@ func lookupRoute(target, runtime string) (matched string, route Route, rc *Runti
 	}
 	// Resolve a user-written alias (e.g. "maf") to its canonical name so the
 	// registry lookup and the "<runtime>/image" route key always agree.
-	runtime = utils.CanonicalRuntime(runtime)
-	rc, rcOK := runtimes[runtime]
+	runtime = runtimes.CanonicalRuntime(runtime)
+	rc, rcOK := runtimeConfigs[runtime]
 	if !rcOK {
 		return "", Route{}, nil, false
 	}
@@ -146,7 +147,7 @@ func canonicalizeTargetRuntime(target string) string {
 		return ""
 	}
 	seg, rest, hasRest := strings.Cut(target, "/")
-	canon := utils.CanonicalRuntime(seg)
+	canon := runtimes.CanonicalRuntime(seg)
 	if hasRest {
 		return canon + "/" + rest
 	}

@@ -28,9 +28,9 @@ RUN apt-get update \
 # Copy the static uv + uvx binaries from the official image onto PATH.
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
-# AgentKit layout constants (must match pkg/utils/const.go):
+# AgentKit layout constants (must match pkg/utils/const.go and pkg/agentkit/abi):
 #   AgentKitRoot = /opt/agentkit ; ServeBinary = /opt/agentkit/bin/agentkit-serve
-#   AgentConfigPath = /agent/agent.yaml
+#   abi.Path = /agent/agent.yaml
 ENV AGENTKIT_ROOT=/opt/agentkit \
     PATH=/opt/agentkit/bin:$PATH \
     PYTHONUNBUFFERED=1 \

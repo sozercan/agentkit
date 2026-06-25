@@ -1,6 +1,4 @@
-// Package utils holds small, dependency-light helpers shared across the
-// AgentKit frontend: shell-command constructors, URL helpers, and the
-// canonical BuildKit Diff/Merge idiom used by the LLB converter.
+// Package utils holds dependency-light constants shared across the AgentKit frontend.
 package utils
 
 const (
@@ -9,18 +7,6 @@ const (
 
 	// KindAgent is the config discriminator for an agent build (see §5.1).
 	KindAgent = "Agent"
-
-	// RuntimePydanticAI is the default runtime adapter (the v0 runtime).
-	RuntimePydanticAI = "pydantic-ai"
-
-	// RuntimeMAF is the Microsoft Agent Framework runtime adapter (runtime #2).
-	RuntimeMAF = "microsoft-agent-framework"
-	// RuntimeMAFAlias is a short, convenient alias for RuntimeMAF that users may
-	// write in `runtime:`; it resolves to RuntimeMAF (see CanonicalRuntime).
-	RuntimeMAFAlias = "maf"
-
-	// RuntimeLangGraph is the LangChain/LangGraph runtime adapter.
-	RuntimeLangGraph = "langgraph"
 
 	// ProviderOpenAICompatible is the only model provider supported in v0.
 	ProviderOpenAICompatible = "openai-compatible"
@@ -32,10 +18,6 @@ const (
 	PlatformLinux = "linux"
 	PlatformAMD64 = "amd64"
 	PlatformARM64 = "arm64"
-
-	// AgentConfigPath is where the resolved agent.yaml is baked in the image.
-	// It is the ABI boundary between the frontend (writer) and agentkit-serve (reader).
-	AgentConfigPath = "/agent/agent.yaml"
 
 	// AgentKitRoot is where the runtime adapter (agentkit-serve) is staged.
 	AgentKitRoot = "/opt/agentkit"

@@ -1,4 +1,4 @@
-package utils
+package runtimes
 
 import (
 	"sort"
@@ -12,10 +12,10 @@ const nonexistentRuntime = "nonexistent"
 func TestCanonicalRuntime(t *testing.T) {
 	cases := map[string]string{
 		"":                 "",                 // empty stays empty (caller defaults it)
-		RuntimePydanticAI:  RuntimePydanticAI,  // canonical → itself
-		RuntimeMAF:         RuntimeMAF,         // canonical → itself
-		RuntimeMAFAlias:    RuntimeMAF,         // alias → canonical
-		RuntimeLangGraph:   RuntimeLangGraph,   // canonical → itself
+		PydanticAI:         PydanticAI,         // canonical → itself
+		MAF:                MAF,                // canonical → itself
+		MAFAlias:           MAF,                // alias → canonical
+		LangGraph:          LangGraph,          // canonical → itself
 		nonexistentRuntime: nonexistentRuntime, // unknown returned verbatim
 	}
 	for in, want := range cases {
@@ -26,7 +26,7 @@ func TestCanonicalRuntime(t *testing.T) {
 }
 
 func TestIsKnownRuntime(t *testing.T) {
-	for _, name := range []string{RuntimePydanticAI, RuntimeMAF, RuntimeMAFAlias, RuntimeLangGraph} {
+	for _, name := range []string{PydanticAI, MAF, MAFAlias, LangGraph} {
 		if !IsKnownRuntime(name) {
 			t.Errorf("IsKnownRuntime(%q) = false, want true", name)
 		}
@@ -41,7 +41,7 @@ func TestIsKnownRuntime(t *testing.T) {
 func TestKnownRuntimesContainsAll(t *testing.T) {
 	got := KnownRuntimes()
 	sort.Strings(got)
-	want := []string{RuntimeLangGraph, RuntimeMAF, RuntimePydanticAI}
+	want := []string{LangGraph, MAF, PydanticAI}
 	if len(got) != len(want) {
 		t.Fatalf("KnownRuntimes() = %v, want %v", got, want)
 	}
@@ -55,7 +55,7 @@ func TestKnownRuntimesContainsAll(t *testing.T) {
 // TestRuntimesDeclarationInvariants locks the single-source-of-truth contract:
 // every RuntimeSpec resolves by its own name and by each alias, carries a default
 // adapter ref, and is reachable via RuntimeByName. Adding runtime #3 is one entry
-// in utils.Runtimes — this test guarantees that entry is internally consistent.
+// in runtimes.Runtimes — this test guarantees that entry is internally consistent.
 func TestRuntimesDeclarationInvariants(t *testing.T) {
 	if len(Runtimes) == 0 {
 		t.Fatal("Runtimes is empty")

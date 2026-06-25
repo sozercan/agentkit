@@ -150,7 +150,7 @@ def test_build_tool_sets_tool_name_prefix():
 
 
 def test_build_tool_rejects_empty_command():
-    tool = ToolSpec(name="broken", command=[], env=[])
+    tool = ToolSpec.model_construct(name="broken", command=[], env=[])
     try:
         agent_factory.build_tool(tool)
     except agent_factory.AgentBuildError as exc:

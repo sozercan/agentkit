@@ -26,9 +26,9 @@ adapter/target.
 from __future__ import annotations
 
 import asyncio
-import os
 from contextlib import AsyncExitStack
 from datetime import timedelta
+from types import TracebackType
 from typing import Any
 
 from langchain.agents import create_agent
@@ -37,18 +37,19 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.tools import load_mcp_tools
 from langchain_openai import ChatOpenAI
 
+from agentkit_serve_common.adapter_support import (
+    FORWARDED_ROLES,
+    AgentBuildError,
+    declared_tool_env,
+    normalize_agent_run_error,
+    positive_float_env,
+    resolve_api_key,
+    split_tool_command,
+    upstream_status_code,
+)
 from agentkit_serve_common.config import AgentSpec, ToolSpec
-from agentkit_serve_common.runtime import AgentRunError, RunResult
-
-# Placeholder API key for OpenAI-compatible endpoints that need no auth (many
-# local servers reject an EMPTY string but accept any non-empty token). Used only
-# when the spec declares no apiKeyEnv. Never a real secret.
-_NO_AUTH_PLACEHOLDER = "not-needed"
-
-# Roles forwarded from the request history into the LangGraph conversation. The
-# agent owns its tools, so client-supplied tool turns are meaningless and are
-# dropped by the shared server before they reach here; this is a defensive gate.
-_FORWARDED_ROLES = frozenset({"system", "user", "assistant"})
+from agentkit_serve_common.conversation import RunRequest
+from agentkit_serve_common.runtime import AgentRunError, RunResult, RuntimeSession
 
 # Seconds to wait for a stdio MCP server's initialize handshake. A cold `uvx` or
 # `npx` tool may download/install before speaking MCP, so match pydantic-ai's
@@ -56,41 +57,14 @@ _FORWARDED_ROLES = frozenset({"system", "user", "assistant"})
 _DEFAULT_MCP_INIT_TIMEOUT = 120.0
 
 
-class AgentBuildError(Exception):
-    """Raised when the agent cannot be constructed (e.g. missing API key env)."""
-
-
 def _mcp_init_timeout() -> float:
     """MCP stdio init timeout (seconds), overridable via AGENTKIT_MCP_TIMEOUT."""
-    raw = os.environ.get("AGENTKIT_MCP_TIMEOUT")
-    if not raw:
-        return _DEFAULT_MCP_INIT_TIMEOUT
-    try:
-        val = float(raw)
-    except ValueError:
-        return _DEFAULT_MCP_INIT_TIMEOUT
-    return val if val > 0 else _DEFAULT_MCP_INIT_TIMEOUT
+    return positive_float_env(default=_DEFAULT_MCP_INIT_TIMEOUT)
 
 
 def _resolve_api_key(spec: AgentSpec) -> str:
-    """Resolve the model API key from the env var NAMED in the spec.
-
-    Per the ABI, ``model.apiKeyEnv`` is the NAME of an env var; the value is
-    injected at runtime (``docker run -e``). If the name is declared but the var
-    is absent, fail fast with a clear, SECRET-FREE message.
-    """
-    name = spec.model.api_key_env
-    if not name:
-        # No auth declared — e.g. a co-located local model over baseURL.
-        return _NO_AUTH_PLACEHOLDER
-    value = os.environ.get(name)
-    if value is None or value == "":
-        raise AgentBuildError(
-            f"model.apiKeyEnv {name!r} is declared in agent.yaml but env var "
-            f"{name!r} is not set; inject it at runtime, e.g. "
-            f"`docker run -e {name}=...`"
-        )
-    return value
+    """Compatibility wrapper over the shared API-key resolver."""
+    return resolve_api_key(spec)
 
 
 def build_model(spec: AgentSpec) -> ChatOpenAI:
@@ -103,32 +77,18 @@ def build_model(spec: AgentSpec) -> ChatOpenAI:
 
 
 def _tool_env(tool: ToolSpec) -> dict[str, str]:
-    """Select ONLY the env vars NAMED in ``tool.env`` (secret-bleed rule).
-
-    The MCP subprocess must never inherit the full container environment — that
-    would bleed the model API key (and every other secret) into every tool. We
-    pass through exactly the declared names that are actually present. Passing an
-    explicit empty dict is important: langchain-mcp-adapters intentionally
-    inherits a default env subset only when env is omitted/None.
-    """
-    return {name: os.environ[name] for name in tool.env if name in os.environ}
+    """Compatibility wrapper over the shared declared-only tool env helper."""
+    return declared_tool_env(tool)
 
 
 def build_mcp_connection(tool: ToolSpec) -> dict[str, Any]:
     """Convert an AgentKit stdio tool declaration into a LangChain MCP connection."""
-    if not tool.command:
-        # config.AgentSpec allows an empty command shape; the writer never emits
-        # one, but guard anyway so a hand-rolled agent.yaml fails clearly.
-        raise AgentBuildError(
-            f"tool {tool.name!r} has an empty command; a stdio MCP server needs "
-            f'at least the executable, e.g. command: ["uvx", "mcp-server-fetch"]'
-        )
-
+    command, args = split_tool_command(tool, example='["uvx", "mcp-server-fetch"]')
     timeout = _mcp_init_timeout()
     return {
         "transport": "stdio",
-        "command": tool.command[0],
-        "args": list(tool.command[1:]),
+        "command": command,
+        "args": args,
         # Declared-only env, even when empty; never let the MCP SDK inherit the
         # model key or process env by omission.
         "env": _tool_env(tool),
@@ -151,11 +111,12 @@ class LangGraphRuntime:
         self.graph: Any | None = None
         self.client: MultiServerMCPClient | None = None
 
-    async def __aenter__(self) -> "LangGraphRuntime":
+    async def __aenter__(self) -> RuntimeSession:
         try:
+            model = build_model(self.spec)
             tools = await self._load_tools()
             self.graph = create_agent(
-                model=build_model(self.spec),
+                model=model,
                 tools=tools,
                 system_prompt=self.spec.instructions,
             )
@@ -164,9 +125,18 @@ class LangGraphRuntime:
             await self.stack.aclose()
             raise
 
-    async def __aexit__(self, exc_type, exc, tb) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool | None:
         self.graph = None
         await self.stack.aclose()
+        return None
+
+    async def run(self, request: RunRequest) -> RunResult:
+        return await run_agent(self, request)
 
     async def _load_tools(self) -> list[Any]:
         if not self.spec.tools:
@@ -190,49 +160,39 @@ class LangGraphRuntime:
         return tools
 
 
-def build_agent(spec: AgentSpec) -> LangGraphRuntime:
-    """Assemble the LangGraph runtime wrapper for one AgentKit agent spec."""
+def build_runtime(spec: AgentSpec) -> LangGraphRuntime:
+    """Build the runtime session consumed by the shared server."""
     return LangGraphRuntime(spec)
 
 
-def _to_messages(history: list[tuple[str, str]] | None, prompt: str) -> list[BaseMessage]:
-    """Map neutral ``(role, text)`` history + final prompt to LangChain messages.
+def build_agent(spec: AgentSpec) -> LangGraphRuntime:
+    """Compatibility alias for wrappers that build an adapter runtime directly."""
+    return build_runtime(spec)
+
+
+def _to_messages(request: RunRequest) -> list[BaseMessage]:
+    """Map a neutral RunRequest to LangChain messages.
 
     The agent's own ``spec.instructions`` is passed as ``system_prompt`` when the
     graph is created; do not duplicate it here.
     """
     messages: list[BaseMessage] = []
-    for role, text in history or []:
-        if role not in _FORWARDED_ROLES or not text:
+    for turn in request.history:
+        if turn.role not in FORWARDED_ROLES or not turn.text:
             continue
-        if role == "system":
-            messages.append(SystemMessage(content=text))
-        elif role == "user":
-            messages.append(HumanMessage(content=text))
-        elif role == "assistant":
-            messages.append(AIMessage(content=text))
-    messages.append(HumanMessage(content=prompt))
+        if turn.role == "system":
+            messages.append(SystemMessage(content=turn.text))
+        elif turn.role == "user":
+            messages.append(HumanMessage(content=turn.text))
+        elif turn.role == "assistant":
+            messages.append(AIMessage(content=turn.text))
+    messages.append(HumanMessage(content=request.prompt))
     return messages
 
 
 def _status_of(exc: Exception) -> int:
-    """Best-effort upstream HTTP status from a model/SDK error (else 502).
-
-    Duck-typed on ``status_code`` and walks common wrapper links, matching the MAF
-    adapter's behavior for OpenAI SDK errors wrapped by framework exceptions.
-    """
-    seen: set[int] = set()
-    cur: BaseException | None = exc
-    for _ in range(10):  # bounded walk; guards against pathological cycles
-        if cur is None or id(cur) in seen:
-            break
-        seen.add(id(cur))
-        code = getattr(cur, "status_code", None)
-        if isinstance(code, int) and 400 <= code <= 599:
-            return code
-        nxt = getattr(cur, "inner_exception", None) or cur.__cause__ or cur.__context__
-        cur = nxt
-    return 502
+    """Compatibility wrapper over shared upstream status unwrapping."""
+    return upstream_status_code(exc)
 
 
 def _state_messages(state: Any) -> list[Any]:
@@ -326,26 +286,17 @@ def _state_usage(state: Any) -> dict[str, int]:
     return totals
 
 
-async def run_agent(
-    agent: LangGraphRuntime,
-    prompt: str,
-    history: list[tuple[str, str]] | None = None,
-) -> RunResult:
+async def run_agent(agent: LangGraphRuntime, request: RunRequest) -> RunResult:
     """Run the compiled LangGraph once and return a neutral ``RunResult``."""
     if agent.graph is None:
         raise AgentRunError("agent graph is not initialized", status=500, code="AgentNotInitialized")
 
     try:
-        state = await agent.graph.ainvoke({"messages": _to_messages(history, prompt)})
+        state = await agent.graph.ainvoke({"messages": _to_messages(request)})
     except AgentRunError:
         raise
     except Exception as exc:  # noqa: BLE001 — normalized for the façade
-        # Preserve the original framework/model exception class name in error.code.
-        raise AgentRunError(
-            f"agent run failed: {exc}",
-            status=_status_of(exc),
-            code=exc.__class__.__name__,
-        ) from exc
+        raise normalize_agent_run_error(exc) from exc
 
     msg = _last_ai_message(state)
     return RunResult(text=_message_text(msg), usage=_state_usage(state))

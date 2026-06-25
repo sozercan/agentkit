@@ -31,7 +31,7 @@ RUN apt-get update \
 
 # --- uv / uvx (for PyPI-distributed MCP servers via `uvx ...`) ---------------
 # Copy the static uv + uvx binaries from the official image onto PATH.
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+COPY --from=ghcr.io/astral-sh/uv:0.11.24@sha256:99ea34acedc870ba4ad11a1f540a1c04267c9f30aadc465a94406f52dfda2c36 /uv /uvx /usr/local/bin/
 
 # AgentKit layout constants (must match pkg/utils/const.go):
 #   AgentKitRoot = /opt/agentkit ; ServeBinary = /opt/agentkit/bin/agentkit-serve

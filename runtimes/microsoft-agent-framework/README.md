@@ -24,8 +24,8 @@ This adapter ships ONLY `agent_factory.py` (which imports MAF) plus a thin
 `__main__.py`. The framework-neutral core — the `/agent/agent.yaml` ABI loader, the
 OpenAI `/v1` facade, and the CLI/network posture — lives in the shared
 `agentkit-serve-common` package. `agent_factory` satisfies that package's
-`RuntimeFactory` protocol (`build_agent` + `run_agent` → a neutral `RunResult`),
-which is the seam that keeps the shared core framework-agnostic.
+`RuntimeFactory` protocol (`build_runtime` → `RuntimeSession.run` → a neutral
+`RunResult`), which is the seam that keeps the shared core framework-agnostic.
 
 
 ## Lock-in boundary (plan §12)
