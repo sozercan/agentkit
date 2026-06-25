@@ -1,31 +1,36 @@
 # AgentKit LangGraph runtime adapter
 
-`runtimes/langgraph` is the generic LangChain/LangGraph AgentKit runtime. It
-consumes the same frozen `/agent/agent.yaml` ABI as the pydantic-ai and Microsoft
-Agent Framework adapters, and serves the same non-streaming OpenAI-compatible
-surface:
+`runtimes/langgraph` builds the AgentKit runtime adapter backed by
+LangChain/LangGraph. It consumes the same `/agent/agent.yaml` ABI as the other
+adapters and serves the same non-streaming OpenAI-compatible surface:
 
 - `GET /healthz`
 - `GET /v1/models`
 - `POST /v1/chat/completions`
 
-## Support level
+Select it from an Agentkitfile with:
 
-`runtime: langgraph` supports AgentKit-authored single-agent LangGraph agents
-generated from the AgentKit ABI:
+```yaml
+runtime: langgraph
+```
 
-- `model.provider: openai-compatible` via `langchain_openai.ChatOpenAI`
-- `instructions` as the graph `system_prompt`
-- stdio MCP `tools` loaded with `langchain-mcp-adapters`
-- one final collapsed assistant message through AgentKit's `/v1` façade
+## Responsibilities
 
-Arbitrary user-authored LangGraph modules, checkpointing, streaming, multi-node
-graph authoring, and Microsoft Foundry `/responses` or `/invocations` protocol
-serving are intentionally out of scope for this generic adapter.
+- Build a LangChain OpenAI chat model from `model.baseURL`, `model.name`, and the
+  env var named by `model.apiKeyEnv`.
+- Create a LangGraph agent from the resolved `instructions` system prompt.
+- Start persistent stdio MCP sessions for ABI-declared tools during app lifespan.
+- Prefix tool names by server name to avoid collisions.
+- Convert the final LangChain `AIMessage` into the neutral `RunResult` contract.
+- Aggregate usage metadata across every AI message in a tool-using run.
+
+The shared server, ABI reader, CLI, network posture, auth behavior, and
+conformance tests live in `runtimes/common`.
 
 ## Dependency boundary
 
-This adapter depends on LangChain/LangGraph/OpenAI/MCP packages only:
+This adapter depends on LangChain/LangGraph/OpenAI/MCP packages plus
+`agentkit-serve-common`:
 
 - `langchain`
 - `langgraph`
@@ -34,16 +39,16 @@ This adapter depends on LangChain/LangGraph/OpenAI/MCP packages only:
 - `mcp`
 - `agentkit-serve-common`
 
-It must not import Azure or Foundry hosting packages such as
-`langchain_azure_ai` or `azure.*`. A future Foundry-native mode should be a
-separate adapter/target so the generic LangGraph runtime stays cloud-neutral.
+It intentionally does not import Azure or Foundry hosting packages. Guardrail
+tests in `tests/test_guardrails.py` enforce that the generic LangGraph adapter
+stays cloud-neutral.
 
 ## Tool lifecycle and secret hygiene
 
 Each `tools:` entry is treated as one stdio MCP server. The adapter creates a
 persistent `MultiServerMCPClient` session for each server during FastAPI lifespan
 startup, initializes it with `AGENTKIT_MCP_TIMEOUT` (default `120` seconds), loads
-LangChain tools with `tool_name_prefix=True`, and closes sessions at shutdown.
+LangChain tools with prefixed names, and closes sessions at shutdown.
 
 Tool subprocess env is declared-only. If a tool declares:
 
@@ -70,20 +75,15 @@ pip install -e ../common -e '.[dev]'
 pytest -q
 ```
 
-Build the adapter image:
+Build the adapter image and a LangGraph-backed test agent:
 
 ```sh
 make build-serve-langgraph
-```
-
-Build a test AgentKit image with the LangGraph runtime:
-
-```sh
 make build-agentkit
 make build-test-agent RUNTIME=langgraph
 ```
 
-Run it (requires the model API key named by the fixture):
+Run it with the model API key named by the fixture:
 
 ```sh
 docker run --rm --platform linux/amd64 \
@@ -91,3 +91,6 @@ docker run --rm --platform linux/amd64 \
   -e OPENAI_API_KEY="$OPENAI_API_KEY" \
   langgraph-agent:test
 ```
+
+See `docs/runtime-adapters.md` and `docs/agent-abi.md` for the shared runtime
+contract.
