@@ -6,20 +6,14 @@ import (
 	"github.com/moby/buildkit/util/system"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sozercan/agentkit/pkg/agentkit/abi"
-	"github.com/sozercan/agentkit/pkg/agentkit/config"
-	"github.com/sozercan/agentkit/pkg/agentkit/runtimes"
+	"github.com/sozercan/agentkit/pkg/agentkit/effective"
 	"github.com/sozercan/agentkit/pkg/utils"
 )
 
 // NewImageConfig builds the OCI image config for the agent image. It deliberately
 // does NOT inherit AIKit's root user: per plan §10 the agent runs non-root, binds
 // loopback by default, and exposes the serve port.
-func NewImageConfig(cfg *config.AgentConfig, platform *specs.Platform) *specs.Image {
-	port := cfg.Expose.Port
-	if port == 0 {
-		port = utils.DefaultPort
-	}
-
+func NewImageConfig(agent effective.Agent, platform *specs.Platform) *specs.Image {
 	img := &specs.Image{
 		Platform: specs.Platform{
 			Architecture: platform.Architecture,
@@ -40,28 +34,18 @@ func NewImageConfig(cfg *config.AgentConfig, platform *specs.Platform) *specs.Im
 	}
 
 	img.Config.ExposedPorts = map[string]struct{}{
-		fmt.Sprintf("%d/tcp", port): {},
+		fmt.Sprintf("%d/tcp", agent.Expose.Port): {},
 	}
 
 	img.Config.Labels = map[string]string{
-		utils.LabelPrefix + ".runtime":   runtimeLabel(cfg),
-		utils.LabelPrefix + ".name":      cfg.Metadata.Name,
+		utils.LabelPrefix + ".runtime":   agent.Runtime,
+		utils.LabelPrefix + ".name":      agent.Metadata.Name,
 		utils.LabelPrefix + ".abi":       abi.Version,
-		"org.opencontainers.image.title": cfg.Metadata.Name,
+		"org.opencontainers.image.title": agent.Metadata.Name,
 	}
-	for k, v := range cfg.Metadata.Labels {
+	for k, v := range agent.Metadata.Labels {
 		img.Config.Labels[k] = v
 	}
 
 	return img
-}
-
-// runtimeLabel returns the canonical runtime name for the image label,
-// defaulting to the v0 runtime when unset and resolving any alias (e.g. "maf")
-// to its canonical form so the label is stable across spellings.
-func runtimeLabel(cfg *config.AgentConfig) string {
-	if cfg.Runtime != "" {
-		return runtimes.CanonicalRuntime(cfg.Runtime)
-	}
-	return runtimes.PydanticAI
 }

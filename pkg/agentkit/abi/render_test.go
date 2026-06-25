@@ -7,6 +7,7 @@ import (
 
 	"github.com/goccy/go-yaml"
 	"github.com/sozercan/agentkit/pkg/agentkit/config"
+	"github.com/sozercan/agentkit/pkg/agentkit/effective"
 )
 
 // testAPIKeyEnvName is the NAME of an env var (not a secret). Hoisted to a const
@@ -36,6 +37,10 @@ func sampleConfig() *config.AgentConfig {
 	}
 }
 
+func sampleAgent() effective.Agent {
+	return effective.FromConfig(sampleConfig(), testInstructions)
+}
+
 func TestVersionAndPath(t *testing.T) {
 	if Version != "v0" {
 		t.Fatalf("Version = %q, want v0", Version)
@@ -46,7 +51,7 @@ func TestVersionAndPath(t *testing.T) {
 }
 
 func TestRenderAgentYAMLMatchesGolden(t *testing.T) {
-	out, err := Render(sampleConfig(), testInstructions)
+	out, err := Render(sampleAgent())
 	if err != nil {
 		t.Fatalf("render error: %v", err)
 	}
@@ -60,7 +65,7 @@ func TestRenderAgentYAMLMatchesGolden(t *testing.T) {
 }
 
 func TestRenderAgentYAMLShape(t *testing.T) {
-	out, err := Render(sampleConfig(), testInstructions)
+	out, err := Render(sampleAgent())
 	if err != nil {
 		t.Fatalf("render error: %v", err)
 	}
@@ -92,7 +97,7 @@ func TestRenderAgentYAMLShape(t *testing.T) {
 // loading this package's golden with agentkit_serve_common.config.load — lives
 // in runtimes/common/tests/test_abi_contract.py.
 func TestRenderAgentYAMLRoundTrips(t *testing.T) {
-	out, err := Render(sampleConfig(), testInstructions)
+	out, err := Render(sampleAgent())
 	if err != nil {
 		t.Fatalf("render error: %v", err)
 	}

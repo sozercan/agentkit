@@ -1,4 +1,4 @@
-// Package agent converts a validated AgentConfig into a BuildKit LLB graph plus
+// Package agent converts an effective Agent into a BuildKit LLB graph plus
 // an OCI image config. v0 uses the runtime adapter image as the LLB base and
 // merges exactly one layer on top: the resolved /agent/agent.yaml. It does NOT
 // rootfs-copy any tool image (plan §5.2 ⚠): v0 tools are stdio commands recorded
@@ -11,19 +11,19 @@ import (
 	"github.com/moby/buildkit/client/llb"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sozercan/agentkit/pkg/agentkit/abi"
-	"github.com/sozercan/agentkit/pkg/agentkit/config"
+	"github.com/sozercan/agentkit/pkg/agentkit/effective"
 	"github.com/sozercan/agentkit/pkg/utils"
 )
 
-// Agentkit2LLB converts an AgentConfig to an LLB state and image config. The
+// Agentkit2LLB converts an effective Agent to an LLB state and image config. The
 // adapter image (agentkit-serve) is the base; the only delta merged on top is
-// the baked agent.yaml. instructions is the already-resolved system prompt.
-func Agentkit2LLB(cfg *config.AgentConfig, adapterRef, instructions string, platform *specs.Platform) (llb.State, *specs.Image, error) {
+// the baked agent.yaml.
+func Agentkit2LLB(agent effective.Agent, adapterRef string, platform *specs.Platform) (llb.State, *specs.Image, error) {
 	if platform == nil {
 		return llb.State{}, nil, os.ErrInvalid
 	}
 
-	agentYAML, err := abi.Render(cfg, instructions)
+	agentYAML, err := abi.Render(agent)
 	if err != nil {
 		return llb.State{}, nil, err
 	}
@@ -45,5 +45,5 @@ func Agentkit2LLB(cfg *config.AgentConfig, adapterRef, instructions string, plat
 		return llb.State{}, nil, err
 	}
 
-	return merge, NewImageConfig(cfg, platform), nil
+	return merge, NewImageConfig(agent, platform), nil
 }
