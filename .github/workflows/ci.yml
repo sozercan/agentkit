@@ -203,9 +203,8 @@ jobs:
       - name: Configure Docker Buildx daemon builder
         run: |
           docker buildx version
-          docker buildx inspect default --bootstrap
-          echo "BUILDER=default" >> "$GITHUB_ENV"
-          echo "BUILDX_BUILDER=default" >> "$GITHUB_ENV"
+          docker buildx inspect --bootstrap
+          echo "BUILDER=" >> "$GITHUB_ENV"
 
       - name: Build AgentKit frontend and runtime adapters
         run: |
@@ -217,8 +216,8 @@ jobs:
       - name: Build test agent images for both runtimes
         run: |
           set -euxo pipefail
-          make build-test-agent TAG=ci BUILDER=default
-          make build-test-agent TAG=ci BUILDER=default RUNTIME=maf
+          make build-test-agent TAG=ci BUILDER=
+          make build-test-agent TAG=ci BUILDER= RUNTIME=maf
 
       - name: Smoke test built agent images
         run: |
@@ -344,9 +343,8 @@ jobs:
         if: steps.gate.outputs.run == 'true'
         run: |
           docker buildx version
-          docker buildx inspect default --bootstrap
-          echo "BUILDER=default" >> "$GITHUB_ENV"
-          echo "BUILDX_BUILDER=default" >> "$GITHUB_ENV"
+          docker buildx inspect --bootstrap
+          echo "BUILDER=" >> "$GITHUB_ENV"
 
       - name: Run live Copilot-backed AgentKit E2E
         if: steps.gate.outputs.run == 'true'

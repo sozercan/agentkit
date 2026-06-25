@@ -29,7 +29,7 @@ agent_host_port="${AGENTKIT_LIVE_HOST_PORT:-18080}"
 agent_auth_token="${AGENTKIT_AUTH_TOKEN:-agentkit-live-ci-token}"
 tag="${TAG:-ci-live}"
 platform="${PLATFORM:-linux/amd64}"
-builder="${BUILDER:-default}"
+builder="${BUILDER:-}"
 
 redact() {
   local text
@@ -128,13 +128,18 @@ main() {
   jq -e '.data[] | select(.id == "claude-haiku-4.5")' "${work_dir}/models.json" >/dev/null
 
   log "Building AgentKit frontend and MAF adapter"
-  docker buildx inspect "${builder}" --bootstrap
-  export BUILDX_BUILDER="${builder}"
+  buildx_args=()
+  if [[ -n "${builder}" ]]; then
+    docker buildx inspect "${builder}" --bootstrap
+    buildx_args=(--builder "${builder}")
+  else
+    docker buildx inspect --bootstrap
+  fi
   make build-agentkit TAG="${tag}"
   make build-serve-maf TAG="${tag}"
 
   log "Building live MAF agent image"
-  docker buildx build --builder "${builder}" . -f test/agentkitfile-maf-live.yaml \
+  docker buildx build "${buildx_args[@]}" . -f test/agentkitfile-maf-live.yaml \
     --build-arg BUILDKIT_SYNTAX="agentkit:${tag}" \
     --build-arg adapter="agentkit-serve-maf:${tag}" \
     --platform "${platform}" \
