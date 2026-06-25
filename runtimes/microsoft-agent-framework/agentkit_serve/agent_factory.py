@@ -29,30 +29,29 @@ package — including the first-party submodules ``agent_framework.azure`` /
 agent_framework.openai`` was verified to pull in zero ``azure*`` modules. The
 boundary is enforced by ``tests/test_guardrails.py`` (AST-based, which is why a
 naive source grep is not relied upon — it would false-positive on this docstring).
+
+Cross-runtime invariants such as API-key resolution, secret-safe tool env
+projection, MCP timeout parsing, and error normalization live in
+``agentkit_serve_common.adapter_support`` so this Module stays focused on MAF's
+concrete Adapter shape.
 """
 
 from __future__ import annotations
 
-import os
-
-from agent_framework import Agent, Message, MCPStdioTool
+from agent_framework import Agent, MCPStdioTool, Message
 from agent_framework.openai import OpenAIChatCompletionClient
+from agentkit_serve_common.adapter_support import (
+    FORWARDED_ROLES,
+    AgentBuildError,
+    declared_tool_env,
+    normalize_agent_run_error,
+    positive_int_env,
+    resolve_api_key,
+    split_tool_command,
+    upstream_status_code,
+)
 from agentkit_serve_common.config import AgentSpec, ToolSpec
-from agentkit_serve_common.runtime import AgentRunError, RunResult
-
-# Placeholder API key for OpenAI-compatible endpoints that need no auth (many
-# local servers reject an EMPTY string but accept any non-empty token). Used only
-# when the spec declares no apiKeyEnv. Never a real secret.
-_NO_AUTH_PLACEHOLDER = "not-needed"
-
-# Roles we forward from the request history into the MAF conversation. The agent
-# owns its tools, so client-supplied ``tool`` turns are meaningless and dropped by
-# the server before they reach here; this set is a defensive second gate.
-_FORWARDED_ROLES = frozenset({"system", "user", "assistant"})
-
-
-class AgentBuildError(Exception):
-    """Raised when the agent cannot be constructed (e.g. missing API key env)."""
+from agentkit_serve_common.runtime import RunResult
 
 
 def _mcp_request_timeout() -> int | None:
@@ -66,35 +65,12 @@ def _mcp_request_timeout() -> int | None:
     preserves the ``AGENTKIT_MCP_TIMEOUT`` knob (plan Open Q2) without regressing
     cold-start behavior.
     """
-    raw = os.environ.get("AGENTKIT_MCP_TIMEOUT")
-    if not raw:
-        return None
-    try:
-        val = int(float(raw))
-    except ValueError:
-        return None
-    return val if val > 0 else None
+    return positive_int_env(default=None)
 
 
 def _resolve_api_key(spec: AgentSpec) -> str:
-    """Resolve the model API key from the env var NAMED in the spec.
-
-    Per the ABI, ``model.apiKeyEnv`` is the NAME of an env var; the value is
-    injected at runtime (``docker run -e``). If the name is declared but the var
-    is absent, fail fast with a clear, SECRET-FREE message.
-    """
-    name = spec.model.api_key_env
-    if not name:
-        # No auth declared — e.g. a co-located local model over baseURL.
-        return _NO_AUTH_PLACEHOLDER
-    value = os.environ.get(name)
-    if value is None or value == "":
-        raise AgentBuildError(
-            f"model.apiKeyEnv {name!r} is declared in agent.yaml but env var "
-            f"{name!r} is not set; inject it at runtime, e.g. "
-            f"`docker run -e {name}=...`"
-        )
-    return value
+    """Compatibility wrapper around the shared adapter support Module."""
+    return resolve_api_key(spec)
 
 
 def build_client(spec: AgentSpec) -> OpenAIChatCompletionClient:
@@ -102,18 +78,13 @@ def build_client(spec: AgentSpec) -> OpenAIChatCompletionClient:
     return OpenAIChatCompletionClient(
         model=spec.model.name,
         base_url=spec.model.base_url,
-        api_key=_resolve_api_key(spec),
+        api_key=resolve_api_key(spec),
     )
 
 
 def _tool_env(tool: ToolSpec) -> dict[str, str]:
-    """Select ONLY the env vars NAMED in ``tool.env`` (plan §10 secret-bleed rule).
-
-    The MCP subprocess must never inherit the full container environment — that
-    would bleed the model API key (and every other secret) into every tool. We
-    pass through exactly the declared names that are actually present.
-    """
-    return {name: os.environ[name] for name in tool.env if name in os.environ}
+    """Compatibility wrapper around the shared secret-safe tool env projection."""
+    return declared_tool_env(tool)
 
 
 def build_tool(tool: ToolSpec) -> MCPStdioTool:
@@ -123,18 +94,12 @@ def build_tool(tool: ToolSpec) -> MCPStdioTool:
     server starts its subprocess once inside the agent's lifespan, mirroring the
     pydantic-ai adapter's ``async with agent:``.
     """
-    if not tool.command:
-        # config.AgentSpec allows an empty command shape; the writer never emits
-        # one, but guard anyway so a hand-rolled agent.yaml fails clearly.
-        raise AgentBuildError(
-            f"tool {tool.name!r} has an empty command; a stdio MCP server needs "
-            f'at least the executable, e.g. command: ["uvx", "mcp-server-fetch"]'
-        )
+    command, args = split_tool_command(tool, example='["uvx", "mcp-server-fetch"]')
     kwargs: dict[str, object] = {
         "name": tool.name,  # the server's identity (used in error messages/spans)
-        "command": tool.command[0],
-        "args": list(tool.command[1:]),
-        "env": _tool_env(tool),
+        "command": command,
+        "args": args,
+        "env": declared_tool_env(tool),
         # tool_name_prefix namespaces the tool names THIS server exposes, so two
         # servers can't collide (MAF raises "Duplicate tool name" otherwise). This
         # mirrors the pydantic-ai adapter's tool_prefix=tool.name. NOTE: the server
@@ -164,32 +129,8 @@ def build_agent(spec: AgentSpec) -> Agent:
 
 
 def _status_of(exc: Exception) -> int:
-    """Best-effort upstream HTTP status from a model/SDK error (else 502).
-
-    Duck-typed on ``status_code`` (the OpenAI SDK's ``APIStatusError`` exposes it)
-    so we map a real upstream 4xx/5xx through WITHOUT importing the SDK error type
-    — keeping the dependency surface minimal and version-resilient.
-
-    MAF WRAPS the SDK error in its own ``ChatClientException`` (raised ``from`` the
-    original and also stored as ``inner_exception``), and that wrapper has no
-    ``status_code``. So we walk the exception chain — the exception itself, its
-    ``inner_exception``, then ``__cause__``/``__context__`` — and return the first
-    real HTTP status we find. This matches the pydantic-ai adapter's behavior
-    (its ``ModelHTTPError.status_code`` is top-level) so upstream 4xx pass through
-    identically across runtimes, verified live against a 400 ``model_not_supported``.
-    """
-    seen: set[int] = set()
-    cur: BaseException | None = exc
-    for _ in range(10):  # bounded walk; guards against pathological cycles
-        if cur is None or id(cur) in seen:
-            break
-        seen.add(id(cur))
-        code = getattr(cur, "status_code", None)
-        if isinstance(code, int) and 400 <= code <= 599:
-            return code
-        nxt = getattr(cur, "inner_exception", None) or cur.__cause__ or cur.__context__
-        cur = nxt
-    return 502
+    """Compatibility wrapper around shared upstream status extraction."""
+    return upstream_status_code(exc)
 
 
 def _result_text(result: object) -> str:
@@ -228,28 +169,21 @@ def _to_messages(history: list[tuple[str, str]] | None, prompt: str) -> list[Mes
     """
     messages: list[Message] = []
     for role, text in history or []:
-        if role in _FORWARDED_ROLES and text:
+        if role in FORWARDED_ROLES and text:
             messages.append(Message(role=role, contents=[text]))
     messages.append(Message(role="user", contents=[prompt]))
     return messages
 
 
-async def run_agent(agent: Agent, prompt: str, history: list[tuple[str, str]] | None = None) -> RunResult:
-    """Framework-agnostic run helper so ``server.py`` stays identical across adapters.
-
-    Accepts the neutral ``(history, prompt)`` the server produces, runs the MAF
-    agent once (non-streaming), and returns a neutral :class:`RunResult`. Any
-    framework/model error is normalized to :class:`AgentRunError` carrying an HTTP
-    status, so the server never imports a framework or SDK exception type.
-    """
+async def run_agent(
+    agent: Agent,
+    prompt: str,
+    history: list[tuple[str, str]] | None = None,
+) -> RunResult:
+    """Run the MAF agent and return the neutral result shape."""
     messages = _to_messages(history, prompt)
     try:
         result = await agent.run(messages)
     except Exception as exc:  # noqa: BLE001 — normalized for the façade
-        # Preserve the original framework exception's class name in error.code.
-        raise AgentRunError(
-            f"agent run failed: {exc}",
-            status=_status_of(exc),
-            code=exc.__class__.__name__,
-        ) from exc
+        raise normalize_agent_run_error(exc) from exc
     return RunResult(text=_result_text(result), usage=_result_usage(result))
