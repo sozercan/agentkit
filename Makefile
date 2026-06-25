@@ -25,6 +25,10 @@ TAG ?= test
 # build-test-agent defaults to the daemon-backed `desktop-linux` builder. Override
 # with `make build-test-agent BUILDER=<name>` (use a `docker` driver builder).
 BUILDER ?= desktop-linux
+BUILDER_FLAG :=
+ifneq ($(strip $(BUILDER)),)
+BUILDER_FLAG := --builder $(BUILDER)
+endif
 
 # The runtime adapter image (agentkit-serve) is linux/amd64 (its uv base is
 # amd64-only), so the test agent is built for the same platform.
@@ -94,7 +98,7 @@ build-serve-maf:
 # --provenance=false keeps the output a plain single-platform image for --load.
 .PHONY: build-test-agent
 build-test-agent:
-	docker buildx build --builder $(BUILDER) . -f $(FIXTURE) \
+	docker buildx build $(BUILDER_FLAG) . -f $(FIXTURE) \
 		--build-arg BUILDKIT_SYNTAX=agentkit:$(TAG) \
 		--build-arg adapter=$(SERVE_IMAGE) \
 		--platform $(PLATFORM) \
