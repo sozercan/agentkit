@@ -29,6 +29,17 @@ The frozen `/agent/agent.yaml` contract between the Go frontend writer and the
 Python runtime Reader. The writer renders it from an Effective Agent; every
 runtime Adapter reads the same ABI shape.
 
+### Conversation
+The ordered OpenAI message list supplied to the `/v1/chat/completions` facade.
+The shared runtime core normalizes it into a Run Request before any runtime
+Adapter maps it to framework-specific message objects.
+
+### Run Request
+The framework-neutral request for one non-streaming agent run. It contains prior
+Conversation turns plus the final user prompt, with client-owned tool turns and
+unsupported roles removed. Runtime Adapters consume Run Requests instead of raw
+OpenAI messages.
+
 ### Runtime Adapter
 A concrete in-image implementation that reads the Agent YAML ABI and serves the
 OpenAI-compatible `/v1` facade using a particular agent framework, such as

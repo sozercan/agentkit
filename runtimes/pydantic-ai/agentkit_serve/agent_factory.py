@@ -46,6 +46,7 @@ from agentkit_serve_common.adapter_support import (
     upstream_status_code,
 )
 from agentkit_serve_common.config import AgentSpec, ToolSpec
+from agentkit_serve_common.conversation import RunRequest
 from agentkit_serve_common.runtime import RunResult
 
 # Seconds to wait for a stdio MCP server's initialize handshake. pydantic-ai's
@@ -123,11 +124,11 @@ def build_agent(spec: AgentSpec) -> Agent:
     )
 
 
-def _to_message_history(history: list[tuple[str, str]] | None) -> list:
-    """Map neutral ``(role, text)`` tuples to a pydantic-ai message_history list.
+def _to_message_history(request: RunRequest) -> list:
+    """Map a neutral RunRequest to a pydantic-ai message_history list.
 
-    The agent's own ``instructions`` are applied by pydantic-ai; this mirrors the
-    server's previous inline ``_split_conversation`` mapping exactly.
+    The agent's own ``instructions`` are applied by pydantic-ai; this function
+    handles only prior conversation turns.
     """
     # Imported lazily so config-only consumers don't pull the messages module.
     from pydantic_ai.messages import (
@@ -139,15 +140,15 @@ def _to_message_history(history: list[tuple[str, str]] | None) -> list:
     )
 
     out: list = []
-    for role, text in history or []:
-        if not text or role not in FORWARDED_ROLES:
+    for turn in request.history:
+        if not turn.text or turn.role not in FORWARDED_ROLES:
             continue
-        if role == "user":
-            out.append(ModelRequest(parts=[UserPromptPart(content=text)]))
-        elif role == "system":
-            out.append(ModelRequest(parts=[SystemPromptPart(content=text)]))
-        elif role == "assistant":
-            out.append(ModelResponse(parts=[TextPart(content=text)]))
+        if turn.role == "user":
+            out.append(ModelRequest(parts=[UserPromptPart(content=turn.text)]))
+        elif turn.role == "system":
+            out.append(ModelRequest(parts=[SystemPromptPart(content=turn.text)]))
+        elif turn.role == "assistant":
+            out.append(ModelResponse(parts=[TextPart(content=turn.text)]))
     return out
 
 
@@ -182,15 +183,11 @@ def _result_usage(result: object) -> dict[str, int]:
     }
 
 
-async def run_agent(
-    agent: Agent,
-    prompt: str,
-    history: list[tuple[str, str]] | None = None,
-) -> RunResult:
+async def run_agent(agent: Agent, request: RunRequest) -> RunResult:
     """Run the pydantic-ai agent and return the neutral result shape."""
-    message_history = _to_message_history(history)
+    message_history = _to_message_history(request)
     try:
-        result = await agent.run(prompt, message_history=message_history)
+        result = await agent.run(request.prompt, message_history=message_history)
     except Exception as exc:  # noqa: BLE001 — normalized for the façade
         raise normalize_agent_run_error(exc) from exc
     return RunResult(text=_result_text(result), usage=_result_usage(result))

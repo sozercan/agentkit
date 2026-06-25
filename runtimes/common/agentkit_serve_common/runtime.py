@@ -13,6 +13,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
+from .conversation import RunRequest
+
 
 class AgentRunError(Exception):
     """A runtime/model failure during a run, carrying an HTTP status.
@@ -48,13 +50,11 @@ class RuntimeFactory(Protocol):
 
     * ``build_agent(spec)`` → an async-context-manager agent (the lifespan enters
       it once: ``async with agent:``), reused across requests.
-    * ``run_agent(agent, prompt, history)`` → a :class:`RunResult`; raises
+    * ``run_agent(agent, request)`` → a :class:`RunResult`; raises
       :class:`AgentRunError` (with an HTTP status) on a framework/model failure.
     """
 
     def build_agent(self, spec: Any) -> Any:  # returns an async context manager
         ...
 
-    async def run_agent(
-        self, agent: Any, prompt: str, history: list[tuple[str, str]] | None = None
-    ) -> RunResult: ...
+    async def run_agent(self, agent: Any, request: RunRequest) -> RunResult: ...

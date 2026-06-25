@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 
 from .config import AgentSpec, ToolSpec
+from .conversation import FORWARDED_ROLES
 from .runtime import AgentRunError
 
 # Placeholder API key for OpenAI-compatible endpoints that need no auth (many
@@ -19,8 +20,6 @@ from .runtime import AgentRunError
 # when the spec declares no apiKeyEnv. Never a real secret.
 NO_AUTH_API_KEY = "not-needed"
 
-# Roles forwarded from request history into framework-specific conversations.
-FORWARDED_ROLES = frozenset({"system", "user", "assistant"})
 
 MCP_TIMEOUT_ENV = "AGENTKIT_MCP_TIMEOUT"
 

@@ -51,6 +51,7 @@ from agentkit_serve_common.adapter_support import (
     upstream_status_code,
 )
 from agentkit_serve_common.config import AgentSpec, ToolSpec
+from agentkit_serve_common.conversation import RunRequest
 from agentkit_serve_common.runtime import RunResult
 
 
@@ -161,27 +162,23 @@ def _result_usage(result: object) -> dict[str, int]:
     }
 
 
-def _to_messages(history: list[tuple[str, str]] | None, prompt: str) -> list[Message]:
-    """Map neutral ``(role, text)`` history + the final user prompt to MAF messages.
+def _to_messages(request: RunRequest) -> list[Message]:
+    """Map a neutral RunRequest to MAF messages.
 
     The agent's own ``instructions`` are prepended by MAF as a system message; this
-    mirrors the pydantic-ai adapter's ``_split_conversation`` mapping shape.
+    function handles prior conversation turns plus the final user prompt.
     """
     messages: list[Message] = []
-    for role, text in history or []:
-        if role in FORWARDED_ROLES and text:
-            messages.append(Message(role=role, contents=[text]))
-    messages.append(Message(role="user", contents=[prompt]))
+    for turn in request.history:
+        if turn.role in FORWARDED_ROLES and turn.text:
+            messages.append(Message(role=turn.role, contents=[turn.text]))
+    messages.append(Message(role="user", contents=[request.prompt]))
     return messages
 
 
-async def run_agent(
-    agent: Agent,
-    prompt: str,
-    history: list[tuple[str, str]] | None = None,
-) -> RunResult:
+async def run_agent(agent: Agent, request: RunRequest) -> RunResult:
     """Run the MAF agent and return the neutral result shape."""
-    messages = _to_messages(history, prompt)
+    messages = _to_messages(request)
     try:
         result = await agent.run(messages)
     except Exception as exc:  # noqa: BLE001 — normalized for the façade
