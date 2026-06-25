@@ -245,10 +245,10 @@ expose:
 }
 
 // TestValidateAcceptsRegisteredRuntimes proves the widened runtime gate (plan §8):
-// the canonical MAF name, its "maf" alias, the default runtime, and an omitted
-// runtime all validate.
+// the canonical MAF name, its "maf" alias, LangGraph, the default runtime, and
+// an omitted runtime all validate.
 func TestValidateAcceptsRegisteredRuntimes(t *testing.T) {
-	for _, rt := range []string{"", "pydantic-ai", "microsoft-agent-framework", "maf"} {
+	for _, rt := range []string{"", "pydantic-ai", "microsoft-agent-framework", "maf", "langgraph"} {
 		cfg, err := NewFromBytes(agentBaseYAML(rt))
 		if err != nil {
 			t.Fatalf("runtime %q: parse error: %v", rt, err)
@@ -270,7 +270,9 @@ func TestValidateRejectsUnknownRuntime(t *testing.T) {
 	if verr == nil || !strings.Contains(verr.Error(), "runtime") {
 		t.Fatalf("expected unknown-runtime rejection, got: %v", verr)
 	}
-	if !strings.Contains(verr.Error(), "microsoft-agent-framework") {
-		t.Errorf("error should list supported runtimes; got: %v", verr)
+	for _, want := range []string{"microsoft-agent-framework", "langgraph"} {
+		if !strings.Contains(verr.Error(), want) {
+			t.Errorf("error should list supported runtime %q; got: %v", want, verr)
+		}
 	}
 }

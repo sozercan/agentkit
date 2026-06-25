@@ -58,15 +58,18 @@ the optional `runtime:` key:
 |---|---|---|
 | *(omitted)* / `pydantic-ai` | `agentkit-serve` | [pydantic-ai](https://ai.pydantic.dev) (default) |
 | `microsoft-agent-framework` (alias `maf`) | `agentkit-serve-maf` | [Microsoft Agent Framework](https://github.com/microsoft/agent-framework) |
+| `langgraph` | `agentkit-serve-langgraph` | [LangChain/LangGraph](https://docs.langchain.com/oss/python/langgraph/overview) |
 
 ```yaml
-runtime: microsoft-agent-framework   # or: maf
+runtime: langgraph
+# or: runtime: microsoft-agent-framework   # alias: maf
 ```
 
-Both runtimes consume the **same** baked `/agent/agent.yaml` and serve the
+All runtimes consume the **same** baked `/agent/agent.yaml` and serve the
 **same** non-streaming OpenAI `/v1` façade with the same guards — so the same
-agentkitfile produces a behavior-compatible image under either. Only the in-image
-runtime adapter differs. The `AGENTKIT_MCP_TIMEOUT` knob applies to both.
+agentkitfile produces a behavior-compatible image under any supported runtime.
+Only the in-image runtime adapter differs. The `AGENTKIT_MCP_TIMEOUT` knob
+applies to all runtimes.
 
 ## Local dev loop (3 steps)
 
@@ -92,16 +95,27 @@ make build-serve-maf                      # agentkit-serve-maf:test
 make build-test-agent RUNTIME=maf         # test/agentkitfile-maf-hello.yaml -> maf-agent:test
 ```
 
+To iterate on the **LangGraph** runtime, build its adapter and target it with
+`RUNTIME=langgraph`:
+
+```sh
+make build-serve-langgraph                # agentkit-serve-langgraph:test
+make build-test-agent RUNTIME=langgraph   # test/agentkitfile-langgraph-hello.yaml -> langgraph-agent:test
+```
+
 ## CI
 
 GitHub Actions runs the full closeout loop on pushes and pull requests:
 
 - Go lint, formatting, vet, race tests, and frontend build.
 - Python compile, pytest, and wheel checks for `runtimes/common/`,
-  `runtimes/pydantic-ai/`, and `runtimes/microsoft-agent-framework/`.
-- Docker builds for the frontend and both runtime adapters, followed by offline
-  `/healthz` smoke tests for generated pydantic-ai and MAF agent images.
-- Optional live Vekil-backed Copilot E2E, using the official pinned `ghcr.io/sozercan/vekil` image and a repository secret named
+  `runtimes/pydantic-ai/`, `runtimes/microsoft-agent-framework/`, and
+  `runtimes/langgraph/`.
+- Docker builds for the frontend and all three runtime adapters, followed by
+  offline `/healthz` smoke tests for generated pydantic-ai, MAF, and LangGraph
+  agent images.
+- Optional live Vekil-backed Copilot E2E, using the official pinned
+  `ghcr.io/sozercan/vekil` image and a repository secret named
   `COPILOT_GITHUB_TOKEN`. If that secret is unavailable (for example on forks or
   unconfigured repos), or Vekil reports that the token lacks Copilot access/
   permissions, the live job is skipped while the offline checks still run.
@@ -142,11 +156,12 @@ Each adapter is a thin shell over a shared core:
   ABI loader, the OpenAI `/v1` façade, the CLI/network posture, and the neutral run
   contract (`RunResult`, `AgentRunError`, `RuntimeSession`, the
   `RuntimeFactory` protocol). Imports no agent framework.
-- `runtimes/pydantic-ai/`, `runtimes/microsoft-agent-framework/` — each ships
-  only an `agent_factory.py` (the one file that imports its framework) plus a
-  thin `__main__.py`, implementing `RuntimeFactory` / `RuntimeSession`. They stay
-  **separate images** with disjoint framework deps; that physical separation is
-  what guarantees the lock-in boundary.
+- `runtimes/pydantic-ai/`, `runtimes/microsoft-agent-framework/`,
+  `runtimes/langgraph/` — each ships only an `agent_factory.py` (the one file
+  that imports its framework) plus a thin `__main__.py`, implementing
+  `RuntimeFactory` / `RuntimeSession`. They stay **separate images** with
+  disjoint framework deps; that physical separation is what guarantees the
+  lock-in boundary.
 
 Adding a single-agent runtime is therefore one `agent_factory.py` + one Go
 `runtimes.RuntimeSpec` entry; it inherits the shared `/v1` façade and the conformance
@@ -154,9 +169,9 @@ test suite for free.
 
 ## v0 scope / not yet
 
-- **v0**: two runtimes (pydantic-ai default + microsoft-agent-framework),
-  `provider: openai-compatible` only, stdio `command` MCP tools, the OpenAI `/v1`
-  façade, single OCI image output.
+- **v0**: three runtimes (pydantic-ai default + microsoft-agent-framework +
+  langgraph), `provider: openai-compatible` only, stdio `command` MCP tools, the
+  OpenAI `/v1` façade, single OCI image output.
 - **Not yet**: image-based MCP tools, evals, lock file / SBOM / signing,
   agentpack, `extends`/patches, knowledge/RAG, memory/state, model fallback,
   streaming, and embedded/BYO serving targets.

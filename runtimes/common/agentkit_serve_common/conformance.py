@@ -43,7 +43,17 @@ __all__ = [
 # Framework/model-SDK roots that must NOT be imported outside an adapter's
 # agent_factory.py. The union across adapters is fine: each adapter only has one
 # of these installed, so listing all is harmless and keeps this test shared.
-_FRAMEWORK_SDK_ROOTS = {"agent_framework", "pydantic_ai", "openai"}
+_FRAMEWORK_SDK_ROOTS = {
+    "agent_framework",
+    "pydantic_ai",
+    "openai",
+    "langchain",
+    "langchain_core",
+    "langchain_mcp_adapters",
+    "langchain_openai",
+    "langgraph",
+    "mcp",
+}
 
 
 def test_healthz_open(make_client):

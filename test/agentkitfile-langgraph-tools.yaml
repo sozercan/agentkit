@@ -1,0 +1,24 @@
+#syntax=agentkit:test
+# The stdio-MCP tool fixture under the LangGraph runtime: the same four keys plus
+# ONE stdio MCP server declared as a `command` (v0 supports command tools only).
+# agentkit-serve-langgraph keeps a persistent langchain-mcp-adapters session open
+# for the process lifespan and namespaces exposed tools by server name. Nothing
+# is baked into the image but the tool's argv and declared env var NAMES.
+apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: fetch-summarizer
+runtime: langgraph
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+  apiKeyEnv: OPENAI_API_KEY
+instructions: |
+  Summarize any URL the user gives you in three bullet points.
+  Use the fetch tool to retrieve the page contents first.
+tools:
+  - name: fetch
+    command: ["uvx", "mcp-server-fetch"]
+expose:
+  openai: true
