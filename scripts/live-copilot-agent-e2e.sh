@@ -19,10 +19,10 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 work_dir="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/agentkit-live-copilot.XXXXXX")"
 
 copilot_token="${COPILOT_GITHUB_TOKEN:-}"
-proxy_image="${COPILOT_PROXY_IMAGE:-docker.io/sozercan/copilot-proxy@sha256:792c0fd26e555550e8807705c7c00f676a9b13ae998514dfe227bddaaded67bb}"
-proxy_container_name="${COPILOT_PROXY_CONTAINER_NAME:-agentkit-copilot-proxy}"
-proxy_host_port="${COPILOT_PROXY_HOST_PORT:-1337}"
-proxy_container_port="${COPILOT_PROXY_CONTAINER_PORT:-1337}"
+vekil_image="${VEKIL_IMAGE:-ghcr.io/sozercan/vekil@sha256:d13edeedf7bec319da8eb3ea4949a4d0802e244c14765a347e62e1b8b7be8e3d}"
+vekil_container_name="${VEKIL_CONTAINER_NAME:-agentkit-vekil}"
+vekil_host_port="${VEKIL_HOST_PORT:-1337}"
+vekil_container_port="${VEKIL_CONTAINER_PORT:-1337}"
 agent_container_name="${AGENTKIT_LIVE_CONTAINER_NAME:-agentkit-maf-live}"
 network_name="${AGENTKIT_LIVE_NETWORK:-agentkit-live-copilot}"
 agent_host_port="${AGENTKIT_LIVE_HOST_PORT:-18080}"
@@ -51,7 +51,7 @@ redact() {
 }
 
 cleanup() {
-  docker rm -f "${agent_container_name}" "${proxy_container_name}" >/dev/null 2>&1 || true
+  docker rm -f "${agent_container_name}" "${vekil_container_name}" >/dev/null 2>&1 || true
   docker network rm "${network_name}" >/dev/null 2>&1 || true
   rm -rf "${work_dir}" >/dev/null 2>&1 || true
 }
@@ -64,13 +64,13 @@ on_exit() {
       echo "=== docker ps -a ==="
       docker ps -a || true
       echo
-      echo "=== copilot-proxy logs ==="
-      docker logs "${proxy_container_name}" 2>&1 || true
+      echo "=== Vekil logs ==="
+      docker logs "${vekil_container_name}" 2>&1 || true
       echo
       echo "=== agent logs ==="
       docker logs "${agent_container_name}" 2>&1 || true
     } | redact >&2
-    log "Live Copilot-backed AgentKit E2E failed"
+    log "Live Vekil-backed AgentKit E2E failed"
   fi
   cleanup
 }
@@ -107,22 +107,22 @@ main() {
   docker network rm "${network_name}" >/dev/null 2>&1 || true
   docker network create "${network_name}" >/dev/null
 
-  log "Starting copilot-proxy (${proxy_image})"
-  docker rm -f "${proxy_container_name}" >/dev/null 2>&1 || true
-  docker run -d --name "${proxy_container_name}" \
+  log "Starting Vekil (${vekil_image})"
+  docker rm -f "${vekil_container_name}" >/dev/null 2>&1 || true
+  docker run -d --name "${vekil_container_name}" \
     --network "${network_name}" \
     --network-alias host.docker.internal \
-    -p "127.0.0.1:${proxy_host_port}:${proxy_container_port}" \
+    -p "127.0.0.1:${vekil_host_port}:${vekil_container_port}" \
     -e COPILOT_GITHUB_TOKEN="${copilot_token}" \
-    -e PORT="${proxy_container_port}" \
-    -e TOKEN_DIR=/home/nonroot/.config/copilot-proxy \
-    "${proxy_image}" >/dev/null
+    -e PORT="${vekil_container_port}" \
+    -e TOKEN_DIR=/home/nonroot/.config/vekil \
+    "${vekil_image}" >/dev/null
 
-  log "Waiting for copilot-proxy /readyz"
-  wait_for_http "http://127.0.0.1:${proxy_host_port}/readyz" "copilot-proxy /readyz"
+  log "Waiting for Vekil /readyz"
+  wait_for_http "http://127.0.0.1:${vekil_host_port}/readyz" "Vekil /readyz"
 
-  log "Validating copilot-proxy /v1/models"
-  curl -fsS "http://127.0.0.1:${proxy_host_port}/v1/models" >"${work_dir}/models.json"
+  log "Validating Vekil /v1/models"
+  curl -fsS "http://127.0.0.1:${vekil_host_port}/v1/models" >"${work_dir}/models.json"
   jq -e '.data | length > 0' "${work_dir}/models.json" >/dev/null
   jq -r '.data[].id' "${work_dir}/models.json" | sed 's/^/model: /' | redact >&2
   jq -e '.data[] | select(.id == "claude-haiku-4.5")' "${work_dir}/models.json" >/dev/null
@@ -170,7 +170,7 @@ main() {
   jq '{model, content: .choices[0].message.content}' "${work_dir}/agent-response.json" | redact >&2
   jq -e '.choices[0].message.content | type == "string" and contains("DONE42")' "${work_dir}/agent-response.json" >/dev/null
 
-  log "Live Copilot-backed AgentKit E2E passed"
+  log "Live Vekil-backed AgentKit E2E passed"
 }
 
 main "$@"

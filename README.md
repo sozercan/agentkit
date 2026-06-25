@@ -101,7 +101,7 @@ GitHub Actions runs the full closeout loop on pushes and pull requests:
   `runtimes/pydantic-ai/`, and `runtimes/microsoft-agent-framework/`.
 - Docker builds for the frontend and both runtime adapters, followed by offline
   `/healthz` smoke tests for generated pydantic-ai and MAF agent images.
-- Optional live Copilot-backed E2E, using a repository secret named
+- Optional live Vekil-backed Copilot E2E, using the official pinned `ghcr.io/sozercan/vekil` image and a repository secret named
   `COPILOT_GITHUB_TOKEN`. If that secret is unavailable (for example on forks or
   unconfigured repos), the live job is skipped while the offline checks still run.
 

@@ -258,14 +258,14 @@ jobs:
           smoke agentkit-smoke-maf maf-agent:ci 18081
 
   live-copilot-e2e:
-    name: Live Copilot E2E
+    name: Live Vekil/Copilot E2E
     runs-on: ubuntu-latest
     timeout-minutes: 75
     env:
       COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
-      COPILOT_PROXY_IMAGE: docker.io/sozercan/copilot-proxy@sha256:792c0fd26e555550e8807705c7c00f676a9b13ae998514dfe227bddaaded67bb
+      VEKIL_IMAGE: ghcr.io/sozercan/vekil@sha256:d13edeedf7bec319da8eb3ea4949a4d0802e244c14765a347e62e1b8b7be8e3d
     steps:
-      - name: Decide whether live Copilot E2E can run
+      - name: Decide whether live Vekil/Copilot E2E can run
         id: gate
         env:
           IS_FORK: ${{ github.event.pull_request.head.repo.fork || false }}
@@ -273,25 +273,25 @@ jobs:
         run: |
           if [ "${GITHUB_EVENT_NAME}" = "pull_request" ] && [ "${IS_FORK}" = "true" ]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "reason=Skipping live Copilot E2E for fork pull requests because repository secrets are not exposed." >> "$GITHUB_OUTPUT"
+            echo "reason=Skipping live Vekil/Copilot E2E for fork pull requests because repository secrets are not exposed." >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           if [ "${ACTOR}" = "dependabot[bot]" ] && [ -z "${COPILOT_GITHUB_TOKEN}" ]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "reason=Skipping live Copilot E2E for Dependabot pull requests because repository secrets are not exposed." >> "$GITHUB_OUTPUT"
+            echo "reason=Skipping live Vekil/Copilot E2E for Dependabot pull requests because repository secrets are not exposed." >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           if [ -z "${COPILOT_GITHUB_TOKEN}" ]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "reason=Skipping live Copilot E2E because COPILOT_GITHUB_TOKEN is not configured for this run." >> "$GITHUB_OUTPUT"
+            echo "reason=Skipping live Vekil/Copilot E2E because COPILOT_GITHUB_TOKEN is not configured for this run." >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           echo "run=true" >> "$GITHUB_OUTPUT"
 
-      - name: Explain skipped live Copilot E2E
+      - name: Explain skipped live Vekil/Copilot E2E
         if: steps.gate.outputs.run != 'true'
         run: echo "${{ steps.gate.outputs.reason }}"
 
@@ -346,6 +346,6 @@ jobs:
           docker buildx inspect --bootstrap
           echo "BUILDER=" >> "$GITHUB_ENV"
 
-      - name: Run live Copilot-backed AgentKit E2E
+      - name: Run live Vekil-backed AgentKit E2E
         if: steps.gate.outputs.run == 'true'
         run: bash scripts/live-copilot-agent-e2e.sh
