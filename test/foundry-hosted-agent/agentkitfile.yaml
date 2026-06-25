@@ -1,0 +1,18 @@
+#syntax=agentkit:test
+# Foundry hosted-agent smoke fixture: builds a normal AgentKit image whose model
+# points at the wrapper's in-container OpenAI-compatible mock on 127.0.0.1:9000.
+# The wrapper then exposes Foundry's /readiness + /invocations contract on :8088.
+apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: agentkit-foundry-smoke
+model:
+  provider: openai-compatible
+  baseURL: http://127.0.0.1:9000/v1
+  name: mock-gpt
+  apiKeyEnv: MODEL_API_KEY
+instructions: |
+  SENTINEL_FOUNDRY_AGENTKIT_123: You are the AgentKit Foundry hosted-agent smoke test.
+  Always answer exactly what the model returns.
+expose:
+  openai: true
