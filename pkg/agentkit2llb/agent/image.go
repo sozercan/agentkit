@@ -7,6 +7,7 @@ import (
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sozercan/agentkit/pkg/agentkit/abi"
 	"github.com/sozercan/agentkit/pkg/agentkit/config"
+	"github.com/sozercan/agentkit/pkg/agentkit/runtimes"
 	"github.com/sozercan/agentkit/pkg/utils"
 )
 
@@ -60,7 +61,7 @@ func NewImageConfig(cfg *config.AgentConfig, platform *specs.Platform) *specs.Im
 // to its canonical form so the label is stable across spellings.
 func runtimeLabel(cfg *config.AgentConfig) string {
 	if cfg.Runtime != "" {
-		return utils.CanonicalRuntime(cfg.Runtime)
+		return runtimes.CanonicalRuntime(cfg.Runtime)
 	}
-	return utils.RuntimePydanticAI
+	return runtimes.PydanticAI
 }

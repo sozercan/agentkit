@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/sozercan/agentkit/pkg/agentkit/runtimes"
 	"github.com/sozercan/agentkit/pkg/utils"
 )
 
@@ -38,10 +39,10 @@ func (c *AgentConfig) Validate() error {
 
 	// --- runtime (empty defaults to pydantic-ai; otherwise must be a runtime
 	// AgentKit knows, after alias resolution). The canonical set lives in
-	// pkg/utils so this validator and pkg/build's adapter registry agree without
-	// a config→build import cycle (plan §8 / Open Q4). -----------------------
-	if c.Runtime != "" && !utils.IsKnownRuntime(c.Runtime) {
-		supported := utils.KnownRuntimes()
+	// pkg/agentkit/runtimes so this validator and pkg/build's adapter registry
+	// agree without a config→build import cycle (plan §8 / Open Q4). ----------
+	if c.Runtime != "" && !runtimes.IsKnownRuntime(c.Runtime) {
+		supported := runtimes.KnownRuntimes()
 		sort.Strings(supported)
 		add("runtime %q is not supported (supported: %s)", c.Runtime, strings.Join(supported, ", "))
 	}
