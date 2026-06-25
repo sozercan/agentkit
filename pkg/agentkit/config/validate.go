@@ -92,8 +92,16 @@ func (c *AgentConfig) Validate() error {
 			add("tools[%d] (%s): sets multiple sources %v; exactly one is allowed", i, t.Name, set)
 		}
 
+		for j, part := range t.Command {
+			if part == "" {
+				add("tools[%d] (%s): command[%d] must be non-empty", i, t.Name, j)
+			}
+		}
+
 		for _, e := range t.Env {
-			if looksLikeSecretLiteral(e) {
+			if e == "" {
+				add("tools[%d] (%s): env entry is empty; list env var NAMES only", i, t.Name)
+			} else if looksLikeSecretLiteral(e) {
 				add("tools[%d] (%s): env entry %q looks like a secret value; list env var NAMES only", i, t.Name, e)
 			}
 		}

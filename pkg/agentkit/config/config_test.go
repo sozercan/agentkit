@@ -143,6 +143,59 @@ expose:
 	}
 }
 
+func TestValidateRejectsEmptyToolCommandEntry(t *testing.T) {
+	in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: emptycmd
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+  apiKeyEnv: OPENAI_API_KEY
+instructions: hi
+tools:
+  - name: fetch
+    command: [""]
+expose:
+  openai: true
+`)
+	cfg, err := NewFromBytes(in)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if verr := cfg.Validate(); verr == nil || !strings.Contains(verr.Error(), "command[0]") {
+		t.Fatalf("expected empty command entry rejection, got: %v", verr)
+	}
+}
+
+func TestValidateRejectsEmptyToolEnvName(t *testing.T) {
+	in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: emptyenv
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+  apiKeyEnv: OPENAI_API_KEY
+instructions: hi
+tools:
+  - name: fetch
+    command: ["uvx", "mcp-server-fetch"]
+    env: [""]
+expose:
+  openai: true
+`)
+	cfg, err := NewFromBytes(in)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if verr := cfg.Validate(); verr == nil || !strings.Contains(verr.Error(), "env entry is empty") {
+		t.Fatalf("expected empty env name rejection, got: %v", verr)
+	}
+}
+
 func TestValidateRejectsImageTool(t *testing.T) {
 	in := []byte(`apiVersion: v1alpha1
 kind: Agent

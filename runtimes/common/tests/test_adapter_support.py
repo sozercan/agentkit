@@ -73,7 +73,7 @@ def test_split_tool_command_returns_executable_and_args():
 
 
 def test_split_tool_command_rejects_empty_command():
-    tool = ToolSpec(name="broken", command=[], env=[])
+    tool = ToolSpec.model_construct(name="broken", command=[], env=[])
     with pytest.raises(support.AgentBuildError, match="empty command"):
         support.split_tool_command(tool, example='["uvx", "mcp-server-fetch"]')
 
