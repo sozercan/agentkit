@@ -23,12 +23,18 @@ equivalent to the native `/v1` server.
 
 ## Build locally
 
-From the repository root, first build the local frontend and pydantic-ai adapter:
+From the repository root, first build the local frontend and one AgentKit runtime
+adapter. The commands below use the default pydantic-ai adapter because the
+fixture is a protocol smoke test, not a runtime-specific behavior test:
 
 ```sh
 make build-agentkit
 make build-serve
 ```
+
+To smoke the wrapper with another runtime, build that adapter instead and use the
+matching `adapter=` build arg; for example LangGraph uses
+`make build-serve-langgraph` and `--build-arg adapter=agentkit-serve-langgraph:test`.
 
 Build the AgentKit base image from this fixture:
 

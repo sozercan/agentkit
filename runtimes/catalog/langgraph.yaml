@@ -1,0 +1,15 @@
+# AgentKit runtime catalog entry — documentation only.
+#
+# Purpose: names the "langgraph" runtime adapter and its default adapter image.
+# The converter uses this adapter image as the LLB BASE and merges the resolved
+# /agent/agent.yaml layer on top; the image then serves the same OpenAI /v1
+# façade as the pydantic-ai and Microsoft Agent Framework runtimes — byte-for-byte
+# ABI compatible. Select it from an agentkitfile with `runtime: langgraph`.
+# Override the adapter per build with `--build-arg adapter=<ref>` (the local dev
+# loop points it at `agentkit-serve-langgraph:test`). Nothing parses this file in
+# v0 — it is the human-readable catalog entry for this runtime.
+apiVersion: v1alpha1
+runtime: langgraph
+capabilities:
+  - stdio-mcp
+adapter: ghcr.io/sozercan/agentkit/serve-langgraph:latest

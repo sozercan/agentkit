@@ -64,6 +64,35 @@ def test_declared_tool_env_passes_only_declared_present_names():
     assert env == {"FETCH_TOKEN": "tok"}
 
 
+def test_declared_tool_env_rejects_interpolation_of_undeclared_env():
+    tool = ToolSpec(name="fetch", command=["uvx", "mcp-server-fetch"], env=["FETCH_CONFIG"])
+    with mock.patch.dict(
+        os.environ,
+        {"FETCH_CONFIG": "token=${OPENAI_API_KEY}", "OPENAI_API_KEY": "sk-should-not-leak"},
+        clear=True,
+    ):
+        with pytest.raises(support.AgentBuildError) as exc:
+            support.declared_tool_env(tool)
+    msg = str(exc.value)
+    assert "OPENAI_API_KEY" in msg
+    assert "sk-should-not-leak" not in msg
+
+
+def test_declared_tool_env_allows_interpolation_of_declared_env():
+    tool = ToolSpec(
+        name="fetch",
+        command=["uvx", "mcp-server-fetch"],
+        env=["FETCH_CONFIG", "FETCH_TOKEN"],
+    )
+    with mock.patch.dict(
+        os.environ,
+        {"FETCH_CONFIG": "token=${FETCH_TOKEN}", "FETCH_TOKEN": "tok"},
+        clear=True,
+    ):
+        env = support.declared_tool_env(tool)
+    assert env == {"FETCH_CONFIG": "token=${FETCH_TOKEN}", "FETCH_TOKEN": "tok"}
+
+
 def test_split_tool_command_returns_executable_and_args():
     tool = ToolSpec(name="fetch", command=["uvx", "mcp-server-fetch", "--flag"], env=[])
     assert support.split_tool_command(tool, example='["uvx", "mcp-server-fetch"]') == (

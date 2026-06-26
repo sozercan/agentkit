@@ -19,6 +19,9 @@ const (
 	// MAFAlias is a short, convenient alias for MAF that users may write in
 	// `runtime:`; it resolves to MAF (see CanonicalRuntime).
 	MAFAlias = "maf"
+
+	// LangGraph is the LangChain/LangGraph runtime adapter.
+	LangGraph = "langgraph"
 )
 
 const (
@@ -96,6 +99,11 @@ var Runtimes = []RuntimeSpec{
 		Aliases:           []string{MAFAlias}, // "maf" → "microsoft-agent-framework"
 		Capabilities:      []string{CapabilityStdioMCP},
 		DefaultAdapterRef: "ghcr.io/sozercan/agentkit/serve-maf:latest",
+	},
+	{
+		Name:              LangGraph,
+		Capabilities:      []string{CapabilityStdioMCP},
+		DefaultAdapterRef: "ghcr.io/sozercan/agentkit/serve-langgraph:latest",
 	},
 }
 

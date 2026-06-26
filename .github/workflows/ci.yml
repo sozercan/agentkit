@@ -107,6 +107,8 @@ jobs:
             path: runtimes/pydantic-ai
           - package: microsoft-agent-framework adapter
             path: runtimes/microsoft-agent-framework
+          - package: langgraph adapter
+            path: runtimes/langgraph
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -212,19 +214,21 @@ jobs:
           make build-agentkit TAG=ci
           make build-serve TAG=ci
           make build-serve-maf TAG=ci
+          make build-serve-langgraph TAG=ci
 
-      - name: Build test agent images for both runtimes
+      - name: Build test agent images for all runtimes
         run: |
           set -euxo pipefail
           make build-test-agent TAG=ci BUILDER=
           make build-test-agent TAG=ci BUILDER= RUNTIME=maf
+          make build-test-agent TAG=ci BUILDER= RUNTIME=langgraph
 
       - name: Smoke test built agent images
         run: |
           set -euo pipefail
 
           cleanup() {
-            docker rm -f agentkit-smoke-pydantic agentkit-smoke-maf >/dev/null 2>&1 || true
+            docker rm -f agentkit-smoke-pydantic agentkit-smoke-maf agentkit-smoke-langgraph >/dev/null 2>&1 || true
           }
           trap cleanup EXIT
 
@@ -256,6 +260,7 @@ jobs:
 
           smoke agentkit-smoke-pydantic hello-agent:ci 18080
           smoke agentkit-smoke-maf maf-agent:ci 18081
+          smoke agentkit-smoke-langgraph langgraph-agent:ci 18082
 
   live-copilot-e2e:
     name: Live Vekil/Copilot E2E

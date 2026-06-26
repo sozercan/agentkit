@@ -10,6 +10,7 @@ normalizing framework/model failures into the common run error.
 from __future__ import annotations
 
 import os
+import re
 
 from .config import AgentSpec, ToolSpec
 from .conversation import FORWARDED_ROLES
@@ -22,6 +23,7 @@ NO_AUTH_API_KEY = "not-needed"
 
 
 MCP_TIMEOUT_ENV = "AGENTKIT_MCP_TIMEOUT"
+_BRACED_ENV_REF_RE = re.compile(r"\$\{([^}]+)\}")
 
 
 class AgentBuildError(Exception):
@@ -55,8 +57,24 @@ def declared_tool_env(tool: ToolSpec) -> dict[str, str]:
     The MCP subprocess must never inherit the full container environment — that
     would bleed the model API key (and every other secret) into every tool. We
     pass through exactly the declared names that are actually present.
+
+    Some MCP stdio transports expand braced references like ``${VAR}`` inside env
+    values against the parent process environment. Reject references to undeclared
+    vars so a declared tool env such as ``TOOL_CONFIG=${OPENAI_API_KEY}`` cannot
+    smuggle the model key into a subprocess unless that key was explicitly listed
+    in the tool's own ``env`` allowlist.
     """
-    return {name: os.environ[name] for name in tool.env if name in os.environ}
+    allowed = set(tool.env)
+    out = {name: os.environ[name] for name in tool.env if name in os.environ}
+    for name, value in out.items():
+        undeclared = sorted(ref for ref in _BRACED_ENV_REF_RE.findall(value) if ref not in allowed)
+        if undeclared:
+            raise AgentBuildError(
+                f"tool {tool.name!r} env var {name!r} references undeclared env var(s) "
+                f"{', '.join(undeclared)}; list every referenced env var in that tool's "
+                "env allowlist or remove the ${...} reference"
+            )
+    return out
 
 
 def split_tool_command(tool: ToolSpec, *, example: str) -> tuple[str, list[str]]:

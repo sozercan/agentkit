@@ -35,6 +35,7 @@ and auth wiring.
 |---|---|
 | `pydantic-ai` | `stdio-mcp` |
 | `microsoft-agent-framework` / `maf` | `stdio-mcp` |
+| `langgraph` | `stdio-mcp` |
 
 New schema features must add capability gates at the same time they become
 requestable from an `agentkitfile.yaml`.
