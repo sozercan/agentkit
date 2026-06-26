@@ -269,3 +269,18 @@ def test_load_rejects_authorization_value_env_plus_auth(tmp_path):
     msg = str(exc.value)
     assert "Authorization" in msg
     assert "auth" in msg
+
+
+def test_load_accepts_model_workload_identity_auth(tmp_path):
+    spec_dict = deepcopy(_BASE_SPEC)
+    spec_dict["model"].pop("apiKeyEnv", None)
+    spec_dict["model"]["auth"] = {
+        "type": "workload-identity-token",
+        "audience": "https://ai.azure.com/.default",
+    }
+
+    spec = load(_write_spec(tmp_path, spec_dict))
+
+    assert spec.model.auth is not None
+    assert spec.model.auth.type == "workload-identity-token"
+    assert spec.model.auth.audience == "https://ai.azure.com/.default"

@@ -65,6 +65,36 @@ def _looks_like_secret_literal(value: str) -> bool:
 class Metadata(_Strict):
     name: str = Field(min_length=1)
 
+class AuthSpec(_Strict):
+    type: str = Field(min_length=1)
+    token_env: str | None = Field(default=None, alias="tokenEnv")
+    audience: str | None = None
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    @field_validator("token_env")
+    @classmethod
+    def _token_env_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        return _validate_env_name(value, field="auth.tokenEnv")
+
+    @model_validator(mode="after")
+    def _valid_shape(self) -> "AuthSpec":
+        if self.type == _AUTH_BEARER:
+            if not self.token_env:
+                raise ValueError("bearer auth requires tokenEnv")
+            if self.audience:
+                raise ValueError("bearer auth must not set audience")
+            return self
+        if self.type == _AUTH_WORKLOAD_IDENTITY:
+            if not self.audience:
+                raise ValueError("workload identity auth requires audience")
+            if self.token_env:
+                raise ValueError("workload identity auth must not set tokenEnv")
+            return self
+        raise ValueError(f"unsupported auth type {self.type!r}")
+
 
 class ModelSpec(_Strict):
     """The hosted, OpenAI-compatible model the agent talks to."""
@@ -74,6 +104,7 @@ class ModelSpec(_Strict):
     name: str = Field(min_length=1)
     # NAME of the env var holding the API key (never the value). agent-abi.md §2.
     api_key_env: str | None = Field(default=None, alias="apiKeyEnv")
+    auth: AuthSpec | None = None
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
@@ -125,36 +156,6 @@ class ToolHeaderSpec(_Strict):
             raise ValueError("header value looks like a secret; use valueEnv")
         return self
 
-
-class AuthSpec(_Strict):
-    type: str = Field(min_length=1)
-    token_env: str | None = Field(default=None, alias="tokenEnv")
-    audience: str | None = None
-
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
-
-    @field_validator("token_env")
-    @classmethod
-    def _token_env_name(cls, value: str | None) -> str | None:
-        if value is None:
-            return value
-        return _validate_env_name(value, field="auth.tokenEnv")
-
-    @model_validator(mode="after")
-    def _valid_shape(self) -> "AuthSpec":
-        if self.type == _AUTH_BEARER:
-            if not self.token_env:
-                raise ValueError("bearer auth requires tokenEnv")
-            if self.audience:
-                raise ValueError("bearer auth must not set audience")
-            return self
-        if self.type == _AUTH_WORKLOAD_IDENTITY:
-            if not self.audience:
-                raise ValueError("workload identity auth requires audience")
-            if self.token_env:
-                raise ValueError("workload identity auth must not set tokenEnv")
-            return self
-        raise ValueError(f"unsupported auth type {self.type!r}")
 
 
 class ToolSpec(_Strict):

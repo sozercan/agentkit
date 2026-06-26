@@ -24,10 +24,11 @@ type abiMetadata struct {
 }
 
 type abiModel struct {
-	Provider  string `yaml:"provider"`
-	BaseURL   string `yaml:"baseURL"`
-	Name      string `yaml:"name"`
-	APIKeyEnv string `yaml:"apiKeyEnv,omitempty"`
+	Provider  string   `yaml:"provider"`
+	BaseURL   string   `yaml:"baseURL"`
+	Name      string   `yaml:"name"`
+	APIKeyEnv string   `yaml:"apiKeyEnv,omitempty"`
+	Auth      *abiAuth `yaml:"auth,omitempty"`
 }
 
 type abiToolHeader struct {
@@ -118,6 +119,9 @@ func Render(agent effective.Agent) ([]byte, error) {
 		Tools:        make([]abiTool, 0, len(agent.Tools)),
 		Env:          make([]abiEnvVar, 0, len(agent.Env)),
 		Expose:       abiExpose{OpenAI: agent.Expose.OpenAI, Port: agent.Expose.Port},
+	}
+	if agent.Model.Auth != nil {
+		out.Model.Auth = &abiAuth{Type: agent.Model.Auth.Type, TokenEnv: agent.Model.Auth.TokenEnv, Audience: agent.Model.Auth.Audience}
 	}
 	for _, t := range agent.Tools {
 		tool := abiTool{

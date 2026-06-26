@@ -16,4 +16,8 @@ capabilities:
   - stdio-mcp
   - streamable-http-mcp
   - workload-identity-token-auth
+  - mcp-skills
+  - filesystem-skills
+  - context-provider-skills
+  - model-workload-identity-auth
 adapter: ghcr.io/sozercan/agentkit/serve-maf:latest

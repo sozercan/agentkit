@@ -2,9 +2,9 @@
 
 Two things in this adapter must never silently regress (plan §10, §12):
 
-1. The LOCK-IN BOUNDARY — ``agent_factory.py`` must import only ``agent_framework``
-   core + ``agent_framework.openai``. If wiring MAF ever pulls an Azure / Foundry /
-   CopilotStudio package, that is the lock-in line and this test fails loudly.
+1. The LOCK-IN BOUNDARY — ``agent_factory.py`` may import Agent Framework core,
+   OpenAI, and the narrow Foundry/Azure identity surface needed for generic
+   model workload identity. It must not pull CopilotStudio/Purview/etc.
 2. The SECRET-BLEED RULE — a tool subprocess receives ONLY the env var NAMES the
    tool declares, never the full container environment (which holds the model key).
 """
@@ -30,12 +30,10 @@ from agentkit_serve_common.config import ToolSpec
 #     would wave them through because their root is the allowed "agent_framework".
 _FORBIDDEN_IMPORT_SEGMENTS = (
     "azure",
-    "foundry",
     "copilotstudio",
     "copilot_studio",
     "microsoft",  # agent_framework.microsoft re-exports CopilotStudioAgent + Purview
     "agent_framework_azure",
-    "agent_framework_foundry",
     "agent_framework_copilotstudio",
     "agent_framework_purview",
 )
@@ -54,6 +52,10 @@ def _imported_modules(path: Path) -> set[str]:
 
 def _is_forbidden(mod: str) -> bool:
     """A module is forbidden if any of its dotted segments is a forbidden token."""
+    if mod == "azure.identity":
+        return False
+    if mod == "agent_framework.foundry" or mod.startswith("agent_framework.foundry."):
+        return False
     return any(seg in _FORBIDDEN_IMPORT_SEGMENTS for seg in mod.split("."))
 
 
@@ -62,7 +64,14 @@ def _is_allowed_framework_module(mod: str) -> bool:
     the OpenAI client — matched EXACTLY, never as a blanket ``agent_framework.*``
     prefix (which would admit agent_framework.azure/.foundry/.microsoft).
     """
-    return mod == "agent_framework" or mod == "agent_framework.openai" or mod.startswith("agent_framework.openai.")
+    return (
+        mod == "agent_framework"
+        or mod == "agent_framework.openai"
+        or mod.startswith("agent_framework.openai.")
+        or mod == "agent_framework.foundry"
+        or mod.startswith("agent_framework.foundry.")
+        or mod == "azure.identity"
+    )
 
 
 def test_agent_factory_import_boundary():
@@ -97,17 +106,16 @@ def test_guardrail_actually_rejects_cloud_submodules():
     """
     must_reject = [
         "agent_framework.azure",
-        "agent_framework.foundry",
         "agent_framework.microsoft",  # re-exports CopilotStudioAgent
         "agent_framework_azure",
         "agent_framework_copilotstudio",
-        "azure.identity",
+        "azure.ai.projects",
     ]
     for mod in must_reject:
         assert _is_forbidden(mod), f"boundary should forbid {mod!r} but did not"
         assert not _is_allowed_framework_module(mod), f"boundary should NOT allow {mod!r}"
     # …and the legitimate minimal surface must still pass both gates.
-    for mod in ["agent_framework", "agent_framework.openai"]:
+    for mod in ["agent_framework", "agent_framework.openai", "agent_framework.foundry", "azure.identity"]:
         assert not _is_forbidden(mod), f"{mod!r} should be allowed"
         assert _is_allowed_framework_module(mod), f"{mod!r} should be allowed"
 
@@ -215,3 +223,103 @@ def test_status_of_unwraps_maf_wrapped_error():
         assert agent_factory._status_of(e) == 400
     # no status anywhere → 502; out-of-range ignored → 502
     assert agent_factory._status_of(ValueError("x")) == 502
+
+
+def test_build_client_uses_foundry_for_model_workload_identity(monkeypatch):
+    from agentkit_serve_common.config import AgentSpec
+
+    calls = {}
+
+    class FakeCredential:
+        pass
+
+    class FakeFoundryClient:
+        def __init__(self, **kwargs):
+            calls.update(kwargs)
+
+    monkeypatch.setattr("azure.identity.DefaultAzureCredential", FakeCredential)
+    monkeypatch.setattr("agent_framework.foundry.FoundryChatClient", FakeFoundryClient)
+    spec = AgentSpec.model_validate({
+        "abiVersion": "v0",
+        "metadata": {"name": "x"},
+        "model": {
+            "provider": "openai-compatible",
+            "baseURL": "https://example.services.ai.azure.com/api/projects/proj/openai/v1",
+            "name": "gpt-4.1-mini",
+            "auth": {"type": "workload-identity-token", "audience": "https://ai.azure.com/.default"},
+        },
+        "instructions": "hi",
+        "tools": [],
+        "expose": {"openai": True, "port": 8080},
+    })
+
+    client = agent_factory.build_client(spec)
+
+    assert isinstance(client, FakeFoundryClient)
+    assert calls["project_endpoint"] == "https://example.services.ai.azure.com/api/projects/proj"
+    assert calls["model"] == "gpt-4.1-mini"
+    assert isinstance(calls["credential"], FakeCredential)
+
+
+def test_build_agent_adds_filesystem_skills_provider(tmp_path):
+    from agentkit_serve_common.config import AgentSpec
+
+    skill_dir = tmp_path / "skills" / "support-style"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\nname: support-style\ndescription: Test skill.\n---\n# Skill\n", encoding="utf-8")
+    spec = AgentSpec.model_validate({
+        "abiVersion": "v0",
+        "metadata": {"name": "x"},
+        "model": {
+            "provider": "openai-compatible",
+            "baseURL": "https://api.openai.com/v1",
+            "name": "gpt-4o-mini",
+        },
+        "instructions": "hi",
+        "tools": [],
+        "context": {"providers": [{"type": "skills", "source": "filesystem", "path": str(skill_dir.parent)}]},
+        "expose": {"openai": True, "port": 8080},
+    })
+    runtime = agent_factory.MAFRuntime(spec)
+
+    async def build():
+        providers = await runtime._build_context_providers()
+        await runtime.stack.aclose()
+        return providers
+
+    import asyncio
+    providers = asyncio.run(build())
+    assert providers is not None
+    assert providers[0].__class__.__name__ == "SkillsProvider"
+
+
+def test_build_client_uses_env_token_for_model_workload_identity_standalone(monkeypatch):
+    from agentkit_serve_common.config import AgentSpec
+
+    calls = {}
+
+    class FakeOpenAIClient:
+        def __init__(self, **kwargs):
+            calls.update(kwargs)
+
+    monkeypatch.setattr(agent_factory, "OpenAIChatCompletionClient", FakeOpenAIClient)
+    monkeypatch.setenv("AGENTKIT_MODEL_WORKLOAD_IDENTITY_TOKEN", "token")
+    spec = AgentSpec.model_validate({
+        "abiVersion": "v0",
+        "metadata": {"name": "x"},
+        "model": {
+            "provider": "openai-compatible",
+            "baseURL": "https://example.services.ai.azure.com/api/projects/proj/openai/v1",
+            "name": "gpt-4.1-mini",
+            "auth": {"type": "workload-identity-token", "audience": "https://ai.azure.com/.default"},
+        },
+        "instructions": "hi",
+        "tools": [],
+        "expose": {"openai": True, "port": 8080},
+    })
+
+    client = agent_factory.build_client(spec)
+
+    assert isinstance(client, FakeOpenAIClient)
+    assert calls["api_key"] == "token"
+    assert calls["base_url"].endswith("/openai/v1")

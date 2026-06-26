@@ -17,6 +17,8 @@ dependencies = [
     # NOTE: agent-framework-openai's latest is 1.8.2 (verified in the M0 spike);
     # the plan's >=1.9 pin would fail to resolve. Pin >=1.8,<2.
     "agent-framework-openai>=1.8,<2",
+    "agent-framework-foundry>=1.8,<2",
+    "azure-identity>=1.20",
     # The MCP SDK is NOT a transitive dependency of agent-framework-core — it is
     # lazily imported by agent_framework._mcp and only bundled via the heavy
     # `[all]` extra (which drags in azure/foundry). Declare it directly so stdio

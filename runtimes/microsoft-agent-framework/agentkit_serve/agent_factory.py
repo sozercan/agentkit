@@ -1,48 +1,27 @@
 """Build a Microsoft Agent Framework (MAF) agent from a validated AgentSpec.
 
-This module is the ONLY net-new surface of the MAF runtime adapter: it is the
-framework-specific translation layer behind the frozen ``/agent/agent.yaml`` ABI.
-The ABI loader, the ``/v1`` facade, and the CLI live in ``agentkit_serve_common``
-(framework-neutral); this module satisfies its ``RuntimeFactory`` protocol by
-building a RuntimeSession.
-
-Verified firsthand against the INSTALLED packages (agent-framework-core 1.9.0,
-agent-framework-openai 1.8.2) — NOT from secondhand docs:
-
-* ``OpenAIChatCompletionClient(model=, api_key=, base_url=)`` — the classic
-  ``/v1/chat/completions`` client; proven against a plain OpenAI-compatible mock.
-  (The plan's ``OpenAIChatClient`` also exists but targets the Responses API; the
-  completion client is the one generic ``/v1`` endpoints — AIKit, vLLM, proxies —
-  implement, so it is the AgentKit choice. Plan §4.1 / Open Q1: resolved.)
-* ``MCPStdioTool(name, command, *, args=, env=, request_timeout=int|None)`` — a
-  stdio MCP server, in the CORE package. There is NO ``timeout=`` kwarg; the knob
-  is ``request_timeout`` (seconds), which maps to the MCP session read timeout and
-  defaults to ``None`` (no cap). Plan §4.2 / Open Q2: resolved.
-* ``Agent(client=, instructions=, *, name=, tools=)`` — note ``client=``, NOT the
-  plan's ``chat_client=`` (which does not exist and would ``TypeError``).
-  ``await agent.run(messages)`` returns an ``AgentResponse`` whose ``.text`` is the
-  final answer and whose ``.usage_details`` carries token counts. Plan §4.3 / Q3.
-
-THE LOCK-IN BOUNDARY (plan §12): imports here are confined to ``agent_framework``
-(core) + ``agent_framework.openai``. NEVER an Azure / Foundry / CopilotStudio
-package — including the first-party submodules ``agent_framework.azure`` /
-``.foundry`` / ``.microsoft`` (which re-export the cloud surface). ``import
-agent_framework.openai`` was verified to pull in zero ``azure*`` modules. The
-boundary is enforced by ``tests/test_guardrails.py`` (AST-based, which is why a
-naive source grep is not relied upon — it would false-positive on this docstring).
-
-Cross-runtime invariants such as API-key resolution, secret-safe tool env
-projection, MCP timeout parsing, and error normalization live in
-``agentkit_serve_common.adapter_support`` so this Module stays focused on MAF's
-concrete Adapter shape.
+This module is the framework-specific translation layer behind the frozen
+``/agent/agent.yaml`` ABI. The ABI loader, the ``/v1`` facade, Foundry protocol
+wrapper, and CLI live in ``agentkit_serve_common``.
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
+from contextlib import AsyncExitStack
 from types import TracebackType
+from urllib.parse import urlsplit
 
-from agent_framework import Agent, MCPStdioTool, MCPStreamableHTTPTool, Message
+from agent_framework import (
+    Agent,
+    FileSkillsSource,
+    MCPSkillsSource,
+    MCPStdioTool,
+    MCPStreamableHTTPTool,
+    Message,
+    SkillsProvider,
+)
 from agent_framework.openai import OpenAIChatCompletionClient
 from agentkit_serve_common.adapter_support import (
     FORWARDED_ROLES,
@@ -53,35 +32,69 @@ from agentkit_serve_common.adapter_support import (
     resolve_api_key,
     resolve_tool_headers,
     resolve_tool_url,
+    same_origin_mcp_httpx_client_factory,
     split_tool_command,
     upstream_status_code,
 )
-from agentkit_serve_common.config import AgentSpec, ToolSpec
+from agentkit_serve_common.config import AgentSpec, ContextProviderSpec, ToolSpec
 from agentkit_serve_common.conversation import RunRequest
 from agentkit_serve_common.runtime import RunResult, RuntimeSession
 
+_AUTH_WORKLOAD_IDENTITY = "workload-identity-token"
+_CONTEXT_TYPE_SKILLS = "skills"
+_CONTEXT_SOURCE_FILESYSTEM = "filesystem"
+_CONTEXT_SOURCE_MCP = "mcp"
+
 
 def _mcp_request_timeout() -> int | None:
-    """MCP stdio request timeout (seconds), overridable via ``AGENTKIT_MCP_TIMEOUT``.
-
-    DELIBERATE DIVERGENCE from the pydantic-ai adapter (which defaults to 120s):
-    MAF's ``request_timeout`` defaults to ``None`` (no read-timeout cap), which is
-    ALREADY tolerant of a cold ``uvx``/``npx`` tool that downloads its package
-    before speaking MCP. Capping it would risk killing a slow cold start, so we
-    leave it unset by default and only honor an EXPLICIT operator override. This
-    preserves the ``AGENTKIT_MCP_TIMEOUT`` knob (plan Open Q2) without regressing
-    cold-start behavior.
-    """
+    """MCP request timeout (seconds), overridable via ``AGENTKIT_MCP_TIMEOUT``."""
     return positive_int_env(default=None)
 
 
+def _remote_mcp_timeout() -> float:
+    """Bound network-backed MCP calls even when stdio timeout is left uncapped."""
+    return float(_mcp_request_timeout() or 120)
+
+
 def _resolve_api_key(spec: AgentSpec) -> str:
-    """Compatibility wrapper around the shared adapter support Module."""
+    """Compatibility wrapper around the shared adapter support module."""
     return resolve_api_key(spec)
 
 
-def build_client(spec: AgentSpec) -> OpenAIChatCompletionClient:
-    """Construct the OpenAI-compatible chat client pointed at ``model.baseURL``."""
+def _project_endpoint_from_openai_base_url(base_url: str) -> str:
+    """Extract a Foundry project endpoint from ``.../openai/v1`` base URLs."""
+    marker = "/openai/v1"
+    if marker not in base_url:
+        raise AgentBuildError(
+            "model.auth workload-identity-token for the MAF runtime requires "
+            "model.baseURL to be a Foundry project OpenAI endpoint ending in /openai/v1"
+        )
+    return base_url.split(marker, 1)[0].rstrip("/")
+
+
+def build_client(spec: AgentSpec):
+    """Construct the chat client for the configured model auth mode."""
+    auth = spec.model.auth
+    if auth is not None and auth.type == _AUTH_WORKLOAD_IDENTITY:
+        if token := os.environ.get("AGENTKIT_MODEL_WORKLOAD_IDENTITY_TOKEN"):
+            return OpenAIChatCompletionClient(
+                model=spec.model.name,
+                base_url=spec.model.base_url,
+                api_key=token,
+            )
+        try:
+            from agent_framework.foundry import FoundryChatClient
+            from azure.identity import DefaultAzureCredential
+        except ImportError as exc:  # pragma: no cover - dependency guard.
+            raise AgentBuildError(
+                "model workload identity auth requires agent-framework-foundry and azure-identity"
+            ) from exc
+        return FoundryChatClient(
+            project_endpoint=_project_endpoint_from_openai_base_url(spec.model.base_url),
+            model=spec.model.name,
+            credential=DefaultAzureCredential(),
+        )
+
     return OpenAIChatCompletionClient(
         model=spec.model.name,
         base_url=spec.model.base_url,
@@ -95,12 +108,7 @@ def _tool_env(tool: ToolSpec) -> dict[str, str]:
 
 
 def build_tool(tool: ToolSpec):
-    """Create a stdio or Streamable HTTP MCP server for one tool spec.
-
-    MCP tools are async context managers (``connect()``/``close()``); the server
-    starts once inside the agent's lifespan, mirroring the pydantic-ai adapter's
-    ``async with agent:``.
-    """
+    """Create a stdio or Streamable HTTP MCP server for one tool spec."""
     timeout = _mcp_request_timeout()
     if tool.url_env:
         from httpx import AsyncClient, URL
@@ -108,7 +116,7 @@ def build_tool(tool: ToolSpec):
         url = resolve_tool_url(tool)
         target_url = URL(url)
         target_origin = (target_url.scheme, target_url.host, target_url.port)
-        remote_timeout = float(timeout if timeout is not None else 120)
+        remote_timeout = _remote_mcp_timeout()
 
         async def inject_headers(request):  # noqa: ANN001
             request_origin = (request.url.scheme, request.url.host, request.url.port)
@@ -122,10 +130,6 @@ def build_tool(tool: ToolSpec):
             "url": url,
             "tool_name_prefix": tool.name,
             "load_prompts": False,
-            # Headers must be present during initialize/list-tools and tool calls.
-            # The event hook refreshes workload tokens for each same-origin HTTP
-            # request. Redirect following is disabled so credential-bearing
-            # headers cannot be replayed to another origin.
             "http_client": AsyncClient(
                 event_hooks={"request": [inject_headers]},
                 follow_redirects=False,
@@ -137,16 +141,10 @@ def build_tool(tool: ToolSpec):
 
     command, args = split_tool_command(tool, example='["uvx", "mcp-server-fetch"]')
     kwargs = {
-        "name": tool.name,  # the server's identity (used in error messages/spans)
+        "name": tool.name,
         "command": command,
         "args": args,
         "env": declared_tool_env(tool),
-        # tool_name_prefix namespaces the tool names THIS server exposes, so two
-        # servers can't collide (MAF raises "Duplicate tool name" otherwise). This
-        # mirrors the pydantic-ai adapter's tool_prefix=tool.name. NOTE: the server
-        # `name` above does NOT namespace exposed tools — tool_name_prefix is the
-        # knob (verified against agent-framework-core: only tool_name_prefix feeds
-        # _build_prefixed_mcp_name).
         "tool_name_prefix": tool.name,
     }
     if timeout is not None:
@@ -154,29 +152,34 @@ def build_tool(tool: ToolSpec):
     return MCPStdioTool(**kwargs)
 
 
-def build_agent(spec: AgentSpec) -> Agent:
-    """Assemble the MAF agent: client + system prompt + stdio MCP tools.
-
-    The agent OWNS its system prompt (``spec.instructions``) and tools —
-    request-side tools are rejected by the server, never merged here.
-    """
+def build_agent(spec: AgentSpec, *, context_providers=None) -> Agent:
+    """Assemble the MAF agent: client + system prompt + tools + context."""
     return Agent(
         client=build_client(spec),
         instructions=spec.instructions,
         name=spec.metadata.name,
         tools=[build_tool(t) for t in spec.tools],
+        context_providers=context_providers,
     )
 
 
 class MAFRuntime:
     """RuntimeSession Adapter around a Microsoft Agent Framework Agent."""
 
-    def __init__(self, agent: Agent) -> None:
-        self.agent = agent
+    def __init__(self, spec: AgentSpec) -> None:
+        self.spec = spec
+        self.stack = AsyncExitStack()
+        self.agent: Agent | None = None
 
     async def __aenter__(self) -> RuntimeSession:
-        await self.agent.__aenter__()
-        return self
+        try:
+            context_providers = await self._build_context_providers()
+            self.agent = build_agent(self.spec, context_providers=context_providers)
+            await self.agent.__aenter__()
+            return self
+        except Exception:
+            await self.stack.aclose()
+            raise
 
     async def __aexit__(
         self,
@@ -184,15 +187,59 @@ class MAFRuntime:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> bool | None:
-        return await self.agent.__aexit__(exc_type, exc, tb)
+        agent_result = None
+        if self.agent is not None:
+            agent_result = await self.agent.__aexit__(exc_type, exc, tb)
+            self.agent = None
+        await self.stack.aclose()
+        return agent_result
 
     async def run(self, request: RunRequest) -> RunResult:
+        if self.agent is None:
+            raise AgentBuildError("MAF runtime session is not initialized")
         return await run_agent(self.agent, request)
+
+    async def _build_context_providers(self):
+        providers = []
+        for provider in self.spec.context.providers:
+            if provider.type != _CONTEXT_TYPE_SKILLS:
+                # Other context provider schemas are validated/gated but not yet
+                # implemented by this runtime.
+                continue
+            if provider.source == _CONTEXT_SOURCE_FILESYSTEM:
+                providers.append(SkillsProvider(FileSkillsSource(provider.path)))
+            elif provider.source == _CONTEXT_SOURCE_MCP:
+                providers.append(await self._build_mcp_skills_provider(provider))
+        return providers or None
+
+    async def _build_mcp_skills_provider(self, provider: ContextProviderSpec):
+        tool = next((t for t in self.spec.tools if t.name == provider.tool_ref), None)
+        if tool is None:
+            raise AgentBuildError(f"skills provider references unknown toolRef {provider.tool_ref!r}")
+        if not tool.url_env:
+            raise AgentBuildError("MCP skills provider currently requires a streamable-http MCP toolRef")
+
+        from mcp.client.session import ClientSession
+        from mcp.client.streamable_http import streamable_http_client
+
+        url = resolve_tool_url(tool)
+        http_client = same_origin_mcp_httpx_client_factory(
+            tool,
+            url,
+            timeout=_remote_mcp_timeout(),
+        )()
+        await self.stack.enter_async_context(http_client)
+        read, write, _ = await self.stack.enter_async_context(
+            streamable_http_client(url=url, http_client=http_client)
+        )
+        session = await self.stack.enter_async_context(ClientSession(read, write))
+        await session.initialize()
+        return SkillsProvider(MCPSkillsSource(client=session))
 
 
 def build_runtime(spec: AgentSpec) -> MAFRuntime:
     """Build the runtime session consumed by the shared server."""
-    return MAFRuntime(build_agent(spec))
+    return MAFRuntime(spec)
 
 
 def _status_of(exc: Exception) -> int:
@@ -207,12 +254,7 @@ def _result_text(result: object) -> str:
 
 
 def _result_usage(result: object) -> dict[str, int]:
-    """Map MAF ``usage_details`` to the OpenAI usage block (zeros if unknown).
-
-    MAF exposes ``usage_details`` as a dict-like with ``input_token_count`` /
-    ``output_token_count`` / ``total_token_count``. The echo client used in tests
-    reports none, so every access is guarded.
-    """
+    """Map MAF ``usage_details`` to the OpenAI usage block (zeros if unknown)."""
     details = getattr(result, "usage_details", None)
     get = getattr(details, "get", None)
     if not callable(get):
@@ -229,11 +271,7 @@ def _result_usage(result: object) -> dict[str, int]:
 
 
 def _to_messages(request: RunRequest) -> list[Message]:
-    """Map a neutral RunRequest to MAF messages.
-
-    The agent's own ``instructions`` are prepended by MAF as a system message; this
-    function handles prior conversation turns plus the final user prompt.
-    """
+    """Map a neutral RunRequest to MAF messages."""
     messages: list[Message] = []
     for turn in request.history:
         if turn.role in FORWARDED_ROLES and turn.text:

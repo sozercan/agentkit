@@ -232,3 +232,18 @@ func TestRenderAgentYAMLIncludesContextAndObservability(t *testing.T) {
 		}
 	}
 }
+
+func TestRenderAgentYAMLIncludesModelWorkloadIdentityAuth(t *testing.T) {
+	cfg := sampleConfig()
+	cfg.Model.Auth = &config.Auth{Type: config.AuthTypeWorkloadIdentity, Audience: "https://ai.azure.com/.default"}
+	out, err := Render(effective.FromConfig(cfg, testInstructions))
+	if err != nil {
+		t.Fatalf("render error: %v", err)
+	}
+	s := string(out)
+	for _, want := range []string{"auth:", "type: workload-identity-token", "audience: https://ai.azure.com/.default"} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("rendered agent.yaml missing %q\n---\n%s", want, s)
+		}
+	}
+}
