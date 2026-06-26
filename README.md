@@ -61,6 +61,46 @@ The image also exposes:
 - `GET /v1/models`
 - `POST /v1/chat/completions`
 
+## Use any OpenAI-compatible model endpoint
+
+AgentKit is model-endpoint agnostic. `model.baseURL` can point at any
+OpenAI-compatible `/v1` endpoint: OpenAI, another hosted provider, a local
+gateway, an in-cluster service, or a model image served by
+[AIKit](https://github.com/kaito-project/aikit). AIKit is only one example.
+
+For an AIKit example, run any AIKit image that exposes the OpenAI-compatible API
+on a Docker network. This can be a prebuilt CPU/GPU image or a custom model image
+you create with AIKit:
+
+```sh
+docker network create agentkit-local 2>/dev/null || true
+
+docker run -d --rm \
+  --name aikit-llama \
+  --network agentkit-local \
+  ghcr.io/kaito-project/aikit/llama3.2:1b
+```
+
+Then point the Agentkitfile at that service and use the model name exposed by the
+endpoint. No-auth local endpoints do not need `apiKeyEnv` unless you add your own
+auth layer:
+
+```yaml
+model:
+  provider: openai-compatible
+  baseURL: http://aikit-llama:8080/v1
+  name: llama-3.2-1b-instruct
+```
+
+For any other endpoint, replace `baseURL` and `model.name` with the values for
+that service. For another prebuilt or custom AIKit image, also replace the image
+reference and container name.
+
+Run the generated AgentKit container on the same Docker network so it can reach
+`aikit-llama`. If AIKit is exposed through the host instead, use an address that
+is reachable from inside the AgentKit container, such as
+`http://host.docker.internal:<port>/v1` on Docker Desktop.
+
 ## Add MCP tools
 
 Declare stdio MCP servers in `tools:`. Tool commands are started by the runtime
