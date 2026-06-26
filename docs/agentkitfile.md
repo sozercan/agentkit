@@ -96,6 +96,44 @@ model:
 If `apiKeyEnv` is omitted, the runtime supplies a non-secret placeholder key for
 OpenAI-compatible endpoints that do not require authentication.
 
+#### OpenAI-compatible endpoints
+
+AgentKit does not require the model endpoint to be OpenAI-hosted. Any
+OpenAI-compatible `/v1` service is valid: OpenAI, another hosted provider, a
+local gateway, an in-cluster service, or a model image from
+[AIKit](https://github.com/kaito-project/aikit). AIKit is only one example.
+
+For an AIKit example, run any AIKit image that serves the OpenAI-compatible API
+on a Docker network. This can be a prebuilt CPU/GPU image or a custom model image
+you create with AIKit:
+
+```sh
+docker network create agentkit-local 2>/dev/null || true
+
+docker run -d --rm \
+  --name aikit-llama \
+  --network agentkit-local \
+  ghcr.io/kaito-project/aikit/llama3.2:1b
+```
+
+Configure the agent to use the `/v1` URL and model name served by that endpoint:
+
+```yaml
+model:
+  provider: openai-compatible
+  baseURL: http://aikit-llama:8080/v1
+  name: llama-3.2-1b-instruct
+```
+
+Omit `apiKeyEnv` for no-auth endpoints. Run the generated AgentKit container on
+the same Docker network, or replace `baseURL` with another address reachable
+from the AgentKit container, such as a Kubernetes service DNS name or
+`http://host.docker.internal:<port>/v1` on Docker Desktop.
+
+Other endpoints follow the same pattern: replace `baseURL` and `model.name` with
+the values for the service you are using. For another prebuilt or custom AIKit
+image, also replace the image reference and container name.
+
 ### `instructions`
 
 Inline form:
