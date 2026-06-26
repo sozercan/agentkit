@@ -1,7 +1,8 @@
 target: foundry-hosted-agent
 name: agentkit-agent
 agent: ./agentkitfile.yaml
-image: docker.io/example/agentkit-agent:latest
+image: docker.io/example/agentkit-foundry-wrapper:latest
+foundryWrapper: true
 protocols:
   - invocations
   - responses

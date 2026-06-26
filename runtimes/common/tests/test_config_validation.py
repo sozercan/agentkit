@@ -336,3 +336,15 @@ def test_load_rejects_mcp_skills_unknown_tool_ref(tmp_path):
         load(_write_spec(tmp_path, spec_dict))
 
     assert "references unknown tool" in str(exc.value)
+
+
+def test_load_rejects_escaped_filesystem_skills_path(tmp_path):
+    spec_dict = deepcopy(_BASE_SPEC)
+    spec_dict["context"] = {
+        "providers": [{"type": "skills", "source": "filesystem", "path": "/agent/skills/../secrets"}]
+    }
+
+    with pytest.raises(ConfigError) as exc:
+        load(_write_spec(tmp_path, spec_dict))
+
+    assert "/agent/skills" in str(exc.value)

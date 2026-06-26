@@ -789,3 +789,38 @@ expose:
 		t.Fatalf("expected /agent/skills guidance, got: %v", verr)
 	}
 }
+
+func TestValidateRejectsBearerAuthForSkillsContextProvider(t *testing.T) {
+	in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: skills-agent
+runtime: microsoft-agent-framework
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: hi
+context:
+  providers:
+    - type: skills
+      source: filesystem
+      path: /agent/skills
+      auth:
+        type: bearer
+        tokenEnv: SKILLS_TOKEN
+expose:
+  openai: true
+`)
+	cfg, err := NewFromBytes(in)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	verr := cfg.Validate()
+	if verr == nil {
+		t.Fatal("expected bearer auth validation error for skills context provider, got nil")
+	}
+	if !strings.Contains(verr.Error(), "not supported for context providers") {
+		t.Fatalf("expected context auth error, got: %v", verr)
+	}
+}

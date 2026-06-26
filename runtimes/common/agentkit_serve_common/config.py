@@ -9,6 +9,7 @@ the *baked* file: ``instructions`` is already a fully-resolved scalar string and
 from __future__ import annotations
 
 import os
+import posixpath
 import re
 import sys
 from pathlib import Path
@@ -69,6 +70,7 @@ def _looks_like_secret_literal(value: str) -> bool:
 
 class Metadata(_Strict):
     name: str = Field(min_length=1)
+
 
 class AuthSpec(_Strict):
     type: str = Field(min_length=1)
@@ -160,7 +162,6 @@ class ToolHeaderSpec(_Strict):
         if self.value and _looks_like_secret_literal(self.value):
             raise ValueError("header value looks like a secret; use valueEnv")
         return self
-
 
 
 class ToolSpec(_Strict):
@@ -269,7 +270,7 @@ class ContextProviderSpec(_Strict):
         if self.type == _CONTEXT_TYPE_SKILLS and self.source == _CONTEXT_SOURCE_FILESYSTEM:
             if not self.path:
                 raise ValueError("filesystem skills require path")
-            normalized = str(Path(self.path))
+            normalized = posixpath.normpath(self.path)
             if normalized != "/agent/skills" and not normalized.startswith("/agent/skills/"):
                 raise ValueError("filesystem skills path must be an absolute path under /agent/skills")
         return self

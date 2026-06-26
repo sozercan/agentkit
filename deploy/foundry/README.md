@@ -9,7 +9,8 @@ features such as remote MCP tools and context providers.
 ```yaml
 target: foundry-hosted-agent
 agent: ./agentkitfile.yaml
-image: docker.io/acme/hr-agent:v1
+image: docker.io/acme/hr-agent-foundry-wrapper:v1
+foundryWrapper: true
 protocols:
   - invocations
   - responses
@@ -24,7 +25,9 @@ without adding Foundry-specific keys to `/agent/agent.yaml`.
 ## Hosted-agent rendering
 
 Use `render_agent.py` to map a provider-neutral Foundry deployment profile to
-the `agent.yaml` shape consumed by azd hosted agents:
+the `agent.yaml` shape consumed by azd hosted agents. The `image` must already
+serve Foundry's `/readiness`, `/invocations`, and `/responses` contract (for
+example by wrapping an AgentKit image with `test/foundry-hosted-agent/foundry_live.py`):
 
 ```sh
 python deploy/foundry/render_agent.py deploy/foundry/agentkit.foundry.yaml.example -o agent.yaml
@@ -42,6 +45,10 @@ environment_variables:
 Do not hand-author the camelCase `environmentVariables` map form for hosted
 AgentKit validation: it can validate locally while failing to inject variables
 into the hosted container.
+
+`render_agent.py` requires `foundryWrapper: true` (or `imageKind:
+foundry-wrapper`) so a plain AgentKit `/v1` image is not accidentally advertised
+as a Foundry-hosted protocol image.
 
 ## Resource setup
 

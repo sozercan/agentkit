@@ -188,6 +188,7 @@ func validateContext(add func(string, ...any), ctx Context, tools []Tool) {
 			validateEnvField(add, path+".indexEnv", provider.IndexEnv, true)
 			validateContextAuth(add, path+".auth", provider.Auth)
 		case ContextTypeSkills:
+			validateContextAuth(add, path+".auth", provider.Auth)
 			switch provider.Source {
 			case ContextSourceFilesystem:
 				if provider.Path == "" {
