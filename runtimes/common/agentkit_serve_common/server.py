@@ -119,13 +119,12 @@ def make_auth_dependency(auth_token: str | None):
     return _require_auth
 
 
-
-
 def _clean_session_id(value: str | None) -> str | None:
     if not value:
         return None
     value = value.strip()
     return value or None
+
 
 def create_app(spec: AgentSpec, factory: RuntimeFactory, auth_token: str | None = None) -> FastAPI:
     """Construct the FastAPI app for one validated :class:`AgentSpec`.

@@ -639,3 +639,121 @@ expose:
 		t.Fatalf("MAF search+memory context providers should validate: %v", verr)
 	}
 }
+
+func TestValidateRejectsInvalidMCPSkillsToolRefs(t *testing.T) {
+	cases := map[string]string{
+		"unknown": `tools:
+  - name: toolbox
+    type: mcp
+    transport: streamable-http
+    urlEnv: TOOLBOX_ENDPOINT
+context:
+  providers:
+    - type: skills
+      source: mcp
+      toolRef: missing
+`,
+		"stdio": `tools:
+  - name: local
+    command: ["uvx", "mcp-server-fetch"]
+context:
+  providers:
+    - type: skills
+      source: mcp
+      toolRef: local
+`,
+	}
+	for name, yaml := range cases {
+		t.Run(name, func(t *testing.T) {
+			in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: skills-agent
+runtime: microsoft-agent-framework
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: hi
+` + yaml + `expose:
+  openai: true
+`)
+			cfg, err := NewFromBytes(in)
+			if err != nil {
+				t.Fatalf("parse error: %v", err)
+			}
+			if verr := cfg.Validate(); verr == nil {
+				t.Fatal("expected invalid MCP skills toolRef validation error, got nil")
+			}
+		})
+	}
+}
+
+func TestValidateAllowsMCPSkillsWithoutIndexWhenToolRefIsRemoteMCP(t *testing.T) {
+	in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: skills-agent
+runtime: microsoft-agent-framework
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: hi
+tools:
+  - name: toolbox
+    type: mcp
+    transport: streamable-http
+    urlEnv: TOOLBOX_ENDPOINT
+context:
+  providers:
+    - type: skills
+      source: mcp
+      toolRef: toolbox
+expose:
+  openai: true
+`)
+	cfg, err := NewFromBytes(in)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if verr := cfg.Validate(); verr != nil {
+		t.Fatalf("valid MCP skills toolRef should pass without index: %v", verr)
+	}
+}
+
+func TestValidateRejectsBearerAuthForContextProviders(t *testing.T) {
+	in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: context-agent
+runtime: microsoft-agent-framework
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: hi
+context:
+  providers:
+    - name: knowledge
+      type: search
+      endpointEnv: SEARCH_ENDPOINT
+      indexEnv: SEARCH_INDEX
+      auth:
+        type: bearer
+        tokenEnv: SEARCH_TOKEN
+expose:
+  openai: true
+`)
+	cfg, err := NewFromBytes(in)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	verr := cfg.Validate()
+	if verr == nil {
+		t.Fatal("expected bearer context auth validation error, got nil")
+	}
+	if !strings.Contains(verr.Error(), "not supported for context providers") {
+		t.Fatalf("expected context auth error, got: %v", verr)
+	}
+}

@@ -284,3 +284,23 @@ def test_load_accepts_model_workload_identity_auth(tmp_path):
     assert spec.model.auth is not None
     assert spec.model.auth.type == "workload-identity-token"
     assert spec.model.auth.audience == "https://ai.azure.com/.default"
+
+
+def test_load_rejects_bearer_auth_for_context_provider(tmp_path):
+    spec_dict = deepcopy(_BASE_SPEC)
+    spec_dict["context"] = {
+        "providers": [
+            {
+                "name": "knowledge",
+                "type": "search",
+                "endpointEnv": "SEARCH_ENDPOINT",
+                "indexEnv": "SEARCH_INDEX",
+                "auth": {"type": "bearer", "tokenEnv": "SEARCH_TOKEN"},
+            }
+        ]
+    }
+
+    with pytest.raises(ConfigError) as exc:
+        load(_write_spec(tmp_path, spec_dict))
+
+    assert "context providers do not support bearer auth" in str(exc.value)

@@ -118,3 +118,42 @@ def test_foundry_responses_ignores_portable_optional_fields():
 
     assert resp.status_code == 200
     assert resp.json()["output"][0]["content"][0]["text"] == "echo: hi"
+
+
+def test_foundry_responses_preserves_message_history_for_list_input():
+    factory = EchoFactory()
+    app = create_foundry_app(_spec(), factory)
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/responses",
+            json={
+                "input": [
+                    {"role": "system", "content": "system context"},
+                    {"role": "user", "content": "first turn"},
+                    {"role": "assistant", "content": "assistant reply"},
+                    {"role": "user", "content": "final prompt"},
+                ]
+            },
+        )
+
+    assert resp.status_code == 200
+    request = factory.runtime.requests[0]
+    assert request.prompt == "final prompt"
+    assert [(turn.role, turn.text) for turn in request.history] == [
+        ("system", "system context"),
+        ("user", "first turn"),
+        ("assistant", "assistant reply"),
+    ]
+
+
+def test_foundry_responses_rejects_request_supplied_tools():
+    app = create_foundry_app(_spec(), EchoFactory())
+    with TestClient(app) as client:
+        tools = client.post("/responses", json={"input": "hi", "tools": [{"type": "function"}]})
+        choice = client.post("/responses", json={"input": "hi", "tool_choice": {"type": "function"}})
+
+    assert tools.status_code == 400
+    assert tools.json()["error"]["code"] == "tools_unsupported"
+    assert choice.status_code == 400
+    assert choice.json()["error"]["code"] == "tool_choice_unsupported"

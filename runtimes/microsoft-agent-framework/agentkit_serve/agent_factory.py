@@ -52,6 +52,7 @@ _CONTEXT_SOURCE_FILESYSTEM = "filesystem"
 _CONTEXT_SOURCE_MCP = "mcp"
 _DEFAULT_SEARCH_AUDIENCE = "https://search.azure.com/.default"
 _DEFAULT_FOUNDRY_AUDIENCE = "https://ai.azure.com/.default"
+_DEFAULT_SESSION_CACHE_MAX = 256
 
 
 def _mcp_request_timeout() -> int | None:
@@ -107,26 +108,55 @@ class _BearerTokenCredential:
         return access_token(token, int(time.time()) + 300)
 
 
-def _credential_for_context(provider: ContextProviderSpec, *, default_audience: str):
+class _AsyncBearerTokenCredential:
+    """Async TokenCredential over AgentKit's generic workload token hook."""
+
+    def __init__(self, audience: str) -> None:
+        self._audience = audience
+
+    async def get_token(self, *scopes: str, **kwargs):  # noqa: ANN003 - Azure async credential protocol
+        credentials_mod = importlib.import_module("azure.core.credentials")
+        access_token = getattr(credentials_mod, "AccessToken")
+
+        audience = scopes[0] if scopes else self._audience
+        token = await asyncio.to_thread(resolve_workload_identity_token, audience or self._audience)
+        return access_token(token, int(time.time()) + 300)
+
+
+def _credential_for_context(
+    provider: ContextProviderSpec,
+    *,
+    default_audience: str,
+    async_credential: bool = False,
+):
     auth = provider.auth
     if auth is None or auth.type == _AUTH_WORKLOAD_IDENTITY:
+        audience = auth.audience if auth and auth.audience else default_audience
         # If AgentKit's generic token hook is configured, use it. Otherwise fall
         # back to DefaultAzureCredential for local az login / hosted MI flows.
         if (
             os.environ.get("AGENTKIT_WORKLOAD_IDENTITY_TOKEN")
             or os.environ.get("AGENTKIT_WORKLOAD_IDENTITY_TOKEN_COMMAND")
         ):
-            return _BearerTokenCredential(auth.audience if auth and auth.audience else default_audience)
+            return _AsyncBearerTokenCredential(audience) if async_credential else _BearerTokenCredential(audience)
         try:
-            from azure.identity import DefaultAzureCredential
-        except ImportError as exc:  # pragma: no cover - dependency guard.
+            if async_credential:
+                identity_mod = importlib.import_module("azure.identity.aio")
+            else:
+                identity_mod = importlib.import_module("azure.identity")
+            credential_type = getattr(identity_mod, "DefaultAzureCredential")
+        except (ImportError, AttributeError) as exc:  # pragma: no cover - dependency guard.
             raise AgentBuildError("context workload identity auth requires azure-identity") from exc
-        return DefaultAzureCredential()
+        return credential_type()
     raise AgentBuildError(f"context provider auth type {auth.type!r} is not supported by the MAF runtime")
 
 
 def _memory_update_delay() -> int:
     return positive_int_env("AGENTKIT_MEMORY_UPDATE_DELAY", default=0) or 0
+
+
+def _session_cache_max() -> int:
+    return positive_int_env("AGENTKIT_SESSION_CACHE_MAX", default=_DEFAULT_SESSION_CACHE_MAX) or _DEFAULT_SESSION_CACHE_MAX
 
 
 def build_client(spec: AgentSpec):
@@ -228,6 +258,7 @@ class MAFRuntime:
         self.stack = AsyncExitStack()
         self.agent: Agent | None = None
         self.sessions: dict[str, AgentSession] = {}
+        self.session_cache_max = _session_cache_max()
 
     async def __aenter__(self) -> RuntimeSession:
         try:
@@ -261,17 +292,19 @@ class MAFRuntime:
     def _session_for(self, session_id: str | None) -> AgentSession | None:
         if not session_id:
             return None
-        session = self.sessions.get(session_id)
+        session = self.sessions.pop(session_id, None)
         if session is None:
             session = AgentSession(session_id=session_id)
-            self.sessions[session_id] = session
+        self.sessions[session_id] = session
+        while len(self.sessions) > self.session_cache_max:
+            self.sessions.pop(next(iter(self.sessions)))
         return session
 
     async def _build_context_providers(self):
         providers = []
         for provider in self.spec.context.providers:
             if provider.type == _CONTEXT_TYPE_SEARCH:
-                providers.append(self._build_search_provider(provider))
+                providers.append(await self._build_search_provider(provider))
             elif provider.type == _CONTEXT_TYPE_SKILLS:
                 if provider.source == _CONTEXT_SOURCE_FILESYSTEM:
                     providers.append(SkillsProvider(FileSkillsSource(provider.path)))
@@ -281,7 +314,7 @@ class MAFRuntime:
                 providers.append(self._build_memory_provider(provider))
         return providers or None
 
-    def _build_search_provider(self, provider: ContextProviderSpec):
+    async def _build_search_provider(self, provider: ContextProviderSpec):
         try:
             azure_mod = importlib.import_module("agent_framework.azure")
             search_provider = getattr(azure_mod, "AzureAISearchContextProvider")
@@ -292,11 +325,19 @@ class MAFRuntime:
 
         endpoint = _env_required(provider.endpoint_env, field="context.providers[].endpointEnv")
         index = _env_required(provider.index_env, field="context.providers[].indexEnv")
+        credential = _credential_for_context(
+            provider,
+            default_audience=_DEFAULT_SEARCH_AUDIENCE,
+            async_credential=True,
+        )
+        close = getattr(credential, "close", None)
+        if callable(close):
+            self.stack.push_async_callback(close)
         return search_provider(
             source_id=provider.name or "search",
             endpoint=endpoint,
             index_name=index,
-            credential=_credential_for_context(provider, default_audience=_DEFAULT_SEARCH_AUDIENCE),
+            credential=credential,
         )
 
     def _build_memory_provider(self, provider: ContextProviderSpec):

@@ -342,7 +342,7 @@ def test_build_agent_adds_search_context_provider(monkeypatch):
         return FakeModule
 
     monkeypatch.setattr(agent_factory.importlib, "import_module", fake_import)
-    monkeypatch.setattr(agent_factory, "_credential_for_context", lambda provider, default_audience: "credential")
+    monkeypatch.setattr(agent_factory, "_credential_for_context", lambda provider, default_audience, async_credential=False: "credential")
     monkeypatch.setenv("SEARCH_ENDPOINT", "https://example.search.windows.net")
     monkeypatch.setenv("SEARCH_INDEX", "kb")
     spec = AgentSpec.model_validate({
@@ -393,7 +393,7 @@ def test_build_agent_adds_memory_context_provider(monkeypatch):
         return FakeModule
 
     monkeypatch.setattr(agent_factory.importlib, "import_module", fake_import)
-    monkeypatch.setattr(agent_factory, "_credential_for_context", lambda provider, default_audience: "credential")
+    monkeypatch.setattr(agent_factory, "_credential_for_context", lambda provider, default_audience, async_credential=False: "credential")
     monkeypatch.setenv("MEMORY_ENDPOINT", "https://example.services.ai.azure.com/api/projects/proj")
     monkeypatch.setenv("MEMORY_STORE_NAME", "agentkit-memory")
     spec = AgentSpec.model_validate({
@@ -462,3 +462,72 @@ def test_runtime_reuses_sessions_by_request_session_id(monkeypatch):
     assert seen_sessions[0] is not seen_sessions[2]
     assert seen_sessions[0].session_id == "s1"
     assert seen_sessions[2].session_id == "s2"
+
+
+def test_runtime_session_cache_is_bounded(monkeypatch):
+    from agentkit_serve_common.config import AgentSpec
+    from agentkit_serve_common.conversation import RunRequest
+    from agentkit_serve_common.runtime import RunResult
+
+    async def fake_run_agent(agent, request, *, session=None):
+        return RunResult(text=session.session_id if session else "none")
+
+    monkeypatch.setattr(agent_factory, "run_agent", fake_run_agent)
+    monkeypatch.setenv("AGENTKIT_SESSION_CACHE_MAX", "2")
+    spec = AgentSpec.model_validate({
+        "abiVersion": "v0",
+        "metadata": {"name": "x"},
+        "model": {"provider": "openai-compatible", "baseURL": "https://api.openai.com/v1", "name": "gpt-4o-mini"},
+        "instructions": "hi",
+        "tools": [],
+        "expose": {"openai": True, "port": 8080},
+    })
+    runtime = agent_factory.MAFRuntime(spec)
+    runtime.agent = object()
+
+    import asyncio
+    asyncio.run(runtime.run(RunRequest(prompt="one", session_id="s1")))
+    asyncio.run(runtime.run(RunRequest(prompt="two", session_id="s2")))
+    asyncio.run(runtime.run(RunRequest(prompt="three", session_id="s3")))
+
+    assert list(runtime.sessions) == ["s2", "s3"]
+
+
+def test_context_credential_uses_async_default_for_search(monkeypatch):
+    from agentkit_serve_common.config import ContextProviderSpec
+
+    class FakeAsyncCredential:
+        pass
+
+    class FakeSyncCredential:
+        pass
+
+    class FakeAioIdentity:
+        DefaultAzureCredential = FakeAsyncCredential
+
+    class FakeSyncIdentity:
+        DefaultAzureCredential = FakeSyncCredential
+
+    def fake_import(name):
+        if name == "azure.identity.aio":
+            return FakeAioIdentity
+        if name == "azure.identity":
+            return FakeSyncIdentity
+        raise ImportError(name)
+
+    monkeypatch.setattr(agent_factory.importlib, "import_module", fake_import)
+    monkeypatch.delenv("AGENTKIT_WORKLOAD_IDENTITY_TOKEN", raising=False)
+    monkeypatch.delenv("AGENTKIT_WORKLOAD_IDENTITY_TOKEN_COMMAND", raising=False)
+    provider = ContextProviderSpec.model_validate({
+        "type": "search",
+        "endpointEnv": "SEARCH_ENDPOINT",
+        "indexEnv": "SEARCH_INDEX",
+    })
+
+    credential = agent_factory._credential_for_context(
+        provider,
+        default_audience="https://search.azure.com/.default",
+        async_credential=True,
+    )
+
+    assert isinstance(credential, FakeAsyncCredential)

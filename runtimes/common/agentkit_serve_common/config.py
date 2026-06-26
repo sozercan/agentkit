@@ -257,6 +257,12 @@ class ContextProviderSpec(_Strict):
             return value
         return _validate_env_name(value, field="context.providers[].env")
 
+    @model_validator(mode="after")
+    def _context_auth_supported(self) -> "ContextProviderSpec":
+        if self.auth is not None and self.auth.type == _AUTH_BEARER:
+            raise ValueError("context providers do not support bearer auth; use workload-identity-token")
+        return self
+
 
 class ContextSpec(_Strict):
     providers: list[ContextProviderSpec] = Field(default_factory=list)

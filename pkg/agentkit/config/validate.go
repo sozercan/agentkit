@@ -143,7 +143,7 @@ func (c *AgentConfig) Validate() error {
 		seenEnv[e.Name] = true
 	}
 
-	validateContext(add, c.Context)
+	validateContext(add, c.Context, c.Tools)
 	validateObservability(add, c.Observability)
 
 	// --- runtime capability gate -------------------------------------------
@@ -165,8 +165,14 @@ func (c *AgentConfig) Validate() error {
 	return errors.Join(errs...)
 }
 
-func validateContext(add func(string, ...any), ctx Context) {
+func validateContext(add func(string, ...any), ctx Context, tools []Tool) {
 	seen := map[string]bool{}
+	toolByName := map[string]Tool{}
+	for _, tool := range tools {
+		if tool.Name != "" {
+			toolByName[tool.Name] = tool
+		}
+	}
 	for i, provider := range ctx.Providers {
 		path := fmt.Sprintf("context.providers[%d]", i)
 		if provider.Name != "" {
@@ -179,7 +185,7 @@ func validateContext(add func(string, ...any), ctx Context) {
 		case ContextTypeSearch:
 			validateEnvField(add, path+".endpointEnv", provider.EndpointEnv, true)
 			validateEnvField(add, path+".indexEnv", provider.IndexEnv, true)
-			validateAuth(add, path+".auth", provider.Auth)
+			validateContextAuth(add, path+".auth", provider.Auth)
 		case ContextTypeSkills:
 			switch provider.Source {
 			case ContextSourceFilesystem:
@@ -189,9 +195,10 @@ func validateContext(add func(string, ...any), ctx Context) {
 			case ContextSourceMCP:
 				if provider.ToolRef == "" {
 					add("%s.toolRef is required for MCP skills", path)
-				}
-				if provider.Index == "" {
-					add("%s.index is required for MCP skills", path)
+				} else if tool, ok := toolByName[provider.ToolRef]; !ok {
+					add("%s.toolRef %q references unknown tool", path, provider.ToolRef)
+				} else if tool.URLEnv == "" || tool.Transport != ToolTransportStreamableHTTP {
+					add("%s.toolRef %q must reference a streamable-http MCP tool", path, provider.ToolRef)
 				}
 			default:
 				add("%s.source %q is not supported for skills (expected filesystem or mcp)", path, provider.Source)
@@ -199,12 +206,19 @@ func validateContext(add func(string, ...any), ctx Context) {
 		case ContextTypeMemory:
 			validateEnvField(add, path+".storeNameEnv", provider.StoreNameEnv, true)
 			validateEnvField(add, path+".endpointEnv", provider.EndpointEnv, true)
-			validateAuth(add, path+".auth", provider.Auth)
+			validateContextAuth(add, path+".auth", provider.Auth)
 		case "":
 			add("%s.type is required", path)
 		default:
 			add("%s.type %q is not supported (expected search, skills, or memory)", path, provider.Type)
 		}
+	}
+}
+
+func validateContextAuth(add func(string, ...any), path string, auth *Auth) {
+	validateAuth(add, path, auth)
+	if auth != nil && auth.Type == AuthTypeBearer {
+		add("%s.type %q is not supported for context providers; use %q", path, auth.Type, AuthTypeWorkloadIdentity)
 	}
 }
 

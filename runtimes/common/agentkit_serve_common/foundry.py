@@ -18,7 +18,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
 from .config import AgentSpec
-from .conversation import RunRequest
+from .conversation import FORWARDED_ROLES, ConversationTurn, RunRequest
 from .runtime import AgentRunError, RuntimeFactory, RunResult
 
 
@@ -71,34 +71,59 @@ def _session_id_from_request(request: Request) -> str | None:
     return None
 
 
-def _responses_input_to_prompt(value: Any) -> str:
-    """Extract a prompt from the common non-streaming Responses API input shapes."""
+def _responses_content_to_text(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                text = block.get("text") or block.get("input_text") or block.get("output_text")
+                if text is not None:
+                    parts.append(str(text))
+        return "".join(parts)
+    return str(content)
+
+
+def _responses_input_to_run_request(value: Any, *, session_id: str | None) -> RunRequest:
+    """Extract a RunRequest from common non-streaming Responses API input shapes."""
     if isinstance(value, str):
-        return value
+        return RunRequest(prompt=value, session_id=session_id)
+
+    if isinstance(value, list) and all(isinstance(item, dict) and "role" in item for item in value):
+        history: list[ConversationTurn] = []
+        for item in value:
+            role = str(item.get("role") or "")
+            text = _responses_content_to_text(item.get("content"))
+            if role in FORWARDED_ROLES and text:
+                history.append(ConversationTurn(role=role, text=text))
+        if not history:
+            return RunRequest(prompt="", session_id=session_id)
+        last = history[-1]
+        if last.role != "user":
+            raise ValueError("Responses input list final message must have role 'user'")
+        return RunRequest(prompt=last.text, history=tuple(history[:-1]), session_id=session_id)
+
     if isinstance(value, list):
         parts: list[str] = []
         for item in value:
             if isinstance(item, str):
                 parts.append(item)
                 continue
-            if not isinstance(item, dict):
-                parts.append(str(item))
-                continue
-            content = item.get("content")
-            if isinstance(content, str):
-                parts.append(content)
-                continue
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, str):
-                        parts.append(block)
-                    elif isinstance(block, dict):
-                        text = block.get("text") or block.get("input_text")
-                        if text is not None:
-                            parts.append(str(text))
+            if isinstance(item, dict):
+                text = _responses_content_to_text(item.get("content"))
+                if text:
+                    parts.append(text)
+                    continue
+            parts.append(str(item))
         if parts:
-            return "\n".join(parts)
-    return json.dumps(value, separators=(",", ":"), sort_keys=True)
+            return RunRequest(prompt="\n".join(parts), session_id=session_id)
+
+    return RunRequest(prompt=json.dumps(value, separators=(",", ":"), sort_keys=True), session_id=session_id)
 
 
 def _responses_payload(spec: AgentSpec, result: RunResult) -> dict[str, Any]:
@@ -181,14 +206,31 @@ def create_foundry_app(spec: AgentSpec, factory: RuntimeFactory) -> FastAPI:
         # Foundry/azd clients may include stream=true by default. The adapter is
         # intentionally non-streaming, so tolerate the flag and return a normal
         # completed response instead of failing readiness/e2e checks.
+        if data.get("tools"):
+            return _error(
+                "request-supplied Responses tools are not allowed; this agent owns its tools",
+                status=400,
+                code="tools_unsupported",
+            )
+        if data.get("tool_choice") not in (None, "", "none", "auto"):
+            return _error(
+                "request-supplied Responses tool_choice is not allowed; this agent owns its tools",
+                status=400,
+                code="tool_choice_unsupported",
+            )
         if "input" not in data:
             return _error("Missing 'input' in request", status=400, code="missing_input")
 
-        prompt = _responses_input_to_prompt(data["input"])
         try:
-            result = await request.app.state.runtime.run(
-                RunRequest(prompt=prompt, session_id=_session_id_from_request(request))
+            run_request = _responses_input_to_run_request(
+                data["input"],
+                session_id=_session_id_from_request(request),
             )
+        except ValueError as exc:
+            return _error(str(exc), status=400, code="invalid_input")
+
+        try:
+            result = await request.app.state.runtime.run(run_request)
         except AgentRunError as exc:
             return _error(str(exc), status=exc.status, code=exc.code)
         except Exception as exc:  # noqa: BLE001 - deterministic protocol envelope.
