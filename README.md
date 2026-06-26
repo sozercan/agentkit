@@ -8,6 +8,10 @@ Use AgentKit when you want to package an agent the same way you package any othe
 container: build it with Docker, run it locally, push it to a registry, and deploy
 it anywhere containers run.
 
+> **Experimental:** AgentKit is still early. APIs, file formats, and runtime
+> behavior may change as the project evolves. Feedback, issues, and PRs are
+> welcome.
+
 ## Quick start
 
 Create `agentkitfile.yaml`:
