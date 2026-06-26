@@ -49,3 +49,13 @@ raw framework agent objects behind the Runtime Adapter Interface.
 A concrete in-image implementation that reads the Agent YAML ABI and serves the
 OpenAI-compatible `/v1` facade using a particular agent framework, such as
 pydantic-ai or Microsoft Agent Framework.
+
+### Runtime Capability
+A provider-neutral feature flag declared by a Runtime Adapter (for example
+`stdio-mcp`). The Agentkitfile validator checks requested features against the
+runtime catalog before build so unsupported features fail clearly.
+
+### Runtime Env Requirement
+A top-level `env:` declaration in an Agentkitfile/Agent YAML ABI. It records only
+an environment variable name and whether it is required; values stay in the
+runtime environment and are never baked into the image.

@@ -11,10 +11,11 @@ import (
 )
 
 type catalogEntry struct {
-	APIVersion string   `yaml:"apiVersion"`
-	Runtime    string   `yaml:"runtime"`
-	Aliases    []string `yaml:"aliases,omitempty"`
-	Adapter    string   `yaml:"adapter"`
+	APIVersion   string   `yaml:"apiVersion"`
+	Runtime      string   `yaml:"runtime"`
+	Aliases      []string `yaml:"aliases,omitempty"`
+	Capabilities []string `yaml:"capabilities,omitempty"`
+	Adapter      string   `yaml:"adapter"`
 }
 
 func TestRuntimeCatalogFilesMatchRuntimeSpecs(t *testing.T) {
@@ -46,6 +47,14 @@ func TestRuntimeCatalogFilesMatchRuntimeSpecs(t *testing.T) {
 		sort.Strings(wantAliases)
 		if !reflect.DeepEqual(gotAliases, wantAliases) {
 			t.Errorf("%s aliases = %v, want %v", path, gotAliases, wantAliases)
+		}
+
+		gotCapabilities := append([]string(nil), entry.Capabilities...)
+		wantCapabilities := append([]string(nil), spec.Capabilities...)
+		sort.Strings(gotCapabilities)
+		sort.Strings(wantCapabilities)
+		if !reflect.DeepEqual(gotCapabilities, wantCapabilities) {
+			t.Errorf("%s capabilities = %v, want %v", path, gotCapabilities, wantCapabilities)
 		}
 		seen[filepath.Base(path)] = true
 	}

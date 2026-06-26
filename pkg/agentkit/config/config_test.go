@@ -3,6 +3,8 @@ package config
 import (
 	"strings"
 	"testing"
+
+	"github.com/sozercan/agentkit/pkg/agentkit/runtimes"
 )
 
 // TestKindProbeRejectsKindlessFile is the regression guard for the AIKit
@@ -272,5 +274,135 @@ func TestValidateRejectsUnknownRuntime(t *testing.T) {
 	}
 	if !strings.Contains(verr.Error(), "microsoft-agent-framework") {
 		t.Errorf("error should list supported runtimes; got: %v", verr)
+	}
+}
+
+func TestEnvDeclarationsValidateAndParse(t *testing.T) {
+	in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: env-agent
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+  apiKeyEnv: OPENAI_API_KEY
+instructions: hi
+env:
+  - name: REQUIRED_FOO
+    required: true
+  - name: OPTIONAL_BAR
+expose:
+  openai: true
+`)
+	cfg, err := NewFromBytes(in)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if len(cfg.Env) != 2 {
+		t.Fatalf("Env len = %d, want 2", len(cfg.Env))
+	}
+	if cfg.Env[0].Name != "REQUIRED_FOO" || !cfg.Env[0].Required {
+		t.Fatalf("first env = %+v, want required REQUIRED_FOO", cfg.Env[0])
+	}
+	if cfg.Env[1].Name != "OPTIONAL_BAR" || cfg.Env[1].Required {
+		t.Fatalf("second env = %+v, want optional OPTIONAL_BAR", cfg.Env[1])
+	}
+	if verr := cfg.Validate(); verr != nil {
+		t.Fatalf("valid env declarations failed validation: %v", verr)
+	}
+}
+
+func TestEnvDeclarationsRejectInvalidNamesDuplicatesAndValues(t *testing.T) {
+	in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: env-agent
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+  apiKeyEnv: OPENAI_API_KEY
+instructions: hi
+env:
+  - name: required-foo
+  - name: REQUIRED_FOO
+  - name: REQUIRED_FOO
+expose:
+  openai: true
+`)
+	cfg, err := NewFromBytes(in)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	verr := cfg.Validate()
+	if verr == nil {
+		t.Fatal("expected env validation errors, got nil")
+	}
+	msg := verr.Error()
+	for _, want := range []string{"env[0].name", "[A-Z0-9_]+", "duplicate env var name"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("validation error missing %q; full: %s", want, msg)
+		}
+	}
+
+	withValue := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: env-agent
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: hi
+env:
+  - name: REQUIRED_FOO
+    value: do-not-allow-literals
+expose:
+  openai: true
+`)
+	if _, err := NewFromBytes(withValue); err == nil || !strings.Contains(err.Error(), "value") {
+		t.Fatalf("expected strict parse rejection for env.value literal, got: %v", err)
+	}
+}
+
+func TestValidateRejectsStdioToolWhenRuntimeLacksCapability(t *testing.T) {
+	old := append([]runtimes.RuntimeSpec(nil), runtimes.Runtimes...)
+	t.Cleanup(func() { runtimes.Runtimes = old })
+	for i := range runtimes.Runtimes {
+		if runtimes.Runtimes[i].Name == runtimes.PydanticAI {
+			runtimes.Runtimes[i].Capabilities = nil
+		}
+	}
+
+	in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: caps-agent
+runtime: pydantic-ai
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: hi
+tools:
+  - name: fetch
+    command: ["uvx", "mcp-server-fetch"]
+expose:
+  openai: true
+`)
+	cfg, err := NewFromBytes(in)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	verr := cfg.Validate()
+	if verr == nil {
+		t.Fatal("expected runtime capability validation error, got nil")
+	}
+	msg := verr.Error()
+	for _, want := range []string{"runtime \"pydantic-ai\"", "stdio-mcp"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("validation error missing %q; full: %s", want, msg)
+		}
 	}
 }

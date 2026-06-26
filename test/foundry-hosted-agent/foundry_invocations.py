@@ -22,7 +22,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from agentkit_serve.agent_factory import build_runtime
-from agentkit_serve_common.config import load
+from agentkit_serve_common.config import load, validate_required_env
 from agentkit_serve_common.conversation import RunRequest
 
 logging.basicConfig(level=logging.INFO)
@@ -113,6 +113,7 @@ os.environ.setdefault("MODEL_API_KEY", "not-needed")
 _start_mock_openai()
 
 spec = load("/agent/agent.yaml")
+validate_required_env(spec)
 runtime = build_runtime(spec)
 app = InvocationAgentServerHost()
 _original_lifespan = app.router.lifespan_context

@@ -25,6 +25,7 @@ func baseConfig() *config.AgentConfig {
 		Tools: []config.Tool{
 			{Name: "fetch", Command: []string{"uvx", "mcp-server-fetch"}, Env: []string{"FETCH_TIMEOUT"}},
 		},
+		Env:    []config.EnvVar{{Name: "REQUIRED_FOO", Required: true}},
 		Expose: config.Expose{OpenAI: true},
 	}
 }
@@ -65,6 +66,7 @@ func TestFromConfigCopiesMutableFields(t *testing.T) {
 	cfg.Metadata.Labels["team"] = "mutated"
 	cfg.Tools[0].Command[0] = "mutated"
 	cfg.Tools[0].Env[0] = "MUTATED"
+	cfg.Env[0].Name = "MUTATED"
 
 	if agent.Metadata.Labels["team"] != "agentkit" {
 		t.Fatalf("label was not copied: %#v", agent.Metadata.Labels)
@@ -73,6 +75,9 @@ func TestFromConfigCopiesMutableFields(t *testing.T) {
 		t.Fatalf("command was not copied: %q", got)
 	}
 	if got := agent.Tools[0].Env[0]; got != "FETCH_TIMEOUT" {
-		t.Fatalf("env was not copied: %q", got)
+		t.Fatalf("tool env was not copied: %q", got)
+	}
+	if got := agent.Env[0].Name; got != "REQUIRED_FOO" {
+		t.Fatalf("agent env was not copied: %q", got)
 	}
 }

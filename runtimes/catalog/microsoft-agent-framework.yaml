@@ -12,4 +12,6 @@ apiVersion: v1alpha1
 runtime: microsoft-agent-framework
 aliases:
   - maf
+capabilities:
+  - stdio-mcp
 adapter: ghcr.io/sozercan/agentkit/serve-maf:latest

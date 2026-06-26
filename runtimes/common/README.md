@@ -5,7 +5,7 @@ The framework-neutral core shared by AgentKit's runtime adapters
 **not** depend on a specific agent framework:
 
 - `config.py` — the strict loader for the frozen `/agent/agent.yaml` ABI
-  (`docs/agent-abi.md`).
+  (`docs/agent-abi.md`) plus secret-free required-env validation.
 - `server.py` — the non-streaming OpenAI `/v1` Chat-Completions facade (the 400
   guards, the Bearer auth gate, the single-`chat.completion` assembly).
 - `cli.py` — the CLI entry point + network posture (loopback default; `0.0.0.0`

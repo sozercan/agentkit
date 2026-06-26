@@ -8,4 +8,6 @@
 # this human-readable entry against pkg/agentkit/runtimes.
 apiVersion: v1alpha1
 runtime: pydantic-ai
+capabilities:
+  - stdio-mcp
 adapter: ghcr.io/sozercan/agentkit/serve-pydantic-ai:latest

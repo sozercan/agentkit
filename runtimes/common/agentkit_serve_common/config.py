@@ -9,6 +9,7 @@ the writer does not emit.
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 from pathlib import Path
@@ -20,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 ABI_VERSION = "v0"
 _PROVIDER_OPENAI_COMPATIBLE = "openai-compatible"
 _ENV_NAME_RE = re.compile(r"^[A-Z0-9_]+$")
+_SECRET_VALUE_PREFIXES = ("sk-", "sk_", "ghp_", "github_pat_", "xoxb-", "AKIA")
 
 
 class _Strict(BaseModel):
@@ -32,6 +34,8 @@ def _validate_env_name(value: str, *, field: str) -> str:
     """Validate an env var NAME from the ABI, never a secret value."""
     if not value or not _ENV_NAME_RE.fullmatch(value):
         raise ValueError(f"{field} must be an env var NAME matching [A-Z0-9_]+")
+    if value.startswith(_SECRET_VALUE_PREFIXES):
+        raise ValueError(f"{field} looks like a secret value; provide an env var NAME")
     return value
 
 
@@ -88,6 +92,18 @@ class ToolSpec(_Strict):
         return [_validate_env_name(name, field="tools[].env") for name in value]
 
 
+class EnvVarSpec(_Strict):
+    """A runtime environment variable requirement by NAME only."""
+
+    name: str = Field(min_length=1)
+    required: bool = False
+
+    @field_validator("name")
+    @classmethod
+    def _name_is_env_var(cls, value: str) -> str:
+        return _validate_env_name(value, field="env[].name")
+
+
 class ExposeSpec(_Strict):
     openai: bool
     port: int
@@ -116,9 +132,24 @@ class AgentSpec(_Strict):
     # Fully-resolved system prompt scalar (writer resolves inline|file -> string).
     instructions: str
     tools: list[ToolSpec] = Field(default_factory=list)
+    env: list[EnvVarSpec] = Field(default_factory=list)
     expose: ExposeSpec
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    @field_validator("env")
+    @classmethod
+    def _unique_env_names(cls, value: list[EnvVarSpec]) -> list[EnvVarSpec]:
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for entry in value:
+            if entry.name in seen:
+                duplicates.append(entry.name)
+            seen.add(entry.name)
+        if duplicates:
+            names = ", ".join(sorted(set(duplicates)))
+            raise ValueError(f"duplicate env var declarations: {names}")
+        return value
 
 
 class ConfigError(Exception):
@@ -168,10 +199,34 @@ def load(path: str | Path) -> AgentSpec:
     return spec
 
 
+def validate_required_env(spec: AgentSpec) -> None:
+    """Fail if required runtime env vars declared in the ABI are missing.
+
+    Only env var NAMES are reported; values are never inspected beyond empty vs
+    present and are never logged.
+    """
+    missing = [
+        entry.name
+        for entry in spec.env
+        if entry.required and not os.environ.get(entry.name)
+    ]
+    if not missing:
+        return
+    names = ", ".join(missing)
+    first = missing[0]
+    plural = "s" if len(missing) != 1 else ""
+    raise ConfigError(
+        f"required env var{plural} not set: {names}; inject at runtime, e.g. "
+        f"`docker run -e {first}=...`"
+    )
+
+
 def load_or_exit(path: str | Path) -> AgentSpec:
-    """Like :func:`load` but prints the error to stderr and exits non-zero."""
+    """Like :func:`load` but validates runtime env and exits non-zero on error."""
     try:
-        return load(path)
+        spec = load(path)
+        validate_required_env(spec)
+        return spec
     except ConfigError as exc:
         print(f"agentkit-serve: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc

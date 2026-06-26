@@ -32,6 +32,14 @@ type Model struct {
 	APIKeyEnv string `yaml:"apiKeyEnv,omitempty"`
 }
 
+// EnvVar declares one runtime environment variable the agent expects. Values are
+// never stored in the agentkitfile or baked ABI; only the variable NAME and
+// whether it must be present at runtime are recorded.
+type EnvVar struct {
+	Name     string `yaml:"name"`
+	Required bool   `yaml:"required,omitempty"`
+}
+
 // Expose declares how the built agent is reachable. v0 supports the OpenAI
 // Chat-Completions façade only; mcp/a2a are v1 (strict parsing rejects them).
 type Expose struct {
@@ -59,6 +67,9 @@ type AgentConfig struct {
 	Instructions Source `yaml:"instructions"`
 	// Tools are MCP servers. v0: stdio command servers (plan §5.2 ⚠).
 	Tools []Tool `yaml:"tools,omitempty"`
+	// Env declares runtime env var requirements by NAME only. Values are injected
+	// by the deployment/runtime environment and never baked into the image.
+	Env []EnvVar `yaml:"env,omitempty"`
 	// Expose declares the serving surface.
 	Expose Expose `yaml:"expose"`
 }

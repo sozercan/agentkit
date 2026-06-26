@@ -71,8 +71,8 @@ func TestRenderAgentYAMLShape(t *testing.T) {
 	}
 	s := string(out)
 
-	// The reader is extra=forbid: assert exactly the allowed top-level keys are
-	// present and no foreign key leaks in.
+	// The reader is extra=forbid: assert the required top-level keys are present
+	// and no foreign key leaks in. Optional env is covered below.
 	mustContain := []string{"abiVersion:", "metadata:", "model:", "instructions:", "tools:", "expose:", "baseURL:", "apiKeyEnv:"}
 	for _, k := range mustContain {
 		if !strings.Contains(s, k) {
@@ -120,6 +120,10 @@ func TestRenderAgentYAMLRoundTrips(t *testing.T) {
 			Command []string `yaml:"command"`
 			Env     []string `yaml:"env"`
 		} `yaml:"tools"`
+		Env []struct {
+			Name     string `yaml:"name"`
+			Required bool   `yaml:"required"`
+		} `yaml:"env"`
 		Expose struct {
 			OpenAI bool `yaml:"openai"`
 			Port   int  `yaml:"port"`
@@ -136,5 +140,27 @@ func TestRenderAgentYAMLRoundTrips(t *testing.T) {
 	}
 	if len(got.Tools) != 1 || got.Tools[0].Name != "fetch" {
 		t.Errorf("tools not round-tripped: %+v", got.Tools)
+	}
+}
+
+func TestRenderAgentYAMLIncludesEnvRequirements(t *testing.T) {
+	cfg := sampleConfig()
+	cfg.Env = []config.EnvVar{
+		{Name: "REQUIRED_FOO", Required: true},
+		{Name: "OPTIONAL_BAR"},
+	}
+	out, err := Render(effective.FromConfig(cfg, testInstructions))
+	if err != nil {
+		t.Fatalf("render error: %v", err)
+	}
+
+	s := string(out)
+	for _, want := range []string{"env:", "name: REQUIRED_FOO", "required: true", "name: OPTIONAL_BAR"} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("rendered agent.yaml missing %q\n---\n%s", want, s)
+		}
+	}
+	if strings.Contains(s, "required: false") {
+		t.Fatalf("optional env vars should omit required: false\n---\n%s", s)
 	}
 }

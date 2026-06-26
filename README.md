@@ -9,7 +9,7 @@ write an `agentkitfile.yaml` (`kind: Agent`) describing a model, instructions,
 and tools; `docker build` turns it into a normal, runnable container image. No
 new runtime, no orchestration — the output is an OCI image you ship anywhere.
 
-## The v0 agent (four keys)
+## The v0 agent
 
 ```yaml
 #syntax=ghcr.io/sozercan/agentkit/agentkit:latest
@@ -40,6 +40,18 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 Add stdio MCP tools with a `tools:` list (see `test/agentkitfile-tools.yaml`).
 
+Declare runtime environment requirements with top-level `env:` entries. AgentKit
+bakes only env var names into `/agent/agent.yaml`; values are supplied by the
+runtime environment. Required entries are checked at startup with secret-free
+errors:
+
+```yaml
+env:
+  - name: REQUIRED_FOO
+    required: true
+  - name: OPTIONAL_BAR
+```
+
 > **First-boot note.** v0 tools are stdio MCP servers launched at runtime via
 > `uvx`/`npx`. The *first* launch downloads and installs the server package before
 > it speaks MCP, so the initial container start can take 30–90s. The init timeout
@@ -67,6 +79,11 @@ Both runtimes consume the **same** baked `/agent/agent.yaml` and serve the
 **same** non-streaming OpenAI `/v1` façade with the same guards — so the same
 agentkitfile produces a behavior-compatible image under either. Only the in-image
 runtime adapter differs. The `AGENTKIT_MCP_TIMEOUT` knob applies to both.
+
+Runtime capabilities are explicit and validated before build. Today both shipped
+runtimes declare `stdio-mcp`; future features such as remote MCP, skills, memory,
+workload identity, and hosted-agent protocol adapters must add provider-neutral
+capability flags before they are requestable. See `docs/runtime-capabilities.md`.
 
 ## Local dev loop (3 steps)
 
@@ -155,11 +172,12 @@ test suite for free.
 ## v0 scope / not yet
 
 - **v0**: two runtimes (pydantic-ai default + microsoft-agent-framework),
-  `provider: openai-compatible` only, stdio `command` MCP tools, the OpenAI `/v1`
-  façade, single OCI image output.
+  `provider: openai-compatible` only, stdio `command` MCP tools, generic env
+  requirements, runtime capability validation, the OpenAI `/v1` façade, single
+  OCI image output.
 - **Not yet**: image-based MCP tools, evals, lock file / SBOM / signing,
   agentpack, `extends`/patches, knowledge/RAG, memory/state, model fallback,
   streaming, and embedded/BYO serving targets.
 
-Secrets are never baked: `apiKeyEnv` and tool `env:` carry env var **names**;
-values are injected at `docker run` time.
+Secrets are never baked: `apiKeyEnv`, tool `env:`, and top-level env
+requirements carry env var **names**; values are injected at `docker run` time.

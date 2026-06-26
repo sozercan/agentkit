@@ -19,6 +19,7 @@ type Agent struct {
 	Model        config.Model
 	Instructions string
 	Tools        []config.Tool
+	Env          []config.EnvVar
 	Expose       config.Expose
 }
 
@@ -46,6 +47,7 @@ func FromConfig(cfg *config.AgentConfig, instructions string) Agent {
 		Model:        cfg.Model,
 		Instructions: instructions,
 		Tools:        copyTools(cfg.Tools),
+		Env:          copyEnvVars(cfg.Env),
 		Expose:       expose,
 	}
 }
@@ -71,5 +73,14 @@ func copyTools(in []config.Tool) []config.Tool {
 		out[i].Command = append([]string(nil), tool.Command...)
 		out[i].Env = append([]string(nil), tool.Env...)
 	}
+	return out
+}
+
+func copyEnvVars(in []config.EnvVar) []config.EnvVar {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]config.EnvVar, len(in))
+	copy(out, in)
 	return out
 }

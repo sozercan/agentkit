@@ -21,5 +21,6 @@ def test_go_rendered_agent_yaml_golden_loads_in_python_reader():
     assert spec.tools[0].name == "fetch"
     assert spec.tools[0].command == ["uvx", "mcp-server-fetch"]
     assert spec.tools[0].env == ["FETCH_TIMEOUT"]
+    assert spec.env == []
     assert spec.expose.openai is True
     assert spec.expose.port == 8080

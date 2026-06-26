@@ -17,8 +17,9 @@ const Path = "/agent/agent.yaml"
 // The following types are the WRITER half of the frozen agent.yaml ABI
 // (docs/agent-abi.md). agentkit-serve reads this file with pydantic
 // extra="forbid", so these structs MUST emit EXACTLY the keys
-// abiVersion/metadata/model/instructions/tools/expose — no more, no fewer — with
-// model using the baseURL/apiKeyEnv aliases. Field order here is the emit order.
+// abiVersion/metadata/model/instructions/tools/env/expose — with env omitted when
+// empty — and model using the baseURL/apiKeyEnv aliases. Field order here is
+// the emit order.
 
 type abiMetadata struct {
 	Name string `yaml:"name"`
@@ -37,6 +38,11 @@ type abiTool struct {
 	Env     []string `yaml:"env,omitempty"`
 }
 
+type abiEnvVar struct {
+	Name     string `yaml:"name"`
+	Required bool   `yaml:"required,omitempty"`
+}
+
 type abiExpose struct {
 	OpenAI bool `yaml:"openai"`
 	Port   int  `yaml:"port"`
@@ -48,6 +54,7 @@ type abiAgent struct {
 	Model        abiModel    `yaml:"model"`
 	Instructions string      `yaml:"instructions"`
 	Tools        []abiTool   `yaml:"tools"`
+	Env          []abiEnvVar `yaml:"env,omitempty"`
 	Expose       abiExpose   `yaml:"expose"`
 }
 
@@ -65,10 +72,17 @@ func Render(agent effective.Agent) ([]byte, error) {
 		},
 		Instructions: agent.Instructions,
 		Tools:        make([]abiTool, 0, len(agent.Tools)),
+		Env:          make([]abiEnvVar, 0, len(agent.Env)),
 		Expose:       abiExpose{OpenAI: agent.Expose.OpenAI, Port: agent.Expose.Port},
 	}
 	for _, t := range agent.Tools {
 		out.Tools = append(out.Tools, abiTool{Name: t.Name, Command: t.Command, Env: t.Env})
+	}
+	for _, e := range agent.Env {
+		out.Env = append(out.Env, abiEnvVar{Name: e.Name, Required: e.Required})
+	}
+	if len(out.Env) == 0 {
+		out.Env = nil
 	}
 
 	return yaml.Marshal(out)
