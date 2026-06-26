@@ -1,36 +1,42 @@
 # agentkit-serve-common
 
-The framework-neutral core shared by AgentKit's runtime adapters
-(`agentkit-serve`, `agentkit-serve-maf`, …). It contains everything that does
-**not** depend on a specific agent framework:
+`agentkit-serve-common` is the framework-neutral Python core shared by all
+AgentKit runtime adapters. It contains the runtime behavior that must be
+identical whether the selected adapter is pydantic-ai, Microsoft Agent Framework,
+or LangGraph.
 
-- `config.py` — the strict loader for the frozen `/agent/agent.yaml` ABI
-  (`docs/agent-abi.md`).
-- `server.py` — the non-streaming OpenAI `/v1` Chat-Completions facade (the 400
-  guards, the Bearer auth gate, the single-`chat.completion` assembly).
-- `cli.py` — the CLI entry point + network posture (loopback default; `0.0.0.0`
-  requires `AGENTKIT_AUTH_TOKEN`).
-- `runtime.py` — the **neutral run contract**: `RunResult`, `AgentRunError`,
-  `RuntimeSession`, and the `RuntimeFactory` protocol each adapter implements.
+## Modules
 
-## The seam
+- `config.py` — strict `/agent/agent.yaml` ABI loader and version check.
+- `cli.py` — `agentkit-serve --config ...`, bind/port handling, and the startup
+  auth gate for non-loopback binds.
+- `server.py` — FastAPI app for `/healthz`, `/v1/models`, and
+  `/v1/chat/completions`.
+- `conversation.py` — OpenAI message normalization into a framework-neutral
+  `RunRequest`.
+- `runtime.py` — `RuntimeFactory`, `RuntimeSession`, `RunResult`, and
+  `AgentRunError`.
+- `adapter_support.py` — API-key resolution, declared-only tool env projection,
+  MCP timeout parsing, and framework exception normalization.
+- `conformance.py` — shared HTTP behavior tests imported by adapter test suites.
 
-`server.create_app(spec, factory, auth_token)` is handed the adapter's
-framework-specific `agent_factory` module (which satisfies `RuntimeFactory`). The
-server uses only `factory.build_runtime(spec)` and the returned
-`RuntimeSession.run(request) -> RunResult`, so it imports **no** agent framework
-and never touches raw framework agent lifecycle. This is what keeps the lock-in
-boundary (plan §12) confined to
-each adapter's `agent_factory.py`.
+## Adapter seam
+
+`server.create_app(spec, factory, auth_token)` receives an adapter module that
+satisfies `RuntimeFactory`. The shared server calls only
+`factory.build_runtime(spec)` and `RuntimeSession.run(request) -> RunResult`.
+It never imports framework packages or touches raw framework agent lifecycle.
+
+This keeps framework dependency lock-in inside each adapter's `agent_factory.py`.
 
 ## Adding a runtime adapter
 
-A new single-agent adapter is just:
+A new single-agent adapter should provide:
 
-1. `agent_factory.py` implementing `build_runtime` (with any private framework
-   helpers it needs; this is the only file that imports the framework), and
-2. a thin `__main__.py` that calls `agentkit_serve_common.cli.run(agent_factory)`.
+1. `agent_factory.py` implementing `build_runtime(spec) -> RuntimeSession`,
+2. a thin `__main__.py` that calls `agentkit_serve_common.cli.run(agent_factory)`,
+3. adapter tests that import the shared conformance checks, and
+4. an adapter image that installs this common package before the adapter package.
 
-This package is imported (as a path dependency) by each adapter and shipped inside
-each adapter image — but the adapters remain **separate images** with disjoint
-framework deps, which is what physically guarantees the lock-in boundary.
+Adapters remain separate images with separate framework dependencies, while this
+package is installed into each image as the shared façade/runtime core.

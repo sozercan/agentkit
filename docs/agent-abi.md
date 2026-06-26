@@ -1,72 +1,120 @@
-# The `agent.yaml` ABI (v0, FROZEN)
+# The `agent.yaml` ABI
 
-This file is the contract between the two halves of AgentKit:
+`/agent/agent.yaml` is the build-time/runtime contract between AgentKit's Go
+frontend and Python runtime adapters.
 
-- **Writer** — the Go frontend (`pkg/agentkit2llb/agent`) renders this file and
-  bakes it at `/agent/agent.yaml` in the built image.
-- **Reader** — `agentkit-serve` (Python) loads it at startup and serves the agent.
+- **Writer:** `pkg/agentkit/abi` renders the file from an effective Agent, and
+  `pkg/agentkit2llb/agent` bakes it into the final image.
+- **Reader:** `runtimes/common/agentkit_serve_common/config.py` loads and
+  validates the file before any adapter starts serving.
 
-Neither side may change this shape without updating the other. v0 keeps it
-minimal; new fields are additive.
+The writer and reader are intentionally strict. Any shape change must update both
+sides and the ABI tests.
 
 ## Location
 
-`/agent/agent.yaml` (constant `abi.Path`).
+`/agent/agent.yaml` (`pkg/agentkit/abi.Path`).
+
+## Version
+
+`abiVersion: v0` is the ABI schema value currently emitted by the Go writer and
+accepted by the Python reader. This is not the same field as the user-authored
+Agentkitfile `apiVersion`.
 
 ## Schema
 
 ```yaml
-# schema/version of THIS file, not the agentkitfile apiVersion.
 abiVersion: v0
 
 metadata:
-  name: url-summarizer          # agent name (from agentkitfile metadata.name)
+  name: url-summarizer
 
 model:
-  provider: openai-compatible   # v0: always openai-compatible
+  provider: openai-compatible
   baseURL: https://api.openai.com/v1
   name: gpt-4o-mini
-  apiKeyEnv: OPENAI_API_KEY      # NAME of env var; serve reads os.environ[apiKeyEnv]
+  apiKeyEnv: OPENAI_API_KEY
 
-instructions: |                  # fully-resolved system prompt (inline OR file contents)
+instructions: |
   Summarize any URL the user gives you in three bullet points.
 
-tools:                           # MCP servers, stdio transport (v0)
+tools:
   - name: fetch
-    command: ["npx", "-y", "@modelcontextprotocol/server-fetch"]
-    env: ["FETCH_TIMEOUT"]       # NAMES only; serve passes ONLY these into the subprocess env
+    command: ["uvx", "mcp-server-fetch"]
+    env: ["FETCH_TIMEOUT"]
 
 expose:
   openai: true
   port: 8080
 ```
 
-## Reader (agentkit-serve) contract
+## Field semantics
 
-1. Load and validate this file. On invalid/missing → exit non-zero with a clear error.
-2. Construct an OpenAI-compatible model client pointed at `model.baseURL`, using
-   model `model.name` and the API key from `os.environ[model.apiKeyEnv]`.
-3. For each tool, spawn a stdio MCP subprocess from `command`, passing **only**
-   the env vars NAMED in that tool's `env:` list (plan §10 secret-bleed rule) —
-   never the full container environment.
-4. Serve:
-   - `POST /v1/chat/completions` — non-streaming Chat-Completions façade.
-     - Reject `stream: true` → HTTP 400.
-     - Reject non-empty `tools` / `tool_choice` in the request → HTTP 400
-       ("this agent owns its tools").
-     - Drive the agent loop; collapse intermediate MCP tool calls to a single
-       assistant message with `finish_reason: "stop"`.
-   - `GET /v1/models` — optional SDK-compatibility listing (returns `model.name`).
-   - `GET /healthz` — liveness.
-5. Network posture (plan §10):
-   - Bind `127.0.0.1` by default.
-   - Binding `0.0.0.0` (env `AGENTKIT_BIND=0.0.0.0`) REQUIRES `AGENTKIT_AUTH_TOKEN`;
-     requests must then present `Authorization: Bearer <token>`.
-   - Run as non-root.
+- `metadata.name` comes from `metadata.name` in the Agentkitfile.
+- `model.provider` is `openai-compatible`.
+- `model.baseURL` and `model.name` are passed to the selected adapter's
+  OpenAI-compatible chat model client.
+- `model.apiKeyEnv` is optional and is an env var name. The runtime reads the
+  value from the process environment when it constructs the model client.
+- `instructions` is fully resolved text. Runtime adapters never fetch prompt
+  files or reinterpret instruction sources.
+- `tools` is a list of stdio MCP servers. `command` is argv; `env` is the
+  allowlist of env var names that may be copied into that subprocess.
+- `expose.openai` must be `true`.
+- `expose.port` is the port the runtime serves.
 
-## Writer (frontend) contract
+The Python reader forbids unknown keys, validates env var names, rejects empty
+commands, and rejects unsupported ABI versions.
 
-- Resolve `instructions` (inline string or file contents from the build context)
-  into the single `instructions:` scalar — serve never fetches sources.
-- Emit `tools[].command` and `tools[].env` verbatim from the agentkitfile.
-- Never write secret values; only env var NAMES (enforced by config.Validate).
+## Writer contract
+
+The Go frontend must:
+
+1. validate the authored Agentkitfile before rendering,
+2. resolve instruction sources into a scalar string,
+3. canonicalize runtime aliases and default the port before ABI rendering,
+4. emit exactly the keys the reader expects,
+5. preserve tool command argv and env allowlist names, and
+6. never write secret values.
+
+## Reader contract
+
+The shared Python runtime core must:
+
+1. load and validate `/agent/agent.yaml`, exiting non-zero on missing, invalid,
+   or unsupported files;
+2. construct the selected adapter runtime from the validated `AgentSpec`;
+3. resolve `model.apiKeyEnv` from the process environment or use the no-auth
+   placeholder when no key env is declared;
+4. start stdio MCP tool sessions for the application lifespan, passing only
+   declared tool env vars; and
+5. serve the OpenAI-compatible façade consistently across adapters.
+
+## Served HTTP contract
+
+The runtime serves:
+
+- `GET /healthz` — liveness.
+- `GET /v1/models` — one-model listing containing `model.name`.
+- `POST /v1/chat/completions` — non-streaming run that returns one
+  `chat.completion` object.
+
+`POST /v1/chat/completions` rejects:
+
+- `stream: true`,
+- request-supplied `tools`,
+- request-supplied `tool_choice` values other than missing, empty, `none`, or
+  `auto`,
+- an empty `messages` array, and
+- requests whose final message is not a `user` message.
+
+The response collapses any intermediate framework/tool loop into one assistant
+message with `finish_reason: "stop"`.
+
+## Network and process contract
+
+Generated images run `agentkit-serve --config /agent/agent.yaml` as user
+`1000:1000`. They bind `127.0.0.1` by default. If `AGENTKIT_BIND` is set to a
+non-loopback host such as `0.0.0.0`, startup requires `AGENTKIT_AUTH_TOKEN`; then
+`/v1/*` requests must include `Authorization: Bearer <token>`. `/healthz` remains
+open.

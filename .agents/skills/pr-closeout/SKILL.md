@@ -1,11 +1,21 @@
 ---
 name: pr-closeout
-description: Drive a GitHub pull request to merge-ready after implementation or review. Use automatically after creating or updating an agent-authored PR unless the user opts out or the PR is intentionally draft/WIP; also use when asked to fix merge conflicts, make CI green, handle unresolved PR review comments, reply to or resolve review threads, push PR branch updates, or repeat until a PR is green and review-clean.
+description: Drive a GitHub pull request to merge-ready after non-trivial implementation or review. Use automatically after creating or updating a non-trivial agent-authored code PR; omit automatic closeout for docs-only or otherwise trivial PRs unless explicitly asked. Also use when asked to fix merge conflicts, make CI green, handle unresolved PR review comments, reply to or resolve review threads, push PR branch updates, or repeat until a PR is green and review-clean.
 ---
 
 # PR Closeout
 
-Drive the current GitHub PR from “has feedback or failing checks” to “currently merge-ready.” Run this automatically after creating or updating an agent-authored PR unless the user opts out or the PR is intentionally draft/WIP. This orchestrates git, GitHub review threads, CI logs, local verification, and optional `$autoreview`; it is not a replacement for `$autoreview`.
+Drive the current GitHub PR from “has feedback or failing checks” to “currently merge-ready.” Run this automatically after creating or updating a non-trivial agent-authored code PR unless the user opts out or the PR is intentionally draft/WIP. Omit automatic closeout for docs-only or otherwise trivial PRs unless the user explicitly asks for closeout. This orchestrates git, GitHub review threads, CI logs, local verification, and optional `$autoreview`; it is not a replacement for `$autoreview`.
+
+## Automatic Skip Cases
+
+Skip the automatic post-create/post-update closeout run when the PR is clearly docs-only or trivial, similar to `$autoreview` being reserved for non-trivial code edits. Examples:
+
+- documentation-only changes such as Markdown, prose, comments, diagrams, examples, or README updates that do not change executable behavior;
+- formatting-only, typo-only, metadata-only, or comment-only changes;
+- small generated-doc/index updates that do not alter build, runtime, API, dependency, or workflow behavior.
+
+Do not skip when the user explicitly asks for closeout, when the change touches code/config/workflows/dependencies/generated API contracts, or when there are known merge conflicts, CI failures, or unresolved actionable review threads. If skipping automatic closeout, say briefly that the PR is docs-only/trivial and list the local validation already run instead of polling CI.
 
 ## Contract
 
@@ -17,7 +27,7 @@ Drive the current GitHub PR from “has feedback or failing checks” to “curr
 
 ## Guardrails
 
-- Treat automatic post-PR closeout or the user’s closeout request as the scope. Fix merge conflicts, CI failures, and unresolved actionable review feedback only.
+- Treat automatic post-PR closeout or the user’s closeout request as the scope. For automatic runs, first apply the docs-only/trivial skip rule above. Otherwise fix merge conflicts, CI failures, and unresolved actionable review feedback only.
 - Creating or updating an agent-authored PR authorizes normal closeout writes for that PR: push fixes to the non-main PR branch, reply on GitHub with fix/pushback evidence, and resolve review threads after replying when they are addressed. A request like “reply and resolve each comment,” “push updates,” or “drive this PR until green” authorizes the same writes.
 - Do not submit reviews, merge, enable auto-merge, retarget the PR, force-push, amend, rebase, or perform destructive git operations unless explicitly asked or the branch owner’s workflow clearly requires it.
 - Never push directly to `main`. For PR branches, commit with `git commit -s` when a commit is needed, then push the current branch.
