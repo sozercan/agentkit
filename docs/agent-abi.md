@@ -1,40 +1,49 @@
-# The `agent.yaml` ABI (v0, FROZEN)
+# The `agent.yaml` ABI (v0)
 
-This file is the contract between the two halves of AgentKit:
+`/agent/agent.yaml` is the built contract between the Go frontend writer and the
+Python runtime reader.
 
-- **Writer** — the Go frontend (`pkg/agentkit2llb/agent`) renders this file and
-  bakes it at `/agent/agent.yaml` in the built image.
-- **Reader** — `agentkit-serve` (Python) loads it at startup and serves the agent.
+- The **writer** renders it from an Effective Agent and bakes it into the image.
+- The **reader** (`agentkit-serve-common`) loads it at startup with strict schema
+  validation.
 
-Neither side may change this shape without updating the other. v0 keeps it
-minimal; new fields are additive.
+The ABI is intentionally target-neutral. Provider-specific deployment profiles or
+resource provisioners should map external resources to the generic fields below
+instead of adding provider-specific top-level keys.
 
 ## Location
 
 `/agent/agent.yaml` (constant `abi.Path`).
 
-## Schema
+## Example
 
 ```yaml
-# schema/version of THIS file, not the agentkitfile apiVersion.
 abiVersion: v0
 
 metadata:
-  name: url-summarizer          # agent name (from agentkitfile metadata.name)
+  name: url-summarizer
 
 model:
-  provider: openai-compatible   # v0: always openai-compatible
+  provider: openai-compatible
   baseURL: https://api.openai.com/v1
   name: gpt-4o-mini
-  apiKeyEnv: OPENAI_API_KEY      # NAME of env var; serve reads os.environ[apiKeyEnv]
+  apiKeyEnv: OPENAI_API_KEY
+  # Optional future generic model auth. Capability-gated; apiKeyEnv remains the
+  # normal v0 model-auth path.
+  # auth:
+  #   type: workload-identity-token
+  #   audience: https://example.com/.default
 
-instructions: |                  # fully-resolved system prompt (inline OR file contents)
+instructions: |
   Summarize any URL the user gives you in three bullet points.
 
-tools:                           # MCP servers: stdio or Streamable HTTP remote
+tools:
+  # Stdio MCP server.
   - name: fetch
     command: ["npx", "-y", "@modelcontextprotocol/server-fetch"]
-    env: ["FETCH_TIMEOUT"]       # NAMES only; serve passes ONLY these into the subprocess env
+    env: ["FETCH_TIMEOUT"]
+
+  # Remote MCP server over Streamable HTTP.
   - name: toolbox
     type: mcp
     transport: streamable-http
@@ -42,64 +51,159 @@ tools:                           # MCP servers: stdio or Streamable HTTP remote
     headers:
       - name: Foundry-Features
         value: Toolboxes=V1Preview
+      - name: X-Trace
+        valueEnv: TOOLBOX_TRACE_HEADER
     auth:
       type: bearer
       tokenEnv: TOOLBOX_TOKEN
 
-context:                         # provider-neutral context schema; runtime capability-gated
+env:
+  - name: REQUIRED_FOO
+    required: true
+  - name: OPTIONAL_BAR
+
+# Provider-neutral context schema. Runtime behavior is capability-gated.
+context:
   providers:
     - name: knowledge
       type: search
       endpointEnv: SEARCH_ENDPOINT
       indexEnv: SEARCH_INDEX
+    - name: support-style
+      type: skills
+      source: filesystem
+      path: /agent/skills
+    - name: user-memory
+      type: memory
+      endpointEnv: MEMORY_ENDPOINT
+      storeNameEnv: MEMORY_STORE_NAME
 
 observability:
   otel:
     endpointEnv: OTEL_EXPORTER_OTLP_ENDPOINT
-
-env:                             # optional runtime env requirements; values are never baked
-  - name: REQUIRED_FOO
-    required: true
-  - name: OPTIONAL_BAR
+  logs:
+    levelEnv: LOG_LEVEL
 
 expose:
   openai: true
   port: 8080
 ```
 
-## Reader (agentkit-serve) contract
+## Top-level fields
 
-1. Load and validate this file. On invalid/missing → exit non-zero with a clear error.
-2. Validate `env[]` requirements. If any `required: true` env var is absent or
-   empty, exit non-zero with a secret-free message that names only the missing
-   env var(s).
-3. Construct an OpenAI-compatible model client pointed at `model.baseURL`, using
-   model `model.name` and the API key from `os.environ[model.apiKeyEnv]`.
-4. For each stdio tool, spawn an MCP subprocess from `command`, passing **only**
-   the env vars NAMED in that tool's `env:` list (plan §10 secret-bleed rule) —
-   never the full container environment. For each remote MCP tool, resolve
-   `urlEnv`, env-derived headers, and auth at startup with secret-free errors.
-5. Load any `context`/`observability` entries only after config validation has
-   proved the selected runtime declares the required provider-neutral capability.
-6. Serve:
-   - `POST /v1/chat/completions` — non-streaming Chat-Completions façade.
-     - Reject `stream: true` → HTTP 400.
-     - Reject non-empty `tools` / `tool_choice` in the request → HTTP 400
-       ("this agent owns its tools").
-     - Drive the agent loop; collapse intermediate MCP tool calls to a single
-       assistant message with `finish_reason: "stop"`.
-   - `GET /v1/models` — optional SDK-compatibility listing (returns `model.name`).
-   - `GET /healthz` — liveness.
-7. Network posture (plan §10):
-   - Bind `127.0.0.1` by default.
-   - Binding `0.0.0.0` (env `AGENTKIT_BIND=0.0.0.0`) REQUIRES `AGENTKIT_AUTH_TOKEN`;
-     requests must then present `Authorization: Bearer <token>`.
-   - Run as non-root.
+| Field | Required | Description |
+|---|---:|---|
+| `abiVersion` | yes | ABI version understood by the runtime reader. Current value: `v0`. |
+| `metadata.name` | yes | Agent image/name label. |
+| `model` | yes | Hosted OpenAI-compatible model connection metadata. |
+| `instructions` | yes | Fully-resolved system prompt scalar. |
+| `tools` | no | Owned MCP tools, either stdio or Streamable HTTP. |
+| `env` | no | Runtime env var requirements by name only. |
+| `context` | no | Provider-neutral context providers; runtime capability-gated. |
+| `observability` | no | Provider-neutral observability env names; runtime capability-gated. |
+| `expose` | yes | Serving surface and port. |
 
-## Writer (frontend) contract
+## Tool forms
 
-- Resolve `instructions` (inline string or file contents from the build context)
-  into the single `instructions:` scalar — serve never fetches sources.
-- Emit `tools[]`, optional top-level `env[]`, `context`, and `observability`
-  declarations verbatim from the agentkitfile after validation/defaulting.
-- Never write secret values; only env var NAMES (enforced by config.Validate).
+### Stdio MCP
+
+```yaml
+tools:
+  - name: fetch
+    command: ["uvx", "mcp-server-fetch"]
+    env: ["FETCH_TIMEOUT"]
+```
+
+Runtime adapters spawn the command for the app lifespan and pass **only** the env
+var names listed in `env` when those variables are present in the container
+environment.
+
+### Streamable HTTP MCP
+
+```yaml
+tools:
+  - name: toolbox
+    type: mcp
+    transport: streamable-http
+    urlEnv: TOOLBOX_ENDPOINT
+    headers:
+      - name: Foundry-Features
+        value: Toolboxes=V1Preview
+      - name: X-API-Key
+        valueEnv: TOOLBOX_API_KEY
+    auth:
+      type: bearer
+      tokenEnv: TOOLBOX_TOKEN
+```
+
+`urlEnv`, `valueEnv`, and `tokenEnv` are env var names. Values are resolved at
+runtime and never baked into the image. Static credential headers such as
+`Authorization`, `Cookie`, `X-API-Key`, and provider subscription-key headers are
+rejected; use `valueEnv` or `auth` instead. Runtime HTTP clients inject headers
+same-origin only and avoid replaying credentials across redirects.
+
+Supported auth types:
+
+- `bearer` with `tokenEnv`.
+- `workload-identity-token` with opaque `audience`, only for runtimes that declare
+  `workload-identity-token-auth`.
+
+## Reader contract
+
+The shared Python runtime core must:
+
+1. load and validate this file, exiting non-zero on missing, invalid, or
+   unsupported files;
+2. validate `env[]` requirements and report missing env var names without values;
+3. construct the selected adapter runtime from the validated `AgentSpec`;
+4. resolve `model.apiKeyEnv` from the process environment or use the no-auth
+   placeholder when no key env is declared;
+5. start MCP tool sessions for the application lifespan:
+   - stdio tools receive only their declared env allowlist;
+   - remote tools resolve URL/header/auth material from env names and generic auth;
+6. serve the OpenAI-compatible façade consistently across adapters.
+
+## Writer contract
+
+The Go frontend must:
+
+1. validate the authored Agentkitfile before rendering,
+2. resolve instruction sources into a scalar string,
+3. canonicalize runtime aliases and default the port before ABI rendering,
+4. emit exactly the keys the reader expects,
+5. preserve tool, env, context, and observability declarations after validation,
+   and
+6. never write secret values.
+
+## Served HTTP contract
+
+The native runtime serves:
+
+- `GET /healthz` — liveness.
+- `GET /v1/models` — one-model listing containing `model.name`.
+- `POST /v1/chat/completions` — non-streaming run that returns one
+  `chat.completion` object.
+
+The reusable Foundry wrapper in `agentkit_serve_common.foundry` reuses the same
+`RuntimeFactory` / `RuntimeSession` seam and exposes `/readiness`, `/invocations`,
+and a minimal non-streaming `/responses` endpoint.
+
+`POST /v1/chat/completions` rejects:
+
+- `stream: true`,
+- request-supplied `tools`,
+- request-supplied `tool_choice` values other than missing, empty, `none`, or
+  `auto`,
+- an empty `messages` array, and
+- requests whose final message is not a `user` message.
+
+The response collapses any intermediate framework/tool loop into one assistant
+message with `finish_reason: "stop"`.
+
+## Network and process contract
+
+Generated images run `agentkit-serve --config /agent/agent.yaml` as user
+`1000:1000`. They bind `127.0.0.1` by default. If `AGENTKIT_BIND` is set to a
+non-loopback host such as `0.0.0.0`, startup requires `AGENTKIT_AUTH_TOKEN`; then
+`/v1/*` requests must include `Authorization: Bearer <token>`. `/healthz` remains
+open.

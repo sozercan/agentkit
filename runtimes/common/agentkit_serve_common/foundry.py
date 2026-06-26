@@ -31,6 +31,18 @@ def _usage(result: RunResult) -> dict[str, int]:
     }
 
 
+def _responses_usage(result: RunResult) -> dict[str, int]:
+    usage = result.usage or {}
+    input_tokens = int(usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0)
+    output_tokens = int(usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0)
+    total_tokens = int(usage.get("total_tokens", input_tokens + output_tokens) or 0)
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
 def _error(message: str, status: int = 400, code: str | None = None) -> JSONResponse:
     return JSONResponse(
         {"error": {"message": message, "code": code}},
@@ -98,7 +110,7 @@ def _responses_payload(spec: AgentSpec, result: RunResult) -> dict[str, Any]:
                 ],
             }
         ],
-        "usage": _usage(result),
+        "usage": _responses_usage(result),
     }
 
 

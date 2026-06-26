@@ -39,6 +39,7 @@ concrete Adapter shape.
 
 from __future__ import annotations
 
+import asyncio
 from types import TracebackType
 
 from agent_framework import Agent, MCPStdioTool, MCPStreamableHTTPTool, Message
@@ -114,13 +115,14 @@ def build_tool(tool: ToolSpec):
             request_origin = (request.url.scheme, request.url.host, request.url.port)
             if request_origin != target_origin:
                 return
-            for key, value in resolve_tool_headers(tool).items():
+            for key, value in (await asyncio.to_thread(resolve_tool_headers, tool)).items():
                 request.headers[key] = value
 
         kwargs: dict[str, object] = {
             "name": tool.name,
             "url": url,
             "tool_name_prefix": tool.name,
+            "load_prompts": False,
             # Headers must be present during initialize/list-tools and tool calls.
             # The event hook refreshes workload tokens for each same-origin HTTP
             # request. Redirect following is disabled so credential-bearing

@@ -37,6 +37,7 @@ def test_build_streamable_http_mcp_tool_resolves_url_headers_and_auth():
         assert "Authorization" not in mcp_tool._httpx_client.headers
         assert mcp_tool._httpx_client.timeout.connect == 120
         assert mcp_tool._httpx_client.follow_redirects is False
+        assert mcp_tool.load_prompts_flag is False
 
         hook = mcp_tool._httpx_client.event_hooks["request"][0]
         request = Request("GET", "http://127.0.0.1:8765/mcp")

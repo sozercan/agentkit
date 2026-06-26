@@ -9,6 +9,7 @@ normalizing framework/model failures into the common run error.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import shlex
@@ -215,7 +216,7 @@ def same_origin_mcp_httpx_client_factory(tool: ToolSpec, url: str, *, timeout: f
         request_origin = (request.url.scheme, request.url.host, request.url.port)
         if request_origin != target_origin:
             return
-        for key, value in resolve_tool_headers(tool).items():
+        for key, value in (await asyncio.to_thread(resolve_tool_headers, tool)).items():
             request.headers[key] = value
 
     def factory(**kwargs):  # noqa: ANN003

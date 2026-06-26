@@ -44,7 +44,7 @@ class EchoRuntime:
 
     async def run(self, request: RunRequest) -> RunResult:
         self.requests.append(request)
-        return RunResult(text=f"echo: {request.prompt}", usage={"total_tokens": 3})
+        return RunResult(text=f"echo: {request.prompt}", usage={"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3})
 
 
 class EchoFactory:
@@ -73,7 +73,7 @@ def test_foundry_invocations_and_responses_protocols():
         body = resp.json()
         assert body["status"] == "completed"
         assert body["output"][0]["content"][0]["text"] == "echo: hi"
-        assert body["usage"]["total_tokens"] == 3
+        assert body["usage"] == {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
 
 
 def test_foundry_responses_rejects_streaming():

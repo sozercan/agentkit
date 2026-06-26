@@ -1,41 +1,51 @@
-# agentkit-serve-maf
+# AgentKit Microsoft Agent Framework runtime adapter
 
-The AgentKit runtime adapter backed by the
-[Microsoft Agent Framework](https://github.com/microsoft/agent-framework) (MAF).
-It loads the frozen `/agent/agent.yaml` ABI (`docs/agent-abi.md`) and serves a
-**non-streaming** OpenAI Chat-Completions facade (`POST /v1/chat/completions`)
-whose tools are stdio MCP servers — byte-for-byte ABI-compatible with the
-default `agentkit-serve` (pydantic-ai) adapter.
+`runtimes/microsoft-agent-framework` builds the AgentKit runtime adapter backed
+by Microsoft Agent Framework (MAF). It consumes the same `/agent/agent.yaml` ABI
+as the other adapters and serves the same non-streaming OpenAI-compatible
+`/v1/chat/completions` façade.
 
-This package is also published as an **adapter image** used as the LLB base by
-the AgentKit Go converter. Select it from an agentkitfile with:
+Select it from an Agentkitfile with either spelling:
 
 ```yaml
-runtime: microsoft-agent-framework   # alias: maf
+runtime: microsoft-agent-framework
+# or
+runtime: maf
 ```
 
+## Responsibilities
+
+- Build the MAF chat client from the OpenAI-compatible model settings in the ABI.
+- Attach stdio MCP tools declared in the ABI.
+- Preserve the shared secret-hygiene rules: model API keys are read from the
+  declared env var, and tool subprocesses receive only declared env vars.
+- Map MAF run results and wrapped framework/model errors into the neutral
+  `RunResult` / `AgentRunError` contract.
+
+The shared server, ABI reader, CLI, network posture, auth behavior, and
+conformance tests live in `runtimes/common`.
+
+## Dependency boundary
+
+This generic adapter depends on the minimal MAF core/OpenAI packages plus the MCP
+SDK. It intentionally does not import Azure, Foundry, or CopilotStudio packages.
+AST-based guardrail tests in `tests/test_guardrails.py` enforce that boundary.
+
+## Build and run
+
+From the repository root:
+
+```sh
+make build-serve-maf
+make build-agentkit
+make build-test-agent RUNTIME=maf
 ```
+
+The console script inside the adapter image is:
+
+```sh
 agentkit-serve --config /agent/agent.yaml
 ```
 
-## What is and isn't framework-specific
-
-This adapter ships ONLY `agent_factory.py` (which imports MAF) plus a thin
-`__main__.py`. The framework-neutral core — the `/agent/agent.yaml` ABI loader, the
-OpenAI `/v1` facade, and the CLI/network posture — lives in the shared
-`agentkit-serve-common` package. `agent_factory` satisfies that package's
-`RuntimeFactory` protocol (`build_runtime` → `RuntimeSession.run` → a neutral
-`RunResult`), which is the seam that keeps the shared core framework-agnostic.
-
-
-## Lock-in boundary (plan §12)
-
-`agent_factory.py` imports **only** `agent_framework` (core) and
-`agent_framework.openai` — never an Azure / Foundry / CopilotStudio package,
-including the first-party submodules `agent_framework.azure` / `.foundry` /
-`.microsoft`. This is enforced by an AST-based check in `tests/test_guardrails.py`
-(a naive source grep would false-positive on comments). The MCP SDK (`mcp`) is
-declared as a direct dependency because MAF only bundles it via the heavy `[all]`
-extra (which would cross that boundary).
-
-See `docs/agent-abi.md` for the writer/reader contract.
+See `docs/runtime-adapters.md` and `docs/agent-abi.md` for the shared runtime
+contract.
