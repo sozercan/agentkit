@@ -8,7 +8,10 @@ import (
 	"github.com/sozercan/agentkit/pkg/utils"
 )
 
-const testAPIKeyEnvName = "OPENAI_API_KEY" //nolint:gosec // G101: env var NAME, not a credential
+const (
+	testAPIKeyEnvName = "OPENAI_API_KEY" //nolint:gosec // G101: env var NAME, not a credential
+	mutatedValue      = "MUTATED"
+)
 
 func baseConfig() *config.AgentConfig {
 	return &config.AgentConfig{
@@ -71,10 +74,10 @@ func TestFromConfigCopiesMutableFields(t *testing.T) {
 
 	cfg.Metadata.Labels["team"] = "mutated"
 	cfg.Tools[0].Command[0] = "mutated"
-	cfg.Tools[0].Env[0] = "MUTATED"
-	cfg.Tools[0].Headers[0].Name = "MUTATED"
-	cfg.Tools[0].Auth.TokenEnv = "MUTATED"
-	cfg.Env[0].Name = "MUTATED"
+	cfg.Tools[0].Env[0] = mutatedValue
+	cfg.Tools[0].Headers[0].Name = mutatedValue
+	cfg.Tools[0].Auth.TokenEnv = mutatedValue
+	cfg.Env[0].Name = mutatedValue
 
 	if agent.Metadata.Labels["team"] != "agentkit" {
 		t.Fatalf("label was not copied: %#v", agent.Metadata.Labels)

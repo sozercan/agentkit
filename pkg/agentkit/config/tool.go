@@ -70,7 +70,3 @@ func (t Tool) variantsSet() []string {
 	}
 	return set
 }
-
-func (t Tool) isRemoteMCP() bool {
-	return t.URLEnv != "" || t.Transport == "streamable-http"
-}

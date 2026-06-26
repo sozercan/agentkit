@@ -226,14 +226,15 @@ func validateEnvField(add func(string, ...any), path, value string, required boo
 }
 
 func validateToolTransport(add func(string, ...any), i int, t Tool) {
-	if len(t.Command) > 0 {
+	switch {
+	case len(t.Command) > 0:
 		if t.Transport != "" && t.Transport != ToolTransportStdio {
 			add("tools[%d] (%s): command tools use transport %q or omit transport", i, t.Name, ToolTransportStdio)
 		}
 		if t.URLEnv != "" || len(t.Headers) > 0 || t.Auth != nil {
 			add("tools[%d] (%s): stdio command tools must not set urlEnv, headers, or auth", i, t.Name)
 		}
-	} else if t.URLEnv != "" {
+	case t.URLEnv != "":
 		if t.Type != ToolTypeMCP {
 			add("tools[%d] (%s): remote MCP tools must set type: %s", i, t.Name, ToolTypeMCP)
 		}
@@ -246,7 +247,7 @@ func validateToolTransport(add func(string, ...any), i int, t Tool) {
 		if len(t.Env) > 0 {
 			add("tools[%d] (%s): remote MCP tools must use headers/auth instead of stdio env", i, t.Name)
 		}
-	} else if t.Transport != "" && t.Transport != ToolTransportStdio {
+	case t.Transport != "" && t.Transport != ToolTransportStdio:
 		add("tools[%d] (%s): transport %q requires urlEnv", i, t.Name, t.Transport)
 	}
 }
@@ -270,11 +271,12 @@ func validateToolHeaders(add func(string, ...any), i int, t Tool) {
 	seen := map[string]bool{}
 	for j, h := range t.Headers {
 		path := fmt.Sprintf("tools[%d] (%s).headers[%d]", i, t.Name, j)
-		if h.Name == "" {
+		switch {
+		case h.Name == "":
 			add("%s.name is required", path)
-		} else if !isHTTPHeaderName(h.Name) {
+		case !isHTTPHeaderName(h.Name):
 			add("%s.name %q is not a valid HTTP header name", path, h.Name)
-		} else if seen[strings.ToLower(h.Name)] {
+		case seen[strings.ToLower(h.Name)]:
 			add("%s: duplicate header name %q", path, h.Name)
 		}
 		seen[strings.ToLower(h.Name)] = true
@@ -341,10 +343,10 @@ func validateApproval(add func(string, ...any), i int, t Tool) {
 func (c *AgentConfig) requiredCapabilities() []string {
 	seen := map[string]bool{}
 	var out []string
-	add := func(cap string) {
-		if !seen[cap] {
-			seen[cap] = true
-			out = append(out, cap)
+	add := func(capability string) {
+		if !seen[capability] {
+			seen[capability] = true
+			out = append(out, capability)
 		}
 	}
 	if c.Model.Auth != nil && c.Model.Auth.Type == AuthTypeWorkloadIdentity {

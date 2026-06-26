@@ -65,9 +65,9 @@ type RuntimeSpec struct {
 }
 
 // HasCapability reports whether this runtime declares cap.
-func (rt RuntimeSpec) HasCapability(cap string) bool {
+func (rt RuntimeSpec) HasCapability(capability string) bool {
 	for _, have := range rt.Capabilities {
-		if have == cap {
+		if have == capability {
 			return true
 		}
 	}
@@ -78,9 +78,9 @@ func (rt RuntimeSpec) HasCapability(cap string) bool {
 // declare, preserving requested order for deterministic error messages.
 func (rt RuntimeSpec) MissingCapabilities(requested []string) []string {
 	var missing []string
-	for _, cap := range requested {
-		if !rt.HasCapability(cap) {
-			missing = append(missing, cap)
+	for _, capability := range requested {
+		if !rt.HasCapability(capability) {
+			missing = append(missing, capability)
 		}
 	}
 	return missing

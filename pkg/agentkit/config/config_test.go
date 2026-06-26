@@ -446,7 +446,7 @@ expose:
 }
 
 func TestValidateRejectsInvalidRemoteMCPToolShapes(t *testing.T) {
-	cases := map[string]string{
+	cases := map[string]string{ //nolint:gosec // test YAML uses credential-looking field names/invalid examples, not real secrets
 		"missing type": `tools:
   - name: remote
     transport: streamable-http
@@ -465,7 +465,7 @@ func TestValidateRejectsInvalidRemoteMCPToolShapes(t *testing.T) {
     urlEnv: REMOTE_MCP_URL
     headers:
       - name: Authorization
-        value: Bearer nope
+        value: static-auth-header
 `,
 		"static api key header": `tools:
   - name: remote
@@ -483,7 +483,7 @@ func TestValidateRejectsInvalidRemoteMCPToolShapes(t *testing.T) {
     urlEnv: REMOTE_MCP_URL
     headers:
       - name: Cookie
-        value: session=abc
+        value: cookie-static-value
 `,
 		"authorization value env plus auth": `tools:
   - name: remote
