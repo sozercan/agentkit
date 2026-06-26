@@ -35,7 +35,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
 from .config import AgentSpec
-from .conversation import ConversationError, run_request_from_messages
+from .conversation import ConversationError, RunRequest, run_request_from_messages
 from .runtime import AgentRunError, RunResult, RuntimeFactory
 
 
@@ -119,6 +119,14 @@ def make_auth_dependency(auth_token: str | None):
     return _require_auth
 
 
+
+
+def _clean_session_id(value: str | None) -> str | None:
+    if not value:
+        return None
+    value = value.strip()
+    return value or None
+
 def create_app(spec: AgentSpec, factory: RuntimeFactory, auth_token: str | None = None) -> FastAPI:
     """Construct the FastAPI app for one validated :class:`AgentSpec`.
 
@@ -160,7 +168,11 @@ def create_app(spec: AgentSpec, factory: RuntimeFactory, auth_token: str | None 
         }
 
     @app.post("/v1/chat/completions", dependencies=[auth])
-    async def chat_completions(req: ChatCompletionRequest, request: Request):
+    async def chat_completions(
+        req: ChatCompletionRequest,
+        request: Request,
+        x_agentkit_session_id: str | None = Header(default=None, alias="X-AgentKit-Session-Id"),
+    ):
         # --- reject unsupported request features (ABI §4) -------------------
         if req.stream:
             return _error_response(
@@ -187,7 +199,12 @@ def create_app(spec: AgentSpec, factory: RuntimeFactory, auth_token: str | None 
 
         # --- map conversation & run the agent ------------------------------
         try:
-            run_request = run_request_from_messages(req.messages)
+            normalized = run_request_from_messages(req.messages)
+            run_request = RunRequest(
+                prompt=normalized.prompt,
+                history=normalized.history,
+                session_id=_clean_session_id(x_agentkit_session_id),
+            )
         except ConversationError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

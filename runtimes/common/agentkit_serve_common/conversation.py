@@ -28,10 +28,17 @@ class ConversationTurn:
 
 @dataclass(frozen=True)
 class RunRequest:
-    """Framework-neutral request for one non-streaming agent run."""
+    """Framework-neutral request for one non-streaming agent run.
+
+    ``session_id`` is optional and provider-neutral. HTTP adapters may set it
+    from their transport/session headers so runtimes with memory or durable
+    context providers can correlate turns without baking a provider-specific
+    concept into the ABI.
+    """
 
     prompt: str
     history: tuple[ConversationTurn, ...] = ()
+    session_id: str | None = None
 
 
 class OpenAIMessage(Protocol):

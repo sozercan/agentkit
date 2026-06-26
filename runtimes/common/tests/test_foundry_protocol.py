@@ -76,12 +76,13 @@ def test_foundry_invocations_and_responses_protocols():
         assert body["usage"] == {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
 
 
-def test_foundry_responses_rejects_streaming():
+def test_foundry_responses_tolerates_stream_flag_with_non_streaming_response():
     app = create_foundry_app(_spec(), EchoFactory())
     with TestClient(app) as client:
         resp = client.post("/responses", json={"input": "hi", "stream": True})
-    assert resp.status_code == 400
-    assert resp.json()["error"]["code"] == "stream_unsupported"
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "completed"
+    assert resp.json()["output"][0]["content"][0]["text"] == "echo: hi"
 
 
 def test_foundry_protocols_reject_non_object_json():
@@ -94,3 +95,26 @@ def test_foundry_protocols_reject_non_object_json():
     assert "JSON object" in inv.text
     assert resp.status_code == 400
     assert resp.json()["error"]["code"] == "invalid_request"
+
+
+def test_foundry_protocol_forwards_session_header_and_query_param():
+    factory = EchoFactory()
+    app = create_foundry_app(_spec(), factory)
+
+    with TestClient(app) as client:
+        inv = client.post("/invocations", json={"message": "hello"}, headers={"x-agent-session-id": "session-1"})
+        resp = client.post("/responses?agent_session_id=session-2", json={"input": "hi"})
+
+    assert inv.status_code == 200
+    assert resp.status_code == 200
+    assert factory.runtime.requests[0].session_id == "session-1"
+    assert factory.runtime.requests[1].session_id == "session-2"
+
+
+def test_foundry_responses_ignores_portable_optional_fields():
+    app = create_foundry_app(_spec(), EchoFactory())
+    with TestClient(app) as client:
+        resp = client.post("/responses", json={"input": "hi", "max_output_tokens": 500})
+
+    assert resp.status_code == 200
+    assert resp.json()["output"][0]["content"][0]["text"] == "echo: hi"

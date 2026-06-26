@@ -98,7 +98,7 @@ var Runtimes = []RuntimeSpec{
 	{
 		Name:              MAF,
 		Aliases:           []string{MAFAlias}, // "maf" → "microsoft-agent-framework"
-		Capabilities:      []string{CapabilityStdioMCP, CapabilityStreamableHTTPMCP, CapabilityWorkloadIdentityTokenAuth, CapabilityModelWorkloadIdentityAuth, CapabilityContextProviderSkills, CapabilityFilesystemSkills, CapabilityMCPSkills},
+		Capabilities:      []string{CapabilityStdioMCP, CapabilityStreamableHTTPMCP, CapabilityWorkloadIdentityTokenAuth, CapabilityModelWorkloadIdentityAuth, CapabilityContextProviderSkills, CapabilityFilesystemSkills, CapabilityMCPSkills, CapabilityContextProviderSearch, CapabilityContextProviderMemory},
 		DefaultAdapterRef: "ghcr.io/sozercan/agentkit/serve-maf:latest",
 	},
 	{

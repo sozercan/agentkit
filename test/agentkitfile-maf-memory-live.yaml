@@ -1,0 +1,27 @@
+#syntax=agentkit:test
+# Replace model.baseURL with your Foundry project OpenAI-compatible /openai/v1 endpoint before live validation.
+apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: agentkit-live-memory-wi
+runtime: microsoft-agent-framework
+model:
+  provider: openai-compatible
+  baseURL: https://YOUR-ACCOUNT.services.ai.azure.com/api/projects/YOUR-PROJECT/openai/v1
+  name: gpt-4.1-mini
+  auth:
+    type: workload-identity-token
+    audience: https://ai.azure.com/.default
+instructions: |
+  You are a memory validation assistant. Use available memory context to recall user facts.
+context:
+  providers:
+    - name: validation-memory
+      type: memory
+      endpointEnv: MEMORY_ENDPOINT
+      storeNameEnv: MEMORY_STORE_NAME
+      auth:
+        type: workload-identity-token
+        audience: https://ai.azure.com/.default
+expose:
+  openai: true

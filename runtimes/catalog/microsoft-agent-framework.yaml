@@ -19,5 +19,7 @@ capabilities:
   - mcp-skills
   - filesystem-skills
   - context-provider-skills
+  - context-provider-search
+  - context-provider-memory
   - model-workload-identity-auth
 adapter: ghcr.io/sozercan/agentkit/serve-maf:latest

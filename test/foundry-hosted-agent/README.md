@@ -8,8 +8,19 @@ OpenAI `/v1` façade: they listen on port `8088`, expose `/readiness`, and serve
 protocol endpoints such as `/invocations` or `/responses`. This fixture wraps a normal AgentKit
 image with those protocol surfaces.
 
-The smoke test intentionally uses an in-container OpenAI-compatible mock model at
-`127.0.0.1:9000` so validation does not depend on external model credentials.
+The default smoke test intentionally uses an in-container OpenAI-compatible mock
+model at `127.0.0.1:9000` so validation does not depend on external model
+credentials.
+
+## Live wrapper
+
+`foundry_live.py` is the non-mock variant used for real parity validation. It
+loads the baked `/agent/agent.yaml`, validates required generic env declarations,
+and exposes the same Foundry `/readiness`, `/invocations`, and non-streaming
+`/responses` surfaces against the selected AgentKit runtime. Use this wrapper
+when testing an AgentKit-built image against real model, search, memory, or
+remote MCP resources. Keep provider-specific endpoints and role assignments in
+deployment tooling rather than AgentKit core schema.
 
 ## Runtime lifecycle
 
@@ -47,13 +58,23 @@ docker buildx build --builder desktop-linux . \
   -t foundry-agentkit-base:test --load --provenance=false
 ```
 
-Wrap it with the Foundry hosted-agent protocol adapter:
+Wrap it with the mock Foundry hosted-agent protocol adapter:
 
 ```sh
 docker buildx build --builder desktop-linux test/foundry-hosted-agent \
   --platform linux/amd64 \
   --build-arg BASE_IMAGE=foundry-agentkit-base:test \
   -t agentkit-foundry-invocations:test --load --provenance=false
+```
+
+For live-resource validation, wrap the same base image with `foundry_live.py`
+instead of the mock wrapper, for example:
+
+```Dockerfile
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+COPY foundry_live.py /opt/agentkit/foundry_live.py
+ENTRYPOINT ["/opt/agentkit/bin/python", "/opt/agentkit/foundry_live.py"]
 ```
 
 ## Validate locally

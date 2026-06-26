@@ -11,13 +11,15 @@ requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "AgentKit" }]
 dependencies = [
-    # Microsoft Agent Framework — MINIMAL slice only (plan §12 lock-in boundary):
-    # core + the OpenAI chat client. NEVER an azure/foundry/copilotstudio package.
+    # Microsoft Agent Framework — bounded slice only (plan §12 lock-in boundary):
+    # core + OpenAI client + provider adapters needed by generic AgentKit capabilities.
+    # Do not pull unrelated Copilot Studio/Purview/etc. packages.
     "agent-framework-core>=1.9,<2",
     # NOTE: agent-framework-openai's latest is 1.8.2 (verified in the M0 spike);
     # the plan's >=1.9 pin would fail to resolve. Pin >=1.8,<2.
     "agent-framework-openai>=1.8,<2",
     "agent-framework-foundry>=1.8,<2",
+    "agent-framework-azure-ai-search>=1.0.0b260521,<2",
     "azure-identity>=1.20",
     # The MCP SDK is NOT a transitive dependency of agent-framework-core — it is
     # lazily imported by agent_framework._mcp and only bundled via the heavy

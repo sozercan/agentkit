@@ -113,6 +113,37 @@ docker run -e AGENTKIT_MCP_TIMEOUT=180 ...
 See [`docs/agentkitfile.md`](docs/agentkitfile.md) for the full Agentkitfile
 schema.
 
+## Add context providers
+
+Context providers are provider-neutral and capability-gated by runtime. The
+`microsoft-agent-framework` runtime currently supports filesystem/MCP skills,
+Azure AI Search-style search providers, and external memory providers through
+generic env names and auth declarations:
+
+```yaml
+context:
+  providers:
+    - name: knowledge
+      type: search
+      endpointEnv: SEARCH_ENDPOINT
+      indexEnv: SEARCH_INDEX
+      auth:
+        type: workload-identity-token
+        audience: https://search.azure.com/.default
+    - name: user-memory
+      type: memory
+      endpointEnv: MEMORY_ENDPOINT
+      storeNameEnv: MEMORY_STORE_NAME
+      auth:
+        type: workload-identity-token
+        audience: https://ai.azure.com/.default
+```
+
+The deployment environment supplies the endpoint, index/store name, and identity
+material. Provider-specific provisioning remains in deployment profiles such as
+`deploy/foundry/`; AgentKit core does not add keys like `foundry.memoryStore`.
+
+
 ## Declare runtime env requirements
 
 Top-level `env:` entries declare runtime environment requirements by name only.
@@ -180,7 +211,8 @@ The most important rules are:
   `urlEnv` or `valueEnv` are env var names, not secret values.
 - `expose.openai` must be `true`; `expose.port` defaults to `8080`.
 - Context provider, model workload-identity, observability export, and tool
-  approval schemas are capability-gated until a runtime declares support.
+  approval schemas are capability-gated; the MAF runtime currently declares
+  skills, search, and memory context-provider support.
 
 Full reference: [`docs/agentkitfile.md`](docs/agentkitfile.md).
 

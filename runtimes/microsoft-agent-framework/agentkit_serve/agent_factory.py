@@ -8,13 +8,16 @@ wrapper, and CLI live in ``agentkit_serve_common``.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import os
+import time
 from contextlib import AsyncExitStack
 from types import TracebackType
 from urllib.parse import urlsplit
 
 from agent_framework import (
     Agent,
+    AgentSession,
     FileSkillsSource,
     MCPSkillsSource,
     MCPStdioTool,
@@ -30,6 +33,7 @@ from agentkit_serve_common.adapter_support import (
     normalize_agent_run_error,
     positive_int_env,
     resolve_api_key,
+    resolve_workload_identity_token,
     resolve_tool_headers,
     resolve_tool_url,
     same_origin_mcp_httpx_client_factory,
@@ -41,9 +45,13 @@ from agentkit_serve_common.conversation import RunRequest
 from agentkit_serve_common.runtime import RunResult, RuntimeSession
 
 _AUTH_WORKLOAD_IDENTITY = "workload-identity-token"
+_CONTEXT_TYPE_SEARCH = "search"
 _CONTEXT_TYPE_SKILLS = "skills"
+_CONTEXT_TYPE_MEMORY = "memory"
 _CONTEXT_SOURCE_FILESYSTEM = "filesystem"
 _CONTEXT_SOURCE_MCP = "mcp"
+_DEFAULT_SEARCH_AUDIENCE = "https://search.azure.com/.default"
+_DEFAULT_FOUNDRY_AUDIENCE = "https://ai.azure.com/.default"
 
 
 def _mcp_request_timeout() -> int | None:
@@ -70,6 +78,55 @@ def _project_endpoint_from_openai_base_url(base_url: str) -> str:
             "model.baseURL to be a Foundry project OpenAI endpoint ending in /openai/v1"
         )
     return base_url.split(marker, 1)[0].rstrip("/")
+
+
+def _env_required(name: str | None, *, field: str) -> str:
+    if not name:
+        raise AgentBuildError(f"{field} is required")
+    value = os.environ.get(name)
+    if value is None or value == "":
+        raise AgentBuildError(
+            f"{field} {name!r} is declared in agent.yaml but env var {name!r} is not set; "
+            "inject it at runtime"
+        )
+    return value
+
+
+class _BearerTokenCredential:
+    """Tiny Azure TokenCredential over AgentKit's generic workload token hook."""
+
+    def __init__(self, audience: str) -> None:
+        self._audience = audience
+
+    def get_token(self, *scopes: str, **kwargs):  # noqa: ANN003 - Azure credential protocol
+        credentials_mod = importlib.import_module("azure.core.credentials")
+        access_token = getattr(credentials_mod, "AccessToken")
+
+        audience = scopes[0] if scopes else self._audience
+        token = resolve_workload_identity_token(audience or self._audience)
+        return access_token(token, int(time.time()) + 300)
+
+
+def _credential_for_context(provider: ContextProviderSpec, *, default_audience: str):
+    auth = provider.auth
+    if auth is None or auth.type == _AUTH_WORKLOAD_IDENTITY:
+        # If AgentKit's generic token hook is configured, use it. Otherwise fall
+        # back to DefaultAzureCredential for local az login / hosted MI flows.
+        if (
+            os.environ.get("AGENTKIT_WORKLOAD_IDENTITY_TOKEN")
+            or os.environ.get("AGENTKIT_WORKLOAD_IDENTITY_TOKEN_COMMAND")
+        ):
+            return _BearerTokenCredential(auth.audience if auth and auth.audience else default_audience)
+        try:
+            from azure.identity import DefaultAzureCredential
+        except ImportError as exc:  # pragma: no cover - dependency guard.
+            raise AgentBuildError("context workload identity auth requires azure-identity") from exc
+        return DefaultAzureCredential()
+    raise AgentBuildError(f"context provider auth type {auth.type!r} is not supported by the MAF runtime")
+
+
+def _memory_update_delay() -> int:
+    return positive_int_env("AGENTKIT_MEMORY_UPDATE_DELAY", default=0) or 0
 
 
 def build_client(spec: AgentSpec):
@@ -170,6 +227,7 @@ class MAFRuntime:
         self.spec = spec
         self.stack = AsyncExitStack()
         self.agent: Agent | None = None
+        self.sessions: dict[str, AgentSession] = {}
 
     async def __aenter__(self) -> RuntimeSession:
         try:
@@ -197,20 +255,69 @@ class MAFRuntime:
     async def run(self, request: RunRequest) -> RunResult:
         if self.agent is None:
             raise AgentBuildError("MAF runtime session is not initialized")
-        return await run_agent(self.agent, request)
+        session = self._session_for(request.session_id)
+        return await run_agent(self.agent, request, session=session)
+
+    def _session_for(self, session_id: str | None) -> AgentSession | None:
+        if not session_id:
+            return None
+        session = self.sessions.get(session_id)
+        if session is None:
+            session = AgentSession(session_id=session_id)
+            self.sessions[session_id] = session
+        return session
 
     async def _build_context_providers(self):
         providers = []
         for provider in self.spec.context.providers:
-            if provider.type != _CONTEXT_TYPE_SKILLS:
-                # Other context provider schemas are validated/gated but not yet
-                # implemented by this runtime.
-                continue
-            if provider.source == _CONTEXT_SOURCE_FILESYSTEM:
-                providers.append(SkillsProvider(FileSkillsSource(provider.path)))
-            elif provider.source == _CONTEXT_SOURCE_MCP:
-                providers.append(await self._build_mcp_skills_provider(provider))
+            if provider.type == _CONTEXT_TYPE_SEARCH:
+                providers.append(self._build_search_provider(provider))
+            elif provider.type == _CONTEXT_TYPE_SKILLS:
+                if provider.source == _CONTEXT_SOURCE_FILESYSTEM:
+                    providers.append(SkillsProvider(FileSkillsSource(provider.path)))
+                elif provider.source == _CONTEXT_SOURCE_MCP:
+                    providers.append(await self._build_mcp_skills_provider(provider))
+            elif provider.type == _CONTEXT_TYPE_MEMORY:
+                providers.append(self._build_memory_provider(provider))
         return providers or None
+
+    def _build_search_provider(self, provider: ContextProviderSpec):
+        try:
+            azure_mod = importlib.import_module("agent_framework.azure")
+            search_provider = getattr(azure_mod, "AzureAISearchContextProvider")
+        except (ImportError, AttributeError) as exc:
+            raise AgentBuildError(
+                "search context provider requires agent-framework-azure-ai-search in the MAF runtime"
+            ) from exc
+
+        endpoint = _env_required(provider.endpoint_env, field="context.providers[].endpointEnv")
+        index = _env_required(provider.index_env, field="context.providers[].indexEnv")
+        return search_provider(
+            source_id=provider.name or "search",
+            endpoint=endpoint,
+            index_name=index,
+            credential=_credential_for_context(provider, default_audience=_DEFAULT_SEARCH_AUDIENCE),
+        )
+
+    def _build_memory_provider(self, provider: ContextProviderSpec):
+        try:
+            foundry_mod = importlib.import_module("agent_framework.foundry")
+            memory_provider = getattr(foundry_mod, "FoundryMemoryProvider")
+        except (ImportError, AttributeError) as exc:
+            raise AgentBuildError(
+                "memory context provider requires agent-framework-foundry in the MAF runtime"
+            ) from exc
+
+        endpoint = _env_required(provider.endpoint_env, field="context.providers[].endpointEnv")
+        store_name = _env_required(provider.store_name_env, field="context.providers[].storeNameEnv")
+        return memory_provider(
+            source_id=provider.name or "memory",
+            project_endpoint=endpoint,
+            credential=_credential_for_context(provider, default_audience=_DEFAULT_FOUNDRY_AUDIENCE),
+            memory_store_name=store_name,
+            scope=os.environ.get("AGENTKIT_MEMORY_SCOPE") or provider.name or "default",
+            update_delay=_memory_update_delay(),
+        )
 
     async def _build_mcp_skills_provider(self, provider: ContextProviderSpec):
         tool = next((t for t in self.spec.tools if t.name == provider.tool_ref), None)
@@ -280,11 +387,11 @@ def _to_messages(request: RunRequest) -> list[Message]:
     return messages
 
 
-async def run_agent(agent: Agent, request: RunRequest) -> RunResult:
+async def run_agent(agent: Agent, request: RunRequest, *, session: AgentSession | None = None) -> RunResult:
     """Run the MAF agent and return the neutral result shape."""
     messages = _to_messages(request)
     try:
-        result = await agent.run(messages)
+        result = await agent.run(messages, session=session)
     except Exception as exc:  # noqa: BLE001 — normalized for the façade
         raise normalize_agent_run_error(exc) from exc
     return RunResult(text=_result_text(result), usage=_result_usage(result))

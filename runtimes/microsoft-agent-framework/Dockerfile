@@ -14,9 +14,10 @@
 # No secret is ever baked in: agent.yaml carries env var NAMES only; values are
 # injected at runtime via `docker run -e`.
 #
-# Dependency lock-in boundary (plan §12): the installed Python deps are MAF core +
-# the OpenAI chat client + the MCP SDK only — NEVER an azure/foundry/copilotstudio
-# package. The `pip install .` below resolves exactly pyproject.toml's deps.
+# Dependency lock-in boundary (plan §12): the installed Python deps are MAF core,
+# the OpenAI chat client, MCP SDK, and provider adapters needed by generic
+# AgentKit capabilities (Foundry workload identity/memory and Azure AI Search).
+# Do not add unrelated Copilot Studio/Purview/etc. packages.
 
 FROM python:3.12-slim-bookworm
 
@@ -47,8 +48,9 @@ ENV AGENTKIT_ROOT=/opt/agentkit \
 # repo-root-relative. The shared framework-neutral core (agentkit_serve_common,
 # brings fastapi/uvicorn/pydantic/pyyaml) is installed FIRST so the adapter's
 # `agentkit-serve-common` dependency is already satisfied; then the adapter adds
-# its framework deps (agent-framework-core/-openai, mcp). The adapter image stays
-# separate from the pydantic-ai one — disjoint framework deps, same shared core.
+# its framework deps (agent-framework-core/-openai/-foundry, Azure AI Search,
+# mcp). The adapter image stays separate from the pydantic-ai one — disjoint
+# framework deps, same shared core.
 WORKDIR /src
 COPY runtimes/common/pyproject.toml runtimes/common/README.md ./common/
 COPY runtimes/common/agentkit_serve_common ./common/agentkit_serve_common

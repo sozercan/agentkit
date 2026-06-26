@@ -182,11 +182,14 @@ The native runtime serves:
 - `GET /healthz` — liveness.
 - `GET /v1/models` — one-model listing containing `model.name`.
 - `POST /v1/chat/completions` — non-streaming run that returns one
-  `chat.completion` object.
+  `chat.completion` object. Optional `X-AgentKit-Session-Id` is forwarded to
+  runtime adapters for provider-neutral session/memory correlation.
 
 The reusable Foundry wrapper in `agentkit_serve_common.foundry` reuses the same
 `RuntimeFactory` / `RuntimeSession` seam and exposes `/readiness`, `/invocations`,
-and a minimal non-streaming `/responses` endpoint.
+and a minimal non-streaming `/responses` endpoint. It forwards Foundry session
+IDs from query/header data to the runtime and tolerates client-supplied
+`stream: true` by returning a normal completed non-streaming response.
 
 `POST /v1/chat/completions` rejects:
 

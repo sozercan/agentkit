@@ -56,6 +56,21 @@ def _message_to_prompt(message: Any) -> str:
     return json.dumps(message, separators=(",", ":"), sort_keys=True)
 
 
+def _session_id_from_request(request: Request) -> str | None:
+    # Foundry hosted agents may pass the session as a query parameter to the
+    # container and expose it as x-agent-session-id externally. The AgentKit
+    # header keeps local standalone validation provider-neutral.
+    for name in ("agent_session_id", "session_id"):
+        value = request.query_params.get(name)
+        if value and value.strip():
+            return value.strip()
+    for name in ("x-agent-session-id", "x-agentkit-session-id"):
+        value = request.headers.get(name)
+        if value and value.strip():
+            return value.strip()
+    return None
+
+
 def _responses_input_to_prompt(value: Any) -> str:
     """Extract a prompt from the common non-streaming Responses API input shapes."""
     if isinstance(value, str):
@@ -144,7 +159,9 @@ def create_foundry_app(spec: AgentSpec, factory: RuntimeFactory) -> FastAPI:
         prompt = _message_to_prompt(data["message"])
 
         try:
-            result = await request.app.state.runtime.run(RunRequest(prompt=prompt))
+            result = await request.app.state.runtime.run(
+                RunRequest(prompt=prompt, session_id=_session_id_from_request(request))
+            )
         except AgentRunError as exc:
             return _error(str(exc), status=exc.status, code=exc.code)
         except Exception as exc:  # noqa: BLE001 - deterministic protocol envelope.
@@ -161,18 +178,17 @@ def create_foundry_app(spec: AgentSpec, factory: RuntimeFactory) -> FastAPI:
 
         if not isinstance(data, dict):
             return _error("Request body must be a JSON object", status=400, code="invalid_request")
-        if data.get("stream"):
-            return _error(
-                "streaming Responses are not supported by this AgentKit Foundry adapter",
-                status=400,
-                code="stream_unsupported",
-            )
+        # Foundry/azd clients may include stream=true by default. The adapter is
+        # intentionally non-streaming, so tolerate the flag and return a normal
+        # completed response instead of failing readiness/e2e checks.
         if "input" not in data:
             return _error("Missing 'input' in request", status=400, code="missing_input")
 
         prompt = _responses_input_to_prompt(data["input"])
         try:
-            result = await request.app.state.runtime.run(RunRequest(prompt=prompt))
+            result = await request.app.state.runtime.run(
+                RunRequest(prompt=prompt, session_id=_session_id_from_request(request))
+            )
         except AgentRunError as exc:
             return _error(str(exc), status=exc.status, code=exc.code)
         except Exception as exc:  # noqa: BLE001 - deterministic protocol envelope.

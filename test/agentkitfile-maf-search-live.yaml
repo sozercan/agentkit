@@ -1,0 +1,28 @@
+#syntax=agentkit:test
+# Replace model.baseURL with your Foundry project OpenAI-compatible /openai/v1 endpoint before live validation.
+apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: agentkit-live-search-wi
+runtime: microsoft-agent-framework
+model:
+  provider: openai-compatible
+  baseURL: https://YOUR-ACCOUNT.services.ai.azure.com/api/projects/YOUR-PROJECT/openai/v1
+  name: gpt-4.1-mini
+  auth:
+    type: workload-identity-token
+    audience: https://ai.azure.com/.default
+instructions: |
+  You are a retrieval validation assistant. Answer from provided search context when relevant.
+  If the retrieved context contains a validation marker, include it exactly.
+context:
+  providers:
+    - name: validation-search
+      type: search
+      endpointEnv: SEARCH_ENDPOINT
+      indexEnv: SEARCH_INDEX
+      auth:
+        type: workload-identity-token
+        audience: https://search.azure.com/.default
+expose:
+  openai: true

@@ -600,3 +600,42 @@ expose:
 		}
 	}
 }
+
+func TestValidateMAFSupportsSearchAndMemoryContextProviders(t *testing.T) {
+	in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: context-agent
+runtime: microsoft-agent-framework
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: hi
+context:
+  providers:
+    - name: knowledge
+      type: search
+      endpointEnv: SEARCH_ENDPOINT
+      indexEnv: SEARCH_INDEX
+      auth:
+        type: workload-identity-token
+        audience: https://search.azure.com/.default
+    - name: memory
+      type: memory
+      endpointEnv: MEMORY_ENDPOINT
+      storeNameEnv: MEMORY_STORE_NAME
+      auth:
+        type: workload-identity-token
+        audience: https://ai.azure.com/.default
+expose:
+  openai: true
+`)
+	cfg, err := NewFromBytes(in)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if verr := cfg.Validate(); verr != nil {
+		t.Fatalf("MAF search+memory context providers should validate: %v", verr)
+	}
+}

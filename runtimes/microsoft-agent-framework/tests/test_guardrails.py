@@ -323,3 +323,142 @@ def test_build_client_uses_env_token_for_model_workload_identity_standalone(monk
     assert isinstance(client, FakeOpenAIClient)
     assert calls["api_key"] == "token"
     assert calls["base_url"].endswith("/openai/v1")
+
+
+def test_build_agent_adds_search_context_provider(monkeypatch):
+    from agentkit_serve_common.config import AgentSpec
+
+    calls = {}
+
+    class FakeSearchProvider:
+        def __init__(self, **kwargs):
+            calls.update(kwargs)
+
+    class FakeModule:
+        AzureAISearchContextProvider = FakeSearchProvider
+
+    def fake_import(name):
+        assert name == "agent_framework.azure"
+        return FakeModule
+
+    monkeypatch.setattr(agent_factory.importlib, "import_module", fake_import)
+    monkeypatch.setattr(agent_factory, "_credential_for_context", lambda provider, default_audience: "credential")
+    monkeypatch.setenv("SEARCH_ENDPOINT", "https://example.search.windows.net")
+    monkeypatch.setenv("SEARCH_INDEX", "kb")
+    spec = AgentSpec.model_validate({
+        "abiVersion": "v0",
+        "metadata": {"name": "x"},
+        "model": {
+            "provider": "openai-compatible",
+            "baseURL": "https://api.openai.com/v1",
+            "name": "gpt-4o-mini",
+        },
+        "instructions": "hi",
+        "tools": [],
+        "context": {"providers": [{
+            "name": "knowledge",
+            "type": "search",
+            "endpointEnv": "SEARCH_ENDPOINT",
+            "indexEnv": "SEARCH_INDEX",
+        }]},
+        "expose": {"openai": True, "port": 8080},
+    })
+    runtime = agent_factory.MAFRuntime(spec)
+
+    import asyncio
+    providers = asyncio.run(runtime._build_context_providers())
+
+    assert providers is not None
+    assert providers[0].__class__.__name__ == "FakeSearchProvider"
+    assert calls["source_id"] == "knowledge"
+    assert calls["endpoint"] == "https://example.search.windows.net"
+    assert calls["index_name"] == "kb"
+    assert calls["credential"] == "credential"
+
+
+def test_build_agent_adds_memory_context_provider(monkeypatch):
+    from agentkit_serve_common.config import AgentSpec
+
+    calls = {}
+
+    class FakeMemoryProvider:
+        def __init__(self, **kwargs):
+            calls.update(kwargs)
+
+    class FakeModule:
+        FoundryMemoryProvider = FakeMemoryProvider
+
+    def fake_import(name):
+        assert name == "agent_framework.foundry"
+        return FakeModule
+
+    monkeypatch.setattr(agent_factory.importlib, "import_module", fake_import)
+    monkeypatch.setattr(agent_factory, "_credential_for_context", lambda provider, default_audience: "credential")
+    monkeypatch.setenv("MEMORY_ENDPOINT", "https://example.services.ai.azure.com/api/projects/proj")
+    monkeypatch.setenv("MEMORY_STORE_NAME", "agentkit-memory")
+    spec = AgentSpec.model_validate({
+        "abiVersion": "v0",
+        "metadata": {"name": "x"},
+        "model": {
+            "provider": "openai-compatible",
+            "baseURL": "https://api.openai.com/v1",
+            "name": "gpt-4o-mini",
+        },
+        "instructions": "hi",
+        "tools": [],
+        "context": {"providers": [{
+            "name": "memory",
+            "type": "memory",
+            "endpointEnv": "MEMORY_ENDPOINT",
+            "storeNameEnv": "MEMORY_STORE_NAME",
+            "auth": {"type": "workload-identity-token", "audience": "https://ai.azure.com/.default"},
+        }]},
+        "expose": {"openai": True, "port": 8080},
+    })
+    runtime = agent_factory.MAFRuntime(spec)
+
+    import asyncio
+    providers = asyncio.run(runtime._build_context_providers())
+
+    assert providers is not None
+    assert providers[0].__class__.__name__ == "FakeMemoryProvider"
+    assert calls["source_id"] == "memory"
+    assert calls["project_endpoint"] == "https://example.services.ai.azure.com/api/projects/proj"
+    assert calls["memory_store_name"] == "agentkit-memory"
+    assert calls["credential"] == "credential"
+    assert calls["scope"] == "memory"
+    assert calls["update_delay"] == 0
+
+
+def test_runtime_reuses_sessions_by_request_session_id(monkeypatch):
+    from agentkit_serve_common.config import AgentSpec
+    from agentkit_serve_common.conversation import RunRequest
+    from agentkit_serve_common.runtime import RunResult
+
+    seen_sessions = []
+
+    async def fake_run_agent(agent, request, *, session=None):
+        seen_sessions.append(session)
+        return RunResult(text="ok")
+
+    monkeypatch.setattr(agent_factory, "run_agent", fake_run_agent)
+    spec = AgentSpec.model_validate({
+        "abiVersion": "v0",
+        "metadata": {"name": "x"},
+        "model": {"provider": "openai-compatible", "baseURL": "https://api.openai.com/v1", "name": "gpt-4o-mini"},
+        "instructions": "hi",
+        "tools": [],
+        "expose": {"openai": True, "port": 8080},
+    })
+    runtime = agent_factory.MAFRuntime(spec)
+    runtime.agent = object()
+
+    import asyncio
+    asyncio.run(runtime.run(RunRequest(prompt="one", session_id="s1")))
+    asyncio.run(runtime.run(RunRequest(prompt="two", session_id="s1")))
+    asyncio.run(runtime.run(RunRequest(prompt="three", session_id="s2")))
+
+    assert seen_sessions[0] is seen_sessions[1]
+    assert seen_sessions[0] is not seen_sessions[2]
+    assert seen_sessions[0].session_id == "s1"
+    assert seen_sessions[2].session_id == "s2"

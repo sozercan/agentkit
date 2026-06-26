@@ -35,7 +35,7 @@ and auth wiring.
 | Runtime | Capabilities |
 |---|---|
 | `pydantic-ai` | `stdio-mcp`, `streamable-http-mcp` |
-| `microsoft-agent-framework` / `maf` | `stdio-mcp`, `streamable-http-mcp`, `workload-identity-token-auth` |
+| `microsoft-agent-framework` / `maf` | `stdio-mcp`, `streamable-http-mcp`, `workload-identity-token-auth`, `context-provider-skills`, `context-provider-search`, `context-provider-memory` |
 | `langgraph` | `stdio-mcp`, `streamable-http-mcp` |
 
-Context-provider, model workload identity, OTel export, and tool approval schemas are present but remain capability-gated until a runtime declares support.
+Context-provider schemas are capability-gated per runtime; the MAF adapter currently declares skills, search, and memory support. OTel export and tool approval schemas remain gated until a runtime declares support.

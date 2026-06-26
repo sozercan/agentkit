@@ -43,6 +43,8 @@ Request behavior is intentionally narrow:
 - prior `system`, `user`, and `assistant` messages become history.
 - prior `tool` and unknown roles are ignored because the built agent owns its
   tools.
+- `X-AgentKit-Session-Id`, when present, is forwarded through the neutral
+  `RunRequest` for runtime/session correlation.
 
 Framework/model failures are normalized to an OpenAI-shaped error envelope with
 `type: agent_error`. The adapters preserve upstream HTTP status codes when the
@@ -61,9 +63,11 @@ service.
 
 ## Tool lifecycle and env projection
 
-Tools are stdio MCP servers declared in the ABI with `name`, `command`, and
-`env` allowlist. Adapter factories are responsible for turning each tool spec
-into their framework's MCP integration.
+Tools are MCP servers declared in the ABI. Stdio tools use `name`, `command`,
+and an `env` allowlist; remote tools use `type: mcp`, `transport:
+streamable-http`, `urlEnv`, optional headers, and generic auth. Adapter
+factories are responsible for turning each tool spec into their framework's MCP
+integration.
 
 Shared invariants:
 
@@ -71,7 +75,9 @@ Shared invariants:
 - `AGENTKIT_MCP_TIMEOUT` controls MCP initialization timeout,
 - each tool subprocess receives only env vars declared in that tool's `env`,
 - undeclared `${VAR}` interpolation inside a declared env value is rejected, and
-- tool sessions are entered once for the app lifespan and reused across requests.
+- tool sessions are entered once for the app lifespan and reused across requests,
+- remote MCP clients inject headers only for the configured origin and do not
+  follow redirects with credentials.
 
 ## Adapter packages
 
@@ -93,9 +99,13 @@ Path: `runtimes/microsoft-agent-framework/`
 - Console script package name: `agentkit-serve-maf`.
 - Adapter image target built by `make build-serve-maf`.
 - Runtime selector: `microsoft-agent-framework` or alias `maf`.
-- Depends on the minimal MAF core/OpenAI packages plus the MCP SDK.
-- Guardrail tests prevent importing Azure, Foundry, or CopilotStudio packages in
-  the generic adapter.
+- Depends on the bounded MAF core/OpenAI packages, the MCP SDK, and provider
+  adapters needed by generic AgentKit capabilities such as workload-identity
+  model auth, Azure AI Search context, and external memory.
+- Guardrail tests prevent unrelated cloud packages such as CopilotStudio/Purview
+  from crossing the adapter boundary.
+- Supports session-aware runs, remote MCP, filesystem/MCP skills, search context,
+  and memory context through generic ABI fields.
 
 ### LangGraph
 
