@@ -66,9 +66,9 @@ type agentRuntimeCaps struct {
 	SupportsRuntimeSessions bool     `yaml:"supportsRuntimeSessions"`
 }
 
-// RenderOrkaAgentRuntime renders a core.orka.ai AgentRuntime manifest for an
+// OrkaAgentRuntime renders a core.orka.ai AgentRuntime manifest for an
 // AgentKit image that exposes the observed-mode orka.harness.v1 protocol.
-func RenderOrkaAgentRuntime(opts OrkaAgentRuntimeOptions) ([]byte, error) {
+func OrkaAgentRuntime(opts OrkaAgentRuntimeOptions) ([]byte, error) {
 	name := strings.TrimSpace(opts.Name)
 	if name == "" {
 		return nil, errors.New("--name is required")
@@ -134,7 +134,7 @@ func RunCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "agentkit render: unsupported --target %q (expected %q)\n", *target, TargetOrkaAgentRuntime)
 		return 2
 	}
-	out, err := RenderOrkaAgentRuntime(OrkaAgentRuntimeOptions{
+	out, err := OrkaAgentRuntime(OrkaAgentRuntimeOptions{
 		Name:             *name,
 		Image:            *image,
 		ExternalEndpoint: *externalEndpoint,

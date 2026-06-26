@@ -6,13 +6,15 @@ import (
 	"testing"
 )
 
-func TestRenderOrkaAgentRuntimeExternalEndpoint(t *testing.T) {
-	got, err := RenderOrkaAgentRuntime(OrkaAgentRuntimeOptions{
+const testRuntimeName = "fibey"
+
+func TestOrkaAgentRuntimeExternalEndpoint(t *testing.T) {
+	got, err := OrkaAgentRuntime(OrkaAgentRuntimeOptions{
 		Name:             "fibey-agentkit",
 		ExternalEndpoint: "http://fibey-agentkit.default.svc.cluster.local:8080",
 	})
 	if err != nil {
-		t.Fatalf("RenderOrkaAgentRuntime() error = %v", err)
+		t.Fatalf("OrkaAgentRuntime() error = %v", err)
 	}
 	want := `apiVersion: core.orka.ai/v1alpha1
 kind: AgentRuntime
@@ -55,15 +57,15 @@ func TestRunCLIRendersOrkaAgentRuntime(t *testing.T) {
 	}
 }
 
-func TestRenderOrkaAgentRuntimeValidation(t *testing.T) {
-	if _, err := RenderOrkaAgentRuntime(OrkaAgentRuntimeOptions{Name: "fibey"}); err == nil {
+func TestOrkaAgentRuntimeValidation(t *testing.T) {
+	if _, err := OrkaAgentRuntime(OrkaAgentRuntimeOptions{Name: testRuntimeName}); err == nil {
 		t.Fatal("expected missing external endpoint error")
 	}
-	if _, err := RenderOrkaAgentRuntime(OrkaAgentRuntimeOptions{Name: "fibey", Image: "ghcr.io/acme/fibey:latest"}); err == nil || !strings.Contains(err.Error(), "external endpoints only") {
+	if _, err := OrkaAgentRuntime(OrkaAgentRuntimeOptions{Name: testRuntimeName, Image: "ghcr.io/acme/fibey:latest"}); err == nil || !strings.Contains(err.Error(), "external endpoints only") {
 		t.Fatalf("expected image unsupported error, got %v", err)
 	}
 	var stdout, stderr bytes.Buffer
-	code := RunCLI([]string{"--target", "other", "--name", "fibey", "--external-endpoint", "http://example.invalid"}, &stdout, &stderr)
+	code := RunCLI([]string{"--target", "other", "--name", testRuntimeName, "--external-endpoint", "http://example.invalid"}, &stdout, &stderr)
 	if code == 0 || !strings.Contains(stderr.String(), "unsupported --target") {
 		t.Fatalf("RunCLI() code=%d stderr=%q", code, stderr.String())
 	}
