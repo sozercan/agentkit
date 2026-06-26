@@ -23,7 +23,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "httpx>=0.28", "httpx2>=0.1"]
+# Starlette/FastAPI TestClient currently imports the httpx2 compatibility package.
+dev = ["pytest>=8.0", "httpx2>=0.1"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["agentkit_serve_common"]

@@ -111,12 +111,3 @@ Example invocation after deployment:
 azd ai agent invoke --protocol invocations --new-session \
   -f test/foundry-hosted-agent/request.json -o raw
 ```
-
-
-Responses smoke:
-
-```sh
-curl -fsS -H 'content-type: application/json' \
-  http://127.0.0.1:18088/responses \
-  -d '{"input":"hello from Foundry hosted AgentKit JSON"}'
-```

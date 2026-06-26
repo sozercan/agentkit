@@ -150,7 +150,7 @@ def create_foundry_app(spec: AgentSpec, factory: RuntimeFactory) -> FastAPI:
         except Exception as exc:  # noqa: BLE001 - deterministic protocol envelope.
             return _error(str(exc), status=502, code=exc.__class__.__name__)
 
-        return JSONResponse({"response": result.text, "usage": result.usage})
+        return JSONResponse({"response": result.text, "usage": _usage(result)})
 
     @app.post("/responses")
     async def responses(request: Request):

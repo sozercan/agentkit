@@ -53,7 +53,6 @@ from agentkit_serve_common.adapter_support import (
     resolve_api_key,
     resolve_tool_headers,
     resolve_tool_url,
-    same_origin_mcp_httpx_client_factory,
     split_tool_command,
     upstream_status_code,
 )
@@ -132,7 +131,6 @@ def build_tool(tool: ToolSpec):
                 follow_redirects=False,
                 timeout=remote_timeout,
             ),
-            "httpx_client_factory": same_origin_mcp_httpx_client_factory(tool, url, timeout=remote_timeout),
         }
         kwargs["request_timeout"] = int(remote_timeout)
         return MCPStreamableHTTPTool(**kwargs)
