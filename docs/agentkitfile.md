@@ -52,7 +52,6 @@ metadata:
 - `labels` is optional. User-supplied labels are copied into the final image
   config alongside AgentKit labels.
 
-
 ### `debug`
 
 ```yaml

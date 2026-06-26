@@ -40,6 +40,8 @@ docker buildx build . -f agentkitfile.yaml -t url-summarizer:latest --load
 
 docker run --rm \
   -p 127.0.0.1:8080:8080 \
+  -e AGENTKIT_BIND=0.0.0.0 \
+  -e AGENTKIT_AUTH_TOKEN=dev-token \
   -e OPENAI_API_KEY="$OPENAI_API_KEY" \
   url-summarizer:latest
 ```
@@ -48,6 +50,7 @@ Call the agent:
 
 ```sh
 curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'authorization: Bearer dev-token' \
   -H 'content-type: application/json' \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"https://example.com"}]}'
 ```
