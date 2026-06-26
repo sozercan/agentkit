@@ -61,6 +61,43 @@ The image also exposes:
 - `GET /v1/models`
 - `POST /v1/chat/completions`
 
+## Select a protocol surface
+
+AgentKit builds one custom-agent image and selects the HTTP protocol at runtime:
+
+```sh
+# default standalone OpenAI-compatible surface
+docker run -e AGENTKIT_PROTOCOL=openai ... image
+
+# Foundry hosted-agent compatibility surface; defaults to port 8088 unless
+# AGENTKIT_PORT is set
+docker run -e AGENTKIT_PROTOCOL=foundry -e AGENTKIT_PORT=8088 ... image
+
+# Orka observed-mode harness; protected endpoints require bearer auth
+docker run \
+  -e AGENTKIT_PROTOCOL=orka \
+  -e AGENTKIT_AUTH_TOKEN=dev-token \
+  ... image
+```
+
+Protocol endpoints:
+
+| Protocol | Endpoints | Notes |
+|---|---|---|
+| `openai` | `/healthz`, `/v1/models`, `/v1/chat/completions` | Default, non-streaming Chat Completions. |
+| `foundry` | `/readiness`, `/invocations`, `/responses` | `/responses` is `foundry-responses-minimal`: synchronous/non-streaming only. |
+| `orka` | `/v1/health`, `/v1/capabilities`, `/v1/turns`, `/v1/turns/{turnID}/events`, `/v1/turns/{turnID}/cancel` | Observed-mode `orka.harness.v1` over HTTP+SSE. AgentKit reports frames; Orka enforces policy. |
+
+After deploying the image with `AGENTKIT_PROTOCOL=orka` and an
+`AGENTKIT_AUTH_TOKEN` sourced from the Orka client-auth Secret, render an Orka
+registration manifest for that endpoint:
+
+```sh
+agentkit render --target orka-agentruntime \
+  --external-endpoint http://fibey-agentkit.default.svc.cluster.local:8080 \
+  --name fibey-agentkit
+```
+
 ## Add MCP tools
 
 Declare MCP servers in `tools:`. Tools are owned by the built agent, not supplied
@@ -250,6 +287,7 @@ workflow.
   adapters, auth, request handling, and tool lifecycle.
 - [`docs/agent-abi.md`](docs/agent-abi.md) — built `/agent/agent.yaml` contract.
 - [`docs/development.md`](docs/development.md) — local development and CI.
+- [`docs/orka.md`](docs/orka.md) — Orka harness mode and AgentRuntime rendering.
 - [`docs/architecture.md`](docs/architecture.md) — codebase architecture map for
   contributors.
 - [`deploy/foundry/README.md`](deploy/foundry/README.md) — Foundry deployment and

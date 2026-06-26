@@ -8,8 +8,9 @@ prompt)`` pairs.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Protocol, Sequence
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Mapping, Protocol, Sequence
 
 FORWARDED_ROLES = frozenset({"system", "user", "assistant"})
 
@@ -28,17 +29,27 @@ class ConversationTurn:
 
 @dataclass(frozen=True)
 class RunRequest:
-    """Framework-neutral request for one non-streaming agent run.
+    """Framework-neutral request for one agent run.
 
     ``session_id`` is optional and provider-neutral. HTTP adapters may set it
     from their transport/session headers so runtimes with memory or durable
     context providers can correlate turns without baking a provider-specific
     concept into the ABI.
+
+    The remaining optional fields carry per-turn protocol metadata used by
+    orchestration hosts such as Orka. Runtime adapters may ignore fields they do
+    not support, but helpers should prefer ``env`` over process environment when
+    resolving per-run credentials.
     """
 
     prompt: str
     history: tuple[ConversationTurn, ...] = ()
     session_id: str | None = None
+    env: Mapping[str, str] = field(default_factory=dict)
+    deadline: datetime | None = None
+    turn_id: str | None = None
+    correlation_id: str | None = None
+    metadata: Mapping[str, str] = field(default_factory=dict)
 
 
 class OpenAIMessage(Protocol):

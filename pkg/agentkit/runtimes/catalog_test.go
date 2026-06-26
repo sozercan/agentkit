@@ -111,7 +111,7 @@ func TestRuntimeCapabilities(t *testing.T) {
 				t.Errorf("runtime %q has duplicate capability %q", rt.Name, cap)
 			}
 			seen[cap] = true
-			if strings.Contains(cap, "foundry-") && cap != CapabilityFoundryInvocationsProtocol && cap != CapabilityFoundryResponsesProtocol {
+			if strings.Contains(cap, "foundry-") && cap != CapabilityFoundryInvocationsProtocol && cap != CapabilityFoundryResponsesMinimal {
 				t.Errorf("runtime %q has provider-specific capability %q", rt.Name, cap)
 			}
 		}
@@ -121,7 +121,7 @@ func TestRuntimeCapabilities(t *testing.T) {
 		if !rt.HasCapability(CapabilityStdioMCP) {
 			t.Errorf("runtime %q should support current v0 stdio MCP tools", rt.Name)
 		}
-		for _, required := range []string{CapabilityStdioMCP, CapabilityStreamableHTTPMCP} {
+		for _, required := range []string{CapabilityStdioMCP, CapabilityStreamableHTTPMCP, CapabilityFoundryInvocationsProtocol, CapabilityFoundryResponsesMinimal, CapabilityOrkaHarnessV1, CapabilityOrkaObservedTools} {
 			if !rt.HasCapability(required) {
 				t.Errorf("runtime %q should support %s", rt.Name, required)
 			}

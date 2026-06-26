@@ -9,14 +9,17 @@ or LangGraph.
 
 - `config.py` — strict `/agent/agent.yaml` ABI loader, version check, env
   requirement validation, and provider-neutral schema validation.
-- `cli.py` — `agentkit-serve --config ...`, bind/port handling, and the startup
-  auth gate for non-loopback binds.
+- `cli.py` — `agentkit-serve --config ... --protocol openai|foundry|orka`,
+  bind/port handling, and startup auth gates for non-loopback binds and Orka
+  protected endpoints.
 - `server.py` — FastAPI app for `/healthz`, `/v1/models`, and
   `/v1/chat/completions`.
 - `foundry.py` — reusable Foundry Hosted Agent protocol wrapper for
   `/readiness`, `/invocations`, and minimal non-streaming `/responses`.
-- `conversation.py` — OpenAI message normalization into a framework-neutral
-  `RunRequest`.
+- `orka.py` — observed-mode `orka.harness.v1` wrapper for `/v1/health`,
+  `/v1/capabilities`, `/v1/turns`, SSE replay, and cancel.
+- `conversation.py` — protocol request normalization into a framework-neutral
+  `RunRequest`, including optional per-turn env/deadline/metadata fields.
 - `runtime.py` — `RuntimeFactory`, `RuntimeSession`, `RunResult`, and
   `AgentRunError`.
 - `adapter_support.py` — API-key resolution, declared-only tool env projection,
@@ -26,8 +29,9 @@ or LangGraph.
 
 ## Adapter seam
 
-`server.create_app(spec, factory, auth_token)` and
-`foundry.create_foundry_app(spec, factory)` receive an adapter module that
+`server.create_app(spec, factory, auth_token)`,
+`foundry.create_foundry_app(spec, factory)`, and
+`orka.create_orka_app(spec, factory, auth_token)` receive an adapter module that
 satisfies `RuntimeFactory`. The shared core calls only `factory.build_runtime(spec)`
 and `RuntimeSession.run(request) -> RunResult`. It never imports framework
 packages or touches raw framework agent lifecycle.

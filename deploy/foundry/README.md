@@ -17,9 +17,10 @@ env:
   TOOLBOX_ENDPOINT: ${FOUNDRY_PROJECT_ENDPOINT}/toolboxes/${TOOLBOX_NAME}/mcp?api-version=v1
 ```
 
-The reusable Python Foundry adapter in `agentkit_serve_common.foundry` exposes
-`/readiness`, `/invocations`, and a minimal non-streaming `/responses` endpoint
-without adding Foundry-specific keys to `/agent/agent.yaml`.
+The reusable Python Foundry adapter in `agentkit_serve_common.foundry` is selected
+with `AGENTKIT_PROTOCOL=foundry` (or `agentkit-serve --protocol foundry`) and
+exposes `/readiness`, `/invocations`, and a minimal non-streaming `/responses`
+endpoint without adding Foundry-specific keys to `/agent/agent.yaml`.
 
 ## Hosted-agent rendering
 

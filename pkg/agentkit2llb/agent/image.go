@@ -2,11 +2,13 @@ package agent
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/moby/buildkit/util/system"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sozercan/agentkit/pkg/agentkit/abi"
 	"github.com/sozercan/agentkit/pkg/agentkit/effective"
+	"github.com/sozercan/agentkit/pkg/agentkit/runtimes"
 	"github.com/sozercan/agentkit/pkg/utils"
 )
 
@@ -36,11 +38,29 @@ func NewImageConfig(agent effective.Agent, platform *specs.Platform) *specs.Imag
 	img.Config.ExposedPorts = map[string]struct{}{
 		fmt.Sprintf("%d/tcp", agent.Expose.Port): {},
 	}
+	if agent.Expose.Port == utils.DefaultPort {
+		// Foundry protocol mode defaults to 8088 for Hosted Agent compatibility.
+		// Expose it in the image metadata too so docker -P and platforms that
+		// inspect OCI ExposedPorts can discover the port the process uses.
+		img.Config.ExposedPorts[fmt.Sprintf("%d/tcp", utils.DefaultFoundryPort)] = struct{}{}
+	}
+
+	capabilities := ""
+	if runtimeSpec, ok := runtimes.RuntimeByName(agent.Runtime); ok {
+		capabilities = strings.Join(runtimeSpec.Capabilities, ",")
+	}
 
 	img.Config.Labels = map[string]string{
-		utils.LabelPrefix + ".runtime":   agent.Runtime,
-		utils.LabelPrefix + ".name":      agent.Metadata.Name,
-		utils.LabelPrefix + ".abi":       abi.Version,
+		// Current AgentKit label namespace.
+		utils.LabelPrefix + ".runtime": agent.Runtime,
+		utils.LabelPrefix + ".name":    agent.Metadata.Name,
+		utils.LabelPrefix + ".abi":     abi.Version,
+		// Cross-orchestrator metadata consumed by Orka and other registries.
+		"ai.agentkit.abi":                abi.Version,
+		"ai.agentkit.runtime":            agent.Runtime,
+		"ai.agentkit.protocols":          "openai,foundry,orka",
+		"ai.agentkit.capabilities":       capabilities,
+		"ai.orka.harness.version":        "orka.harness.v1",
 		"org.opencontainers.image.title": agent.Metadata.Name,
 	}
 	for k, v := range agent.Metadata.Labels {

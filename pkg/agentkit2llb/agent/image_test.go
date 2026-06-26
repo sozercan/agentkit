@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
@@ -48,11 +49,29 @@ func TestNewImageConfigUsesEffectiveAgentContract(t *testing.T) {
 	if _, ok := img.Config.ExposedPorts[fmt.Sprintf("%d/tcp", utils.DefaultPort)]; !ok {
 		t.Fatalf("ExposedPorts = %#v, want default port %d", img.Config.ExposedPorts, utils.DefaultPort)
 	}
+	if _, ok := img.Config.ExposedPorts[fmt.Sprintf("%d/tcp", utils.DefaultFoundryPort)]; !ok {
+		t.Fatalf("ExposedPorts = %#v, want Foundry default port %d", img.Config.ExposedPorts, utils.DefaultFoundryPort)
+	}
 	if got := img.Config.Labels[utils.LabelPrefix+".runtime"]; got != runtimes.MAF {
 		t.Fatalf("runtime label = %q, want canonical %q", got, runtimes.MAF)
 	}
 	if got := img.Config.Labels[utils.LabelPrefix+".abi"]; got != abi.Version {
 		t.Fatalf("abi label = %q, want %q", got, abi.Version)
+	}
+	if got := img.Config.Labels["ai.agentkit.abi"]; got != abi.Version {
+		t.Fatalf("portable abi label = %q, want %q", got, abi.Version)
+	}
+	if got := img.Config.Labels["ai.agentkit.runtime"]; got != runtimes.MAF {
+		t.Fatalf("portable runtime label = %q, want %q", got, runtimes.MAF)
+	}
+	if got := img.Config.Labels["ai.agentkit.protocols"]; got != "openai,foundry,orka" {
+		t.Fatalf("protocols label = %q", got)
+	}
+	if got := img.Config.Labels["ai.orka.harness.version"]; got != "orka.harness.v1" {
+		t.Fatalf("orka harness label = %q", got)
+	}
+	if got := img.Config.Labels["ai.agentkit.capabilities"]; !strings.Contains(got, runtimes.CapabilityOrkaHarnessV1) {
+		t.Fatalf("capabilities label = %q, want %s", got, runtimes.CapabilityOrkaHarnessV1)
 	}
 	if got := img.Config.Labels[testTeamLabel]; got != testTeamValue {
 		t.Fatalf("custom label = %q, want %s", got, testTeamValue)
@@ -65,5 +84,8 @@ func TestNewImageConfigPreservesEffectivePort(t *testing.T) {
 
 	if _, ok := img.Config.ExposedPorts["9090/tcp"]; !ok {
 		t.Fatalf("ExposedPorts = %#v, want explicit 9090/tcp", img.Config.ExposedPorts)
+	}
+	if _, ok := img.Config.ExposedPorts[fmt.Sprintf("%d/tcp", utils.DefaultFoundryPort)]; ok {
+		t.Fatalf("ExposedPorts = %#v, did not want Foundry default when explicit port is set", img.Config.ExposedPorts)
 	}
 }
