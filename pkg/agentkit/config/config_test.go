@@ -408,3 +408,195 @@ expose:
 		}
 	}
 }
+
+func TestValidateAcceptsRemoteMCPToolWithHeadersAndAuth(t *testing.T) {
+	in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: remote-mcp-agent
+runtime: maf
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: hi
+tools:
+  - name: toolbox
+    type: mcp
+    transport: streamable-http
+    urlEnv: TOOLBOX_ENDPOINT
+    headers:
+      - name: Foundry-Features
+        value: Toolboxes=V1Preview
+      - name: X-Trace
+        valueEnv: TOOLBOX_TRACE_HEADER
+    auth:
+      type: bearer
+      tokenEnv: TOOLBOX_TOKEN
+expose:
+  openai: true
+`)
+	cfg, err := NewFromBytes(in)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if verr := cfg.Validate(); verr != nil {
+		t.Fatalf("valid remote MCP tool failed validation: %v", verr)
+	}
+}
+
+func TestValidateRejectsInvalidRemoteMCPToolShapes(t *testing.T) {
+	cases := map[string]string{
+		"missing type": `tools:
+  - name: remote
+    transport: streamable-http
+    urlEnv: REMOTE_MCP_URL
+`,
+		"bad url env": `tools:
+  - name: remote
+    type: mcp
+    transport: streamable-http
+    urlEnv: https://example.com/mcp
+`,
+		"static authorization": `tools:
+  - name: remote
+    type: mcp
+    transport: streamable-http
+    urlEnv: REMOTE_MCP_URL
+    headers:
+      - name: Authorization
+        value: Bearer nope
+`,
+		"static api key header": `tools:
+  - name: remote
+    type: mcp
+    transport: streamable-http
+    urlEnv: REMOTE_MCP_URL
+    headers:
+      - name: X-API-Key
+        value: not-secret-looking
+`,
+		"static cookie header": `tools:
+  - name: remote
+    type: mcp
+    transport: streamable-http
+    urlEnv: REMOTE_MCP_URL
+    headers:
+      - name: Cookie
+        value: session=abc
+`,
+		"authorization value env plus auth": `tools:
+  - name: remote
+    type: mcp
+    transport: streamable-http
+    urlEnv: REMOTE_MCP_URL
+    headers:
+      - name: Authorization
+        valueEnv: AUTH_HEADER
+    auth:
+      type: bearer
+      tokenEnv: REMOTE_TOKEN
+`,
+		"missing token": `tools:
+  - name: remote
+    type: mcp
+    transport: streamable-http
+    urlEnv: REMOTE_MCP_URL
+    auth:
+      type: bearer
+`,
+	}
+	for name, toolYAML := range cases {
+		t.Run(name, func(t *testing.T) {
+			in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: remote-mcp-agent
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: hi
+` + toolYAML + `expose:
+  openai: true
+`)
+			cfg, err := NewFromBytes(in)
+			if err != nil {
+				t.Fatalf("parse error: %v", err)
+			}
+			if verr := cfg.Validate(); verr == nil {
+				t.Fatal("expected validation error, got nil")
+			}
+		})
+	}
+}
+
+func TestValidateRejectsUnsupportedContextProviderCapabilities(t *testing.T) {
+	in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: context-agent
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: hi
+context:
+  providers:
+    - name: knowledge
+      type: search
+      endpointEnv: SEARCH_ENDPOINT
+      indexEnv: SEARCH_INDEX
+expose:
+  openai: true
+`)
+	cfg, err := NewFromBytes(in)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	verr := cfg.Validate()
+	if verr == nil {
+		t.Fatal("expected unsupported context capability error, got nil")
+	}
+	if !strings.Contains(verr.Error(), runtimes.CapabilityContextProviderSearch) {
+		t.Fatalf("expected search capability error, got: %v", verr)
+	}
+}
+
+func TestValidateRejectsUnsupportedModelWorkloadIdentityAndApproval(t *testing.T) {
+	in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: capability-agent
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+  auth:
+    type: workload-identity-token
+    audience: https://example.com/.default
+instructions: hi
+tools:
+  - name: remote
+    type: mcp
+    transport: streamable-http
+    urlEnv: REMOTE_MCP_URL
+    approval: always
+expose:
+  openai: true
+`)
+	cfg, err := NewFromBytes(in)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	verr := cfg.Validate()
+	if verr == nil {
+		t.Fatal("expected unsupported capability errors, got nil")
+	}
+	msg := verr.Error()
+	for _, want := range []string{runtimes.CapabilityModelWorkloadIdentityAuth, runtimes.CapabilityToolApproval} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("expected %s in validation error, got: %v", want, verr)
+		}
+	}
+}

@@ -59,3 +59,13 @@ runtime catalog before build so unsupported features fail clearly.
 A top-level `env:` declaration in an Agentkitfile/Agent YAML ABI. It records only
 an environment variable name and whether it is required; values stay in the
 runtime environment and are never baked into the image.
+
+### Remote MCP Tool
+A `tools[]` entry with `type: mcp`, `transport: streamable-http`, and `urlEnv`.
+AgentKit core stores only env var names and non-secret static headers; runtime
+adapters resolve the URL, headers, and generic auth at startup.
+
+### Context Provider
+A provider-neutral `context.providers[]` entry for search, skills, or memory.
+The schema is present so provider-specific deployment tooling can map resources
+to generic env names, but runtime behavior is capability-gated.

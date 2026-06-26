@@ -23,7 +23,13 @@ func baseConfig() *config.AgentConfig {
 			APIKeyEnv: testAPIKeyEnvName,
 		},
 		Tools: []config.Tool{
-			{Name: "fetch", Command: []string{"uvx", "mcp-server-fetch"}, Env: []string{"FETCH_TIMEOUT"}},
+			{
+				Name:    "fetch",
+				Command: []string{"uvx", "mcp-server-fetch"},
+				Env:     []string{"FETCH_TIMEOUT"},
+				Headers: []config.ToolHeader{{Name: "X-Trace", ValueEnv: "TRACE_HEADER"}},
+				Auth:    &config.Auth{Type: config.AuthTypeBearer, TokenEnv: "TOOL_TOKEN"},
+			},
 		},
 		Env:    []config.EnvVar{{Name: "REQUIRED_FOO", Required: true}},
 		Expose: config.Expose{OpenAI: true},
@@ -66,6 +72,8 @@ func TestFromConfigCopiesMutableFields(t *testing.T) {
 	cfg.Metadata.Labels["team"] = "mutated"
 	cfg.Tools[0].Command[0] = "mutated"
 	cfg.Tools[0].Env[0] = "MUTATED"
+	cfg.Tools[0].Headers[0].Name = "MUTATED"
+	cfg.Tools[0].Auth.TokenEnv = "MUTATED"
 	cfg.Env[0].Name = "MUTATED"
 
 	if agent.Metadata.Labels["team"] != "agentkit" {
@@ -76,6 +84,12 @@ func TestFromConfigCopiesMutableFields(t *testing.T) {
 	}
 	if got := agent.Tools[0].Env[0]; got != "FETCH_TIMEOUT" {
 		t.Fatalf("tool env was not copied: %q", got)
+	}
+	if got := agent.Tools[0].Headers[0].Name; got != "X-Trace" {
+		t.Fatalf("tool headers were not copied: %q", got)
+	}
+	if got := agent.Tools[0].Auth.TokenEnv; got != "TOOL_TOKEN" {
+		t.Fatalf("tool auth was not copied: %q", got)
 	}
 	if got := agent.Env[0].Name; got != "REQUIRED_FOO" {
 		t.Fatalf("agent env was not copied: %q", got)

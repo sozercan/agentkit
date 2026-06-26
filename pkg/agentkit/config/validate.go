@@ -10,6 +10,23 @@ import (
 	"github.com/sozercan/agentkit/pkg/utils"
 )
 
+const (
+	ContextTypeSearch       = "search"
+	ContextTypeSkills       = "skills"
+	ContextTypeMemory       = "memory"
+	ContextSourceFilesystem = "filesystem"
+	ContextSourceMCP        = "mcp"
+
+	ToolTypeMCP                 = "mcp"
+	ToolTransportStdio          = "stdio"
+	ToolTransportStreamableHTTP = "streamable-http"
+	AuthTypeBearer              = "bearer"
+	AuthTypeWorkloadIdentity    = "workload-identity-token"
+	ApprovalNever               = "never"
+	ApprovalAuto                = "auto"
+	ApprovalAlways              = "always"
+)
+
 // Validate reports every problem with the config at once via errors.Join (plan
 // §16.2 #3 — one report-all validator, not scattered first-error-wins funcs).
 //
@@ -37,10 +54,7 @@ func (c *AgentConfig) Validate() error {
 		add("metadata.name is required")
 	}
 
-	// --- runtime (empty defaults to pydantic-ai; otherwise must be a runtime
-	// AgentKit knows, after alias resolution). The canonical set lives in
-	// pkg/agentkit/runtimes so this validator and pkg/build's adapter registry
-	// agree without a config→build import cycle. ----------
+	// --- runtime -----------------------------------------------------------
 	runtimeName := c.Runtime
 	if runtimeName == "" {
 		runtimeName = runtimes.DefaultRuntime()
@@ -68,6 +82,10 @@ func (c *AgentConfig) Validate() error {
 	if c.Model.APIKeyEnv != "" && (!isEnvVarName(c.Model.APIKeyEnv) || looksLikeSecretLiteral(c.Model.APIKeyEnv)) {
 		add("model.apiKeyEnv %q must be an env var NAME matching [A-Z0-9_]+; provide the NAME of an env var (e.g. OPENAI_API_KEY) and inject the value with `docker run -e`", c.Model.APIKeyEnv)
 	}
+	validateAuth(add, "model.auth", c.Model.Auth)
+	if c.Model.Auth != nil && c.Model.Auth.Type != AuthTypeWorkloadIdentity {
+		add("model.auth.type %q is not supported in v0; use apiKeyEnv or workload-identity-token gated by runtime capability", c.Model.Auth.Type)
+	}
 
 	// --- instructions ------------------------------------------------------
 	if c.Instructions.IsZero() {
@@ -76,7 +94,7 @@ func (c *AgentConfig) Validate() error {
 		add("instructions set multiple sources %v; exactly one of inline|file is allowed", set)
 	}
 
-	// --- tools (v0: stdio command MCP servers only) ------------------------
+	// --- tools -------------------------------------------------------------
 	seen := map[string]bool{}
 	for i, t := range c.Tools {
 		if t.Name == "" {
@@ -86,31 +104,27 @@ func (c *AgentConfig) Validate() error {
 		}
 		seen[t.Name] = true
 
+		if t.Type != "" && t.Type != ToolTypeMCP {
+			add("tools[%d] (%s): type %q is not supported (expected %q)", i, t.Name, t.Type, ToolTypeMCP)
+		}
+
 		set := t.variantsSet()
 		switch len(set) {
 		case 0:
-			add("tools[%d] (%s): a tool source is required (v0: command)", i, t.Name)
+			add("tools[%d] (%s): a tool source is required (command or urlEnv)", i, t.Name)
 		case 1:
 			if t.Image != "" {
-				add("tools[%d] (%s): image-based MCP servers are not supported in v0 (use a stdio command; arbitrary-OCI staging is v1)", i, t.Name)
+				add("tools[%d] (%s): image-based MCP servers are not supported in v0 (use command or streamable-http urlEnv; arbitrary-OCI staging is v1)", i, t.Name)
 			}
 		default:
 			add("tools[%d] (%s): sets multiple sources %v; exactly one is allowed", i, t.Name, set)
 		}
 
-		for j, part := range t.Command {
-			if part == "" {
-				add("tools[%d] (%s): command[%d] must be non-empty", i, t.Name, j)
-			}
-		}
-
-		for _, e := range t.Env {
-			if e == "" {
-				add("tools[%d] (%s): env entry is empty; list env var NAMES only", i, t.Name)
-			} else if !isEnvVarName(e) || looksLikeSecretLiteral(e) {
-				add("tools[%d] (%s): env entry %q must be an env var NAME matching [A-Z0-9_]+; list names only, never values", i, t.Name, e)
-			}
-		}
+		validateToolTransport(add, i, t)
+		validateToolEnv(add, i, t)
+		validateToolHeaders(add, i, t)
+		validateAuth(add, fmt.Sprintf("tools[%d] (%s).auth", i, t.Name), t.Auth)
+		validateApproval(add, i, t)
 	}
 
 	// --- env requirements ---------------------------------------------------
@@ -128,6 +142,9 @@ func (c *AgentConfig) Validate() error {
 		}
 		seenEnv[e.Name] = true
 	}
+
+	validateContext(add, c.Context)
+	validateObservability(add, c.Observability)
 
 	// --- runtime capability gate -------------------------------------------
 	if runtimeKnown {
@@ -148,6 +165,179 @@ func (c *AgentConfig) Validate() error {
 	return errors.Join(errs...)
 }
 
+func validateContext(add func(string, ...any), ctx Context) {
+	seen := map[string]bool{}
+	for i, provider := range ctx.Providers {
+		path := fmt.Sprintf("context.providers[%d]", i)
+		if provider.Name != "" {
+			if seen[provider.Name] {
+				add("%s: duplicate provider name %q", path, provider.Name)
+			}
+			seen[provider.Name] = true
+		}
+		switch provider.Type {
+		case ContextTypeSearch:
+			validateEnvField(add, path+".endpointEnv", provider.EndpointEnv, true)
+			validateEnvField(add, path+".indexEnv", provider.IndexEnv, true)
+			validateAuth(add, path+".auth", provider.Auth)
+		case ContextTypeSkills:
+			switch provider.Source {
+			case ContextSourceFilesystem:
+				if provider.Path == "" {
+					add("%s.path is required for filesystem skills", path)
+				}
+			case ContextSourceMCP:
+				if provider.ToolRef == "" {
+					add("%s.toolRef is required for MCP skills", path)
+				}
+				if provider.Index == "" {
+					add("%s.index is required for MCP skills", path)
+				}
+			default:
+				add("%s.source %q is not supported for skills (expected filesystem or mcp)", path, provider.Source)
+			}
+		case ContextTypeMemory:
+			validateEnvField(add, path+".storeNameEnv", provider.StoreNameEnv, true)
+			validateEnvField(add, path+".endpointEnv", provider.EndpointEnv, true)
+			validateAuth(add, path+".auth", provider.Auth)
+		case "":
+			add("%s.type is required", path)
+		default:
+			add("%s.type %q is not supported (expected search, skills, or memory)", path, provider.Type)
+		}
+	}
+}
+
+func validateObservability(add func(string, ...any), obs Observability) {
+	validateEnvField(add, "observability.otel.endpointEnv", obs.OTel.EndpointEnv, false)
+	validateEnvField(add, "observability.logs.levelEnv", obs.Logs.LevelEnv, false)
+}
+
+func validateEnvField(add func(string, ...any), path, value string, required bool) {
+	if value == "" {
+		if required {
+			add("%s is required", path)
+		}
+		return
+	}
+	if !isEnvVarName(value) || looksLikeSecretLiteral(value) {
+		add("%s %q must be an env var NAME matching [A-Z0-9_]+", path, value)
+	}
+}
+
+func validateToolTransport(add func(string, ...any), i int, t Tool) {
+	if len(t.Command) > 0 {
+		if t.Transport != "" && t.Transport != ToolTransportStdio {
+			add("tools[%d] (%s): command tools use transport %q or omit transport", i, t.Name, ToolTransportStdio)
+		}
+		if t.URLEnv != "" || len(t.Headers) > 0 || t.Auth != nil {
+			add("tools[%d] (%s): stdio command tools must not set urlEnv, headers, or auth", i, t.Name)
+		}
+	} else if t.URLEnv != "" {
+		if t.Type != ToolTypeMCP {
+			add("tools[%d] (%s): remote MCP tools must set type: %s", i, t.Name, ToolTypeMCP)
+		}
+		if t.Transport != ToolTransportStreamableHTTP {
+			add("tools[%d] (%s): remote MCP tools must set transport: %s", i, t.Name, ToolTransportStreamableHTTP)
+		}
+		if !isEnvVarName(t.URLEnv) || looksLikeSecretLiteral(t.URLEnv) {
+			add("tools[%d] (%s): urlEnv %q must be an env var NAME matching [A-Z0-9_]+", i, t.Name, t.URLEnv)
+		}
+		if len(t.Env) > 0 {
+			add("tools[%d] (%s): remote MCP tools must use headers/auth instead of stdio env", i, t.Name)
+		}
+	} else if t.Transport != "" && t.Transport != ToolTransportStdio {
+		add("tools[%d] (%s): transport %q requires urlEnv", i, t.Name, t.Transport)
+	}
+}
+
+func validateToolEnv(add func(string, ...any), i int, t Tool) {
+	for j, part := range t.Command {
+		if part == "" {
+			add("tools[%d] (%s): command[%d] must be non-empty", i, t.Name, j)
+		}
+	}
+	for _, e := range t.Env {
+		if e == "" {
+			add("tools[%d] (%s): env entry is empty; list env var NAMES only", i, t.Name)
+		} else if !isEnvVarName(e) || looksLikeSecretLiteral(e) {
+			add("tools[%d] (%s): env entry %q must be an env var NAME matching [A-Z0-9_]+; list names only, never values", i, t.Name, e)
+		}
+	}
+}
+
+func validateToolHeaders(add func(string, ...any), i int, t Tool) {
+	seen := map[string]bool{}
+	for j, h := range t.Headers {
+		path := fmt.Sprintf("tools[%d] (%s).headers[%d]", i, t.Name, j)
+		if h.Name == "" {
+			add("%s.name is required", path)
+		} else if !isHTTPHeaderName(h.Name) {
+			add("%s.name %q is not a valid HTTP header name", path, h.Name)
+		} else if seen[strings.ToLower(h.Name)] {
+			add("%s: duplicate header name %q", path, h.Name)
+		}
+		seen[strings.ToLower(h.Name)] = true
+
+		values := 0
+		if h.Value != "" {
+			values++
+		}
+		if h.ValueEnv != "" {
+			values++
+		}
+		if values != 1 {
+			add("%s must set exactly one of value or valueEnv", path)
+		}
+		if t.Auth != nil && strings.EqualFold(h.Name, "authorization") {
+			add("%s must not set Authorization when auth is also configured; use one auth path", path)
+		}
+		if h.Value != "" && isCredentialHeaderName(h.Name) {
+			add("%s.value must not bake a static credential header; use valueEnv or auth", path)
+		}
+		if h.Value != "" && hasSecretPrefix(h.Value) {
+			add("%s.value looks like a secret value; use valueEnv instead", path)
+		}
+		if h.ValueEnv != "" && (!isEnvVarName(h.ValueEnv) || looksLikeSecretLiteral(h.ValueEnv)) {
+			add("%s.valueEnv %q must be an env var NAME matching [A-Z0-9_]+", path, h.ValueEnv)
+		}
+	}
+}
+
+func validateAuth(add func(string, ...any), path string, auth *Auth) {
+	if auth == nil {
+		return
+	}
+	switch auth.Type {
+	case AuthTypeBearer:
+		if auth.TokenEnv == "" {
+			add("%s.tokenEnv is required for bearer auth", path)
+		} else if !isEnvVarName(auth.TokenEnv) || looksLikeSecretLiteral(auth.TokenEnv) {
+			add("%s.tokenEnv %q must be an env var NAME matching [A-Z0-9_]+", path, auth.TokenEnv)
+		}
+		if auth.Audience != "" {
+			add("%s.audience must be empty for bearer auth", path)
+		}
+	case AuthTypeWorkloadIdentity:
+		if auth.Audience == "" {
+			add("%s.audience is required for workload identity token auth", path)
+		}
+		if auth.TokenEnv != "" {
+			add("%s.tokenEnv must be empty for workload identity token auth", path)
+		}
+	default:
+		add("%s.type %q is not supported (expected %q or %q)", path, auth.Type, AuthTypeBearer, AuthTypeWorkloadIdentity)
+	}
+}
+
+func validateApproval(add func(string, ...any), i int, t Tool) {
+	switch t.Approval {
+	case "", ApprovalNever, ApprovalAuto, ApprovalAlways:
+	default:
+		add("tools[%d] (%s): approval %q is not supported (expected never, auto, or always)", i, t.Name, t.Approval)
+	}
+}
+
 func (c *AgentConfig) requiredCapabilities() []string {
 	seen := map[string]bool{}
 	var out []string
@@ -157,10 +347,44 @@ func (c *AgentConfig) requiredCapabilities() []string {
 			out = append(out, cap)
 		}
 	}
+	if c.Model.Auth != nil && c.Model.Auth.Type == AuthTypeWorkloadIdentity {
+		add(runtimes.CapabilityModelWorkloadIdentityAuth)
+	}
 	for _, t := range c.Tools {
 		if len(t.Command) > 0 {
 			add(runtimes.CapabilityStdioMCP)
 		}
+		if t.URLEnv != "" || t.Transport == ToolTransportStreamableHTTP {
+			add(runtimes.CapabilityStreamableHTTPMCP)
+		}
+		if t.Auth != nil && t.Auth.Type == AuthTypeWorkloadIdentity {
+			add(runtimes.CapabilityWorkloadIdentityTokenAuth)
+		}
+		if t.Approval == ApprovalAuto || t.Approval == ApprovalAlways {
+			add(runtimes.CapabilityToolApproval)
+		}
+	}
+	for _, provider := range c.Context.Providers {
+		switch provider.Type {
+		case ContextTypeSearch:
+			add(runtimes.CapabilityContextProviderSearch)
+		case ContextTypeSkills:
+			add(runtimes.CapabilityContextProviderSkills)
+			if provider.Source == ContextSourceFilesystem {
+				add(runtimes.CapabilityFilesystemSkills)
+			}
+			if provider.Source == ContextSourceMCP {
+				add(runtimes.CapabilityMCPSkills)
+			}
+		case ContextTypeMemory:
+			add(runtimes.CapabilityContextProviderMemory)
+		}
+		if provider.Auth != nil && provider.Auth.Type == AuthTypeWorkloadIdentity {
+			add(runtimes.CapabilityWorkloadIdentityTokenAuth)
+		}
+	}
+	if c.Observability.OTel.EndpointEnv != "" {
+		add(runtimes.CapabilityOTelExport)
 	}
 	return out
 }
@@ -179,6 +403,43 @@ func isEnvVarName(v string) bool {
 	return true
 }
 
+func isHTTPHeaderName(v string) bool {
+	if v == "" {
+		return false
+	}
+	for _, r := range v {
+		isAlpha := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
+		isDigit := r >= '0' && r <= '9'
+		switch {
+		case isAlpha || isDigit:
+			continue
+		case strings.ContainsRune("!#$%&'*+-.^_`|~", r):
+			continue
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func isCredentialHeaderName(name string) bool {
+	switch strings.ToLower(name) {
+	case "authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key", "api-key", "ocp-apim-subscription-key", "subscription-key", "x-functions-key":
+		return true
+	default:
+		return false
+	}
+}
+
+func hasSecretPrefix(v string) bool {
+	for _, p := range []string{"sk-", "sk_", "ghp_", "github_pat_", "xoxb-", "AKIA"} {
+		if strings.HasPrefix(v, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // looksLikeSecretLiteral heuristically flags a value that appears to be a secret
 // rather than an env var NAME. Env var names are uppercase letters, digits, and
 // underscores; common secret prefixes (sk-, etc.) and lowercase/punctuation are
@@ -188,13 +449,14 @@ func looksLikeSecretLiteral(v string) bool {
 		return false
 	}
 	// Known secret-value prefixes.
-	for _, p := range []string{"sk-", "sk_", "ghp_", "github_pat_", "xoxb-", "AKIA"} {
-		if strings.HasPrefix(v, p) {
-			return true
-		}
+	if hasSecretPrefix(v) {
+		return true
 	}
-	// An env var NAME is [A-Z0-9_]+; anything else (lowercase, spaces, ://,
-	// punctuation) is not a valid name and is treated as a misplaced value.
+	// Env var NAMEs are [A-Z0-9_]+; lowercase/spaces/URLs/punctuation are a strong
+	// signal the user pasted a value into an env-name field.
+	if isEnvVarName(v) {
+		return false
+	}
 	for _, r := range v {
 		isUpper := r >= 'A' && r <= 'Z'
 		isDigit := r >= '0' && r <= '9'

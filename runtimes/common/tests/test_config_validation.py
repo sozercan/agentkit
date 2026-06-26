@@ -62,10 +62,10 @@ def test_load_rejects_secret_like_api_key_env_name(tmp_path):
     assert "secret value" in msg
 
 
-def test_load_rejects_tool_without_command(tmp_path):
+def test_load_rejects_tool_without_command_or_url(tmp_path):
     msg = _invalid_message(tmp_path, lambda spec: spec["tools"][0].update(command=[]))
-    assert "tools.0.command" in msg
-    assert "at least 1 item" in msg
+    assert "tools.0" in msg
+    assert "command or urlEnv" in msg
 
 
 def test_load_rejects_empty_tool_command_entry(tmp_path):
@@ -160,3 +160,112 @@ def test_load_or_exit_validates_required_env(tmp_path, monkeypatch, capsys):
     assert exc.value.code == 2
     captured = capsys.readouterr()
     assert "REQUIRED_FOO" in captured.err
+
+
+def test_load_accepts_remote_mcp_tool(tmp_path):
+    spec_dict = deepcopy(_BASE_SPEC)
+    spec_dict["tools"] = [
+        {
+            "name": "toolbox",
+            "type": "mcp",
+            "transport": "streamable-http",
+            "urlEnv": "TOOLBOX_ENDPOINT",
+            "headers": [
+                {"name": "Foundry-Features", "value": "Toolboxes=V1Preview"},
+                {"name": "X-Trace", "valueEnv": "TOOLBOX_TRACE"},
+            ],
+            "auth": {"type": "bearer", "tokenEnv": "TOOLBOX_TOKEN"},
+        }
+    ]
+
+    spec = load(_write_spec(tmp_path, spec_dict))
+
+    tool = spec.tools[0]
+    assert tool.url_env == "TOOLBOX_ENDPOINT"
+    assert tool.headers[0].value == "Toolboxes=V1Preview"
+    assert tool.headers[1].value_env == "TOOLBOX_TRACE"
+    assert tool.auth is not None
+    assert tool.auth.token_env == "TOOLBOX_TOKEN"
+
+
+def test_load_rejects_invalid_remote_mcp_tool(tmp_path):
+    spec_dict = deepcopy(_BASE_SPEC)
+    spec_dict["tools"] = [
+        {
+            "name": "toolbox",
+            "type": "mcp",
+            "transport": "streamable-http",
+            "urlEnv": "TOOLBOX_ENDPOINT",
+            "headers": [{"name": "Authorization", "value": "Bearer nope"}],
+        }
+    ]
+
+    with pytest.raises(ConfigError) as exc:
+        load(_write_spec(tmp_path, spec_dict))
+
+    msg = str(exc.value)
+    assert "static credential" in msg
+
+
+def test_load_accepts_context_and_observability_shapes(tmp_path):
+    spec_dict = deepcopy(_BASE_SPEC)
+    spec_dict["context"] = {
+        "providers": [
+            {
+                "name": "knowledge",
+                "type": "search",
+                "endpointEnv": "SEARCH_ENDPOINT",
+                "indexEnv": "SEARCH_INDEX",
+            }
+        ]
+    }
+    spec_dict["observability"] = {
+        "otel": {"endpointEnv": "OTEL_EXPORTER_OTLP_ENDPOINT"},
+        "logs": {"levelEnv": "LOG_LEVEL"},
+    }
+
+    spec = load(_write_spec(tmp_path, spec_dict))
+
+    assert spec.context.providers[0].endpoint_env == "SEARCH_ENDPOINT"
+    assert spec.observability.otel.endpoint_env == "OTEL_EXPORTER_OTLP_ENDPOINT"
+    assert spec.observability.logs.level_env == "LOG_LEVEL"
+
+
+@pytest.mark.parametrize("header", ["X-API-Key", "Cookie"])
+def test_load_rejects_static_credential_header_names(tmp_path, header: str):
+    spec_dict = deepcopy(_BASE_SPEC)
+    spec_dict["tools"] = [
+        {
+            "name": "toolbox",
+            "type": "mcp",
+            "transport": "streamable-http",
+            "urlEnv": "TOOLBOX_ENDPOINT",
+            "headers": [{"name": header, "value": "not-secret-looking"}],
+        }
+    ]
+
+    with pytest.raises(ConfigError) as exc:
+        load(_write_spec(tmp_path, spec_dict))
+
+    assert "static credential" in str(exc.value)
+
+
+def test_load_rejects_authorization_value_env_plus_auth(tmp_path):
+    spec_dict = deepcopy(_BASE_SPEC)
+    spec_dict["tools"] = [
+        {
+            "name": "toolbox",
+            "type": "mcp",
+            "transport": "streamable-http",
+            "urlEnv": "TOOLBOX_ENDPOINT",
+            "headers": [{"name": "Authorization", "valueEnv": "AUTH_HEADER"}],
+            "auth": {"type": "bearer", "tokenEnv": "TOOLBOX_TOKEN"},
+        }
+    ]
+
+    with pytest.raises(ConfigError) as exc:
+        load(_write_spec(tmp_path, spec_dict))
+
+    msg = str(exc.value)
+    assert "Authorization" in msg
+    assert "auth" in msg

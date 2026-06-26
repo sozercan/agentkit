@@ -3,8 +3,7 @@
 This mirrors ``docs/agent-abi.md`` EXACTLY — it is the Python (reader) half of the
 contract whose Go (writer) half lives in ``pkg/agentkit/abi``. The shape here is
 the *baked* file: ``instructions`` is already a fully-resolved scalar string and
-``model.provider`` is always ``openai-compatible`` in v0. Do not add fields that
-the writer does not emit.
+``model.provider`` is always ``openai-compatible`` in v0.
 """
 
 from __future__ import annotations
@@ -15,13 +14,31 @@ import sys
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 # The ABI schema version this reader understands (agent-abi.md: ``abiVersion: v0``).
 ABI_VERSION = "v0"
 _PROVIDER_OPENAI_COMPATIBLE = "openai-compatible"
 _ENV_NAME_RE = re.compile(r"^[A-Z0-9_]+$")
+_HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+\-.^_`|~]+$")
 _SECRET_VALUE_PREFIXES = ("sk-", "sk_", "ghp_", "github_pat_", "xoxb-", "AKIA")
+_TOOL_TYPE_MCP = "mcp"
+_TRANSPORT_STDIO = "stdio"
+_TRANSPORT_STREAMABLE_HTTP = "streamable-http"
+_AUTH_BEARER = "bearer"
+_AUTH_WORKLOAD_IDENTITY = "workload-identity-token"
+_APPROVAL_VALUES = {"never", "auto", "always"}
+_CREDENTIAL_HEADER_NAMES = {
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+    "api-key",
+    "ocp-apim-subscription-key",
+    "subscription-key",
+    "x-functions-key",
+}
 
 
 class _Strict(BaseModel):
@@ -37,6 +54,12 @@ def _validate_env_name(value: str, *, field: str) -> str:
     if value.startswith(_SECRET_VALUE_PREFIXES):
         raise ValueError(f"{field} looks like a secret value; provide an env var NAME")
     return value
+
+
+def _looks_like_secret_literal(value: str) -> bool:
+    if not value:
+        return False
+    return value.startswith(_SECRET_VALUE_PREFIXES)
 
 
 class Metadata(_Strict):
@@ -71,13 +94,84 @@ class ModelSpec(_Strict):
         return _validate_env_name(value, field="model.apiKeyEnv")
 
 
+class ToolHeaderSpec(_Strict):
+    name: str = Field(min_length=1)
+    value: str | None = None
+    value_env: str | None = Field(default=None, alias="valueEnv")
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    @field_validator("name")
+    @classmethod
+    def _header_name(cls, value: str) -> str:
+        if not _HEADER_NAME_RE.fullmatch(value):
+            raise ValueError("header name is invalid")
+        return value
+
+    @field_validator("value_env")
+    @classmethod
+    def _value_env_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        return _validate_env_name(value, field="tools[].headers[].valueEnv")
+
+    @model_validator(mode="after")
+    def _exactly_one_value(self) -> "ToolHeaderSpec":
+        if (self.value is None or self.value == "") == (self.value_env is None or self.value_env == ""):
+            raise ValueError("headers must set exactly one of value or valueEnv")
+        if self.name.lower() in _CREDENTIAL_HEADER_NAMES and self.value:
+            raise ValueError("static credential headers are not allowed; use valueEnv or auth")
+        if self.value and _looks_like_secret_literal(self.value):
+            raise ValueError("header value looks like a secret; use valueEnv")
+        return self
+
+
+class AuthSpec(_Strict):
+    type: str = Field(min_length=1)
+    token_env: str | None = Field(default=None, alias="tokenEnv")
+    audience: str | None = None
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    @field_validator("token_env")
+    @classmethod
+    def _token_env_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        return _validate_env_name(value, field="auth.tokenEnv")
+
+    @model_validator(mode="after")
+    def _valid_shape(self) -> "AuthSpec":
+        if self.type == _AUTH_BEARER:
+            if not self.token_env:
+                raise ValueError("bearer auth requires tokenEnv")
+            if self.audience:
+                raise ValueError("bearer auth must not set audience")
+            return self
+        if self.type == _AUTH_WORKLOAD_IDENTITY:
+            if not self.audience:
+                raise ValueError("workload identity auth requires audience")
+            if self.token_env:
+                raise ValueError("workload identity auth must not set tokenEnv")
+            return self
+        raise ValueError(f"unsupported auth type {self.type!r}")
+
+
 class ToolSpec(_Strict):
-    """A stdio MCP server (v0's only tool transport)."""
+    """An MCP server: stdio command or Streamable HTTP remote transport."""
 
     name: str = Field(min_length=1)
-    command: list[str] = Field(min_length=1)
-    # NAMES only — serve passes ONLY these into the subprocess env (secret-bleed rule).
+    type: str | None = None
+    transport: str | None = None
+    command: list[str] = Field(default_factory=list)
+    url_env: str | None = Field(default=None, alias="urlEnv")
+    headers: list[ToolHeaderSpec] = Field(default_factory=list)
+    auth: AuthSpec | None = None
+    approval: str | None = None
+    # NAMES only — serve passes ONLY these into stdio subprocess env (secret-bleed rule).
     env: list[str] = Field(default_factory=list)
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     @field_validator("command")
     @classmethod
@@ -86,10 +180,47 @@ class ToolSpec(_Strict):
             raise ValueError("command entries must be non-empty strings")
         return value
 
+    @field_validator("url_env")
+    @classmethod
+    def _url_env_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        return _validate_env_name(value, field="tools[].urlEnv")
+
     @field_validator("env")
     @classmethod
     def _env_names(cls, value: list[str]) -> list[str]:
         return [_validate_env_name(name, field="tools[].env") for name in value]
+
+    @field_validator("approval")
+    @classmethod
+    def _approval_supported(cls, value: str | None) -> str | None:
+        if value is not None and value not in _APPROVAL_VALUES:
+            raise ValueError("approval must be one of never, auto, or always")
+        return value
+
+    @model_validator(mode="after")
+    def _valid_tool_shape(self) -> "ToolSpec":
+        if self.type is not None and self.type != _TOOL_TYPE_MCP:
+            raise ValueError("tool type must be 'mcp'")
+        variants = int(bool(self.command)) + int(bool(self.url_env))
+        if variants != 1:
+            raise ValueError("tool must set exactly one of command or urlEnv")
+        if self.command:
+            if self.transport not in (None, "", _TRANSPORT_STDIO):
+                raise ValueError("command tools must omit transport or set stdio")
+            if self.headers or self.auth or self.url_env:
+                raise ValueError("command tools must not set urlEnv, headers, or auth")
+        if self.url_env:
+            if self.type != _TOOL_TYPE_MCP:
+                raise ValueError("remote MCP tools must set type: mcp")
+            if self.transport != _TRANSPORT_STREAMABLE_HTTP:
+                raise ValueError("remote MCP tools must set transport: streamable-http")
+            if self.env:
+                raise ValueError("remote MCP tools must use headers/auth instead of env")
+            if self.auth is not None and any(h.name.lower() == "authorization" for h in self.headers):
+                raise ValueError("remote MCP tools must not set Authorization header when auth is configured")
+        return self
 
 
 class EnvVarSpec(_Strict):
@@ -102,6 +233,63 @@ class EnvVarSpec(_Strict):
     @classmethod
     def _name_is_env_var(cls, value: str) -> str:
         return _validate_env_name(value, field="env[].name")
+
+
+class ContextProviderSpec(_Strict):
+    name: str | None = None
+    type: str = Field(min_length=1)
+    source: str | None = None
+    path: str | None = None
+    tool_ref: str | None = Field(default=None, alias="toolRef")
+    index: str | None = None
+    endpoint_env: str | None = Field(default=None, alias="endpointEnv")
+    index_env: str | None = Field(default=None, alias="indexEnv")
+    store_name_env: str | None = Field(default=None, alias="storeNameEnv")
+    auth: AuthSpec | None = None
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    @field_validator("endpoint_env", "index_env", "store_name_env")
+    @classmethod
+    def _env_names(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        return _validate_env_name(value, field="context.providers[].env")
+
+
+class ContextSpec(_Strict):
+    providers: list[ContextProviderSpec] = Field(default_factory=list)
+
+
+class ObservabilityOTelSpec(_Strict):
+    endpoint_env: str | None = Field(default=None, alias="endpointEnv")
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    @field_validator("endpoint_env")
+    @classmethod
+    def _endpoint_env_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        return _validate_env_name(value, field="observability.otel.endpointEnv")
+
+
+class ObservabilityLogsSpec(_Strict):
+    level_env: str | None = Field(default=None, alias="levelEnv")
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    @field_validator("level_env")
+    @classmethod
+    def _level_env_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        return _validate_env_name(value, field="observability.logs.levelEnv")
+
+
+class ObservabilitySpec(_Strict):
+    otel: ObservabilityOTelSpec = Field(default_factory=ObservabilityOTelSpec)
+    logs: ObservabilityLogsSpec = Field(default_factory=ObservabilityLogsSpec)
 
 
 class ExposeSpec(_Strict):
@@ -133,6 +321,8 @@ class AgentSpec(_Strict):
     instructions: str
     tools: list[ToolSpec] = Field(default_factory=list)
     env: list[EnvVarSpec] = Field(default_factory=list)
+    context: ContextSpec = Field(default_factory=ContextSpec)
+    observability: ObservabilitySpec = Field(default_factory=ObservabilitySpec)
     expose: ExposeSpec
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)

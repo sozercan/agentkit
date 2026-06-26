@@ -24,6 +24,7 @@ Current and reserved names:
 - `workload-identity-token-auth` — workload identity tokens for tools/resources.
 - `model-workload-identity-auth` — workload identity tokens for model calls.
 - `otel-export` — OpenTelemetry export support.
+- `tool-approval` — tool approval / human-in-the-loop policy support.
 
 Avoid provider-specific resource names such as `foundry-toolbox`; those should map
 to generic capabilities such as `streamable-http-mcp` plus deployment-profile env
@@ -33,9 +34,8 @@ and auth wiring.
 
 | Runtime | Capabilities |
 |---|---|
-| `pydantic-ai` | `stdio-mcp` |
-| `microsoft-agent-framework` / `maf` | `stdio-mcp` |
-| `langgraph` | `stdio-mcp` |
+| `pydantic-ai` | `stdio-mcp`, `streamable-http-mcp` |
+| `microsoft-agent-framework` / `maf` | `stdio-mcp`, `streamable-http-mcp`, `workload-identity-token-auth` |
+| `langgraph` | `stdio-mcp`, `streamable-http-mcp` |
 
-New schema features must add capability gates at the same time they become
-requestable from an `agentkitfile.yaml`.
+Context-provider, model workload identity, OTel export, and tool approval schemas are present but remain capability-gated until a runtime declares support.

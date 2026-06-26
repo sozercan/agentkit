@@ -40,6 +40,25 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 Add stdio MCP tools with a `tools:` list (see `test/agentkitfile-tools.yaml`).
 
+Remote MCP servers over Streamable HTTP are also supported through generic env and
+header/auth declarations:
+
+```yaml
+tools:
+  - name: toolbox
+    type: mcp
+    transport: streamable-http
+    urlEnv: TOOLBOX_ENDPOINT
+    headers:
+      - name: Foundry-Features
+        value: Toolboxes=V1Preview
+    auth:
+      type: bearer
+      tokenEnv: TOOLBOX_TOKEN
+```
+
+The `microsoft-agent-framework` runtime also supports `auth.type: workload-identity-token` with an opaque `audience` when the deployment environment provides `AGENTKIT_WORKLOAD_IDENTITY_TOKEN`, `AGENTKIT_WORKLOAD_IDENTITY_TOKEN_COMMAND`, or an installed credential provider.
+
 Declare runtime environment requirements with top-level `env:` entries. AgentKit
 bakes only env var names into `/agent/agent.yaml`; values are supplied by the
 runtime environment. Required entries are checked at startup with secret-free
@@ -84,9 +103,10 @@ Only the in-image runtime adapter differs. The `AGENTKIT_MCP_TIMEOUT` knob
 applies to all runtimes.
 
 Runtime capabilities are explicit and validated before build. Today all shipped
-runtimes declare `stdio-mcp`; future features such as remote MCP, skills, memory,
-workload identity, and hosted-agent protocol adapters must add provider-neutral
-capability flags before they are requestable. See `docs/runtime-capabilities.md`.
+runtimes declare `stdio-mcp`; remote MCP and workload identity are capability-gated. Future features such as
+skills, memory, model workload identity, observability export, and hosted-agent
+protocol adapters must add provider-neutral capability flags before they are
+requestable. See `docs/runtime-capabilities.md`.
 
 ## Local dev loop (3 steps)
 
@@ -191,7 +211,7 @@ test suite for free.
   generic env requirements, runtime capability validation, the OpenAI `/v1`
   façade, single OCI image output.
 - **Not yet**: image-based MCP tools, evals, lock file / SBOM / signing,
-  agentpack, `extends`/patches, knowledge/RAG, memory/state, model fallback,
+  agentpack, `extends`/patches, knowledge/RAG runtime providers, memory/state runtime providers, model fallback,
   streaming, and embedded/BYO serving targets.
 
 Secrets are never baked: `apiKeyEnv`, tool `env:`, and top-level env

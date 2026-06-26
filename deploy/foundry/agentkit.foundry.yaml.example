@@ -1,0 +1,8 @@
+target: foundry-hosted-agent
+agent: ./agentkitfile.yaml
+image: docker.io/example/agentkit-agent:latest
+protocols:
+  - invocations
+  - responses
+env:
+  TOOLBOX_ENDPOINT: ${FOUNDRY_PROJECT_ENDPOINT}/toolboxes/${TOOLBOX_NAME}/mcp?api-version=v1

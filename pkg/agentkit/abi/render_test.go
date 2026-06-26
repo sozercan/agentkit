@@ -164,3 +164,71 @@ func TestRenderAgentYAMLIncludesEnvRequirements(t *testing.T) {
 		t.Fatalf("optional env vars should omit required: false\n---\n%s", s)
 	}
 }
+
+func TestRenderAgentYAMLIncludesRemoteMCPTool(t *testing.T) {
+	cfg := sampleConfig()
+	cfg.Tools = []config.Tool{{
+		Name:      "toolbox",
+		Type:      config.ToolTypeMCP,
+		Transport: config.ToolTransportStreamableHTTP,
+		URLEnv:    "TOOLBOX_ENDPOINT",
+		Headers: []config.ToolHeader{{
+			Name:  "Foundry-Features",
+			Value: "Toolboxes=V1Preview",
+		}},
+		Auth: &config.Auth{Type: config.AuthTypeBearer, TokenEnv: "TOOLBOX_TOKEN"},
+	}}
+	out, err := Render(effective.FromConfig(cfg, testInstructions))
+	if err != nil {
+		t.Fatalf("render error: %v", err)
+	}
+
+	s := string(out)
+	for _, want := range []string{
+		"type: mcp",
+		"transport: streamable-http",
+		"urlEnv: TOOLBOX_ENDPOINT",
+		"name: Foundry-Features",
+		"value: Toolboxes=V1Preview",
+		"auth:",
+		"type: bearer",
+		"tokenEnv: TOOLBOX_TOKEN",
+	} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("rendered agent.yaml missing %q\n---\n%s", want, s)
+		}
+	}
+}
+
+func TestRenderAgentYAMLIncludesContextAndObservability(t *testing.T) {
+	cfg := sampleConfig()
+	cfg.Context.Providers = []config.ContextProvider{{
+		Name:        "knowledge",
+		Type:        config.ContextTypeSearch,
+		EndpointEnv: "SEARCH_ENDPOINT",
+		IndexEnv:    "SEARCH_INDEX",
+	}}
+	cfg.Observability.OTel.EndpointEnv = "OTEL_EXPORTER_OTLP_ENDPOINT"
+	cfg.Observability.Logs.LevelEnv = "LOG_LEVEL"
+	out, err := Render(effective.FromConfig(cfg, testInstructions))
+	if err != nil {
+		t.Fatalf("render error: %v", err)
+	}
+
+	s := string(out)
+	for _, want := range []string{
+		"context:",
+		"providers:",
+		"name: knowledge",
+		"type: search",
+		"endpointEnv: SEARCH_ENDPOINT",
+		"indexEnv: SEARCH_INDEX",
+		"observability:",
+		"endpointEnv: OTEL_EXPORTER_OTLP_ENDPOINT",
+		"levelEnv: LOG_LEVEL",
+	} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("rendered agent.yaml missing %q\n---\n%s", want, s)
+		}
+	}
+}

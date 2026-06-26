@@ -19,10 +19,11 @@ dependencies = [
     "uvicorn[standard]>=0.29",
     "pydantic>=2.7",
     "pyyaml>=6.0",
+    "httpx>=0.28",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "httpx>=0.28", "httpx2>=0.1"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["agentkit_serve_common"]

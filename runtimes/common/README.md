@@ -8,10 +8,14 @@ The framework-neutral core shared by AgentKit's runtime adapters
   (`docs/agent-abi.md`) plus secret-free required-env validation.
 - `server.py` — the non-streaming OpenAI `/v1` Chat-Completions facade (the 400
   guards, the Bearer auth gate, the single-`chat.completion` assembly).
+- `foundry.py` — reusable Foundry Hosted Agent protocol wrapper for `/readiness`,
+  `/invocations`, and minimal non-streaming `/responses`.
 - `cli.py` — the CLI entry point + network posture (loopback default; `0.0.0.0`
   requires `AGENTKIT_AUTH_TOKEN`).
 - `runtime.py` — the **neutral run contract**: `RunResult`, `AgentRunError`,
   `RuntimeSession`, and the `RuntimeFactory` protocol each adapter implements.
+- `adapter_support.py` — cross-runtime env, auth, remote MCP header, and error
+  normalization helpers.
 
 ## The seam
 

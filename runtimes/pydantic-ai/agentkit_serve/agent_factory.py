@@ -32,16 +32,30 @@ try:  # pydantic-ai 1.x
     from pydantic_ai.mcp import MCPServerStdio
 except ImportError:  # pydantic-ai 2.x
     MCPServerStdio = None  # type: ignore[assignment]
-    from pydantic_ai.mcp import MCPToolset, StdioTransport
+
+try:
+    from pydantic_ai.mcp import MCPToolset
+except ImportError:  # pragma: no cover - older pydantic-ai without MCPToolset
+    MCPToolset = None  # type: ignore[assignment]
+
+try:
+    from fastmcp.client.transports.stdio import StdioTransport
+    from fastmcp.client.transports.http import StreamableHttpTransport
+except ImportError:  # pragma: no cover - older dependency set without FastMCP transports
+    StdioTransport = None  # type: ignore[assignment]
+    StreamableHttpTransport = None  # type: ignore[assignment]
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from agentkit_serve_common.adapter_support import (
     FORWARDED_ROLES,
+    AgentBuildError,
     declared_tool_env,
     normalize_agent_run_error,
     positive_float_env,
     resolve_api_key,
+    resolve_tool_url,
+    same_origin_mcp_httpx_client_factory,
     split_tool_command,
 )
 from agentkit_serve_common.config import AgentSpec, ToolSpec
@@ -70,12 +84,26 @@ def build_model(spec: AgentSpec) -> OpenAIChatModel:
 
 
 def build_tool_server(tool: ToolSpec) -> Any:
-    """Create a stdio MCP toolset for one tool spec."""
+    """Create an MCP toolset for one stdio or Streamable HTTP tool spec."""
+    timeout = _mcp_init_timeout()
+
+    if tool.url_env:
+        url = resolve_tool_url(tool)
+        if MCPToolset is None or StreamableHttpTransport is None:
+            raise AgentBuildError(
+                f"tool {tool.name!r} requires streamable-http MCP, but this pydantic-ai "
+                "build does not expose a Streamable HTTP MCP transport"
+            )
+        transport = StreamableHttpTransport(
+            url,
+            httpx_client_factory=same_origin_mcp_httpx_client_factory(tool, url, timeout=timeout),
+        )
+        return MCPToolset(transport, init_timeout=timeout, read_timeout=timeout).prefixed(tool.name)
+
     command, args = split_tool_command(tool, example='["npx", "-y", "..."]')
 
     # Generous init timeout: a cold uvx/npx tool installs its package before
     # speaking MCP, which exceeds pydantic-ai's 5s default (see above).
-    timeout = _mcp_init_timeout()
     env = declared_tool_env(tool)
 
     if MCPServerStdio is not None:
@@ -87,6 +115,9 @@ def build_tool_server(tool: ToolSpec) -> Any:
             # tool_prefix namespaces tool names so two servers can't collide.
             tool_prefix=tool.name,
         )
+
+    if MCPToolset is None or StdioTransport is None:
+        raise AgentBuildError("this pydantic-ai build does not expose an MCP stdio transport")
 
     # pydantic-ai 2.x replaced MCPServerStdio with a transport + toolset pair.
     # Prefixing moved to Toolset.prefixed(...), preserving the same namespacing

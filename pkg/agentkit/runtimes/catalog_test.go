@@ -121,9 +121,17 @@ func TestRuntimeCapabilities(t *testing.T) {
 		if !rt.HasCapability(CapabilityStdioMCP) {
 			t.Errorf("runtime %q should support current v0 stdio MCP tools", rt.Name)
 		}
-		missing := rt.MissingCapabilities([]string{CapabilityStdioMCP, CapabilityStreamableHTTPMCP})
-		if len(missing) != 1 || missing[0] != CapabilityStreamableHTTPMCP {
-			t.Errorf("runtime %q MissingCapabilities = %v, want [%s]", rt.Name, missing, CapabilityStreamableHTTPMCP)
+		for _, required := range []string{CapabilityStdioMCP, CapabilityStreamableHTTPMCP} {
+			if !rt.HasCapability(required) {
+				t.Errorf("runtime %q should support %s", rt.Name, required)
+			}
+		}
+		if rt.Name == MAF && !rt.HasCapability(CapabilityWorkloadIdentityTokenAuth) {
+			t.Errorf("runtime %q should support %s", rt.Name, CapabilityWorkloadIdentityTokenAuth)
+		}
+		missing := rt.MissingCapabilities([]string{CapabilityStdioMCP, CapabilityToolApproval})
+		if len(missing) != 1 || missing[0] != CapabilityToolApproval {
+			t.Errorf("runtime %q MissingCapabilities = %v, want [%s]", rt.Name, missing, CapabilityToolApproval)
 		}
 	}
 }

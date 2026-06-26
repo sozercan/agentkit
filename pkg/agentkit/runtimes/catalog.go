@@ -46,6 +46,7 @@ const (
 	CapabilityWorkloadIdentityTokenAuth = "workload-identity-token-auth"
 	CapabilityModelWorkloadIdentityAuth = "model-workload-identity-auth"
 	CapabilityOTelExport                = "otel-export"
+	CapabilityToolApproval              = "tool-approval"
 )
 
 // RuntimeSpec is the complete declaration of one runtime adapter.
@@ -91,18 +92,18 @@ func (rt RuntimeSpec) MissingCapabilities(requested []string) []string {
 var Runtimes = []RuntimeSpec{
 	{
 		Name:              PydanticAI,
-		Capabilities:      []string{CapabilityStdioMCP},
+		Capabilities:      []string{CapabilityStdioMCP, CapabilityStreamableHTTPMCP},
 		DefaultAdapterRef: "ghcr.io/sozercan/agentkit/serve-pydantic-ai:latest",
 	},
 	{
 		Name:              MAF,
 		Aliases:           []string{MAFAlias}, // "maf" → "microsoft-agent-framework"
-		Capabilities:      []string{CapabilityStdioMCP},
+		Capabilities:      []string{CapabilityStdioMCP, CapabilityStreamableHTTPMCP, CapabilityWorkloadIdentityTokenAuth},
 		DefaultAdapterRef: "ghcr.io/sozercan/agentkit/serve-maf:latest",
 	},
 	{
 		Name:              LangGraph,
-		Capabilities:      []string{CapabilityStdioMCP},
+		Capabilities:      []string{CapabilityStdioMCP, CapabilityStreamableHTTPMCP},
 		DefaultAdapterRef: "ghcr.io/sozercan/agentkit/serve-langgraph:latest",
 	},
 }

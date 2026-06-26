@@ -10,4 +10,5 @@ apiVersion: v1alpha1
 runtime: pydantic-ai
 capabilities:
   - stdio-mcp
+  - streamable-http-mcp
 adapter: ghcr.io/sozercan/agentkit/serve-pydantic-ai:latest

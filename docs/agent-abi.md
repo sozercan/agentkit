@@ -31,10 +31,31 @@ model:
 instructions: |                  # fully-resolved system prompt (inline OR file contents)
   Summarize any URL the user gives you in three bullet points.
 
-tools:                           # MCP servers, stdio transport (v0)
+tools:                           # MCP servers: stdio or Streamable HTTP remote
   - name: fetch
     command: ["npx", "-y", "@modelcontextprotocol/server-fetch"]
     env: ["FETCH_TIMEOUT"]       # NAMES only; serve passes ONLY these into the subprocess env
+  - name: toolbox
+    type: mcp
+    transport: streamable-http
+    urlEnv: TOOLBOX_ENDPOINT
+    headers:
+      - name: Foundry-Features
+        value: Toolboxes=V1Preview
+    auth:
+      type: bearer
+      tokenEnv: TOOLBOX_TOKEN
+
+context:                         # provider-neutral context schema; runtime capability-gated
+  providers:
+    - name: knowledge
+      type: search
+      endpointEnv: SEARCH_ENDPOINT
+      indexEnv: SEARCH_INDEX
+
+observability:
+  otel:
+    endpointEnv: OTEL_EXPORTER_OTLP_ENDPOINT
 
 env:                             # optional runtime env requirements; values are never baked
   - name: REQUIRED_FOO
@@ -54,10 +75,13 @@ expose:
    env var(s).
 3. Construct an OpenAI-compatible model client pointed at `model.baseURL`, using
    model `model.name` and the API key from `os.environ[model.apiKeyEnv]`.
-4. For each tool, spawn a stdio MCP subprocess from `command`, passing **only**
+4. For each stdio tool, spawn an MCP subprocess from `command`, passing **only**
    the env vars NAMED in that tool's `env:` list (plan §10 secret-bleed rule) —
-   never the full container environment.
-5. Serve:
+   never the full container environment. For each remote MCP tool, resolve
+   `urlEnv`, env-derived headers, and auth at startup with secret-free errors.
+5. Load any `context`/`observability` entries only after config validation has
+   proved the selected runtime declares the required provider-neutral capability.
+6. Serve:
    - `POST /v1/chat/completions` — non-streaming Chat-Completions façade.
      - Reject `stream: true` → HTTP 400.
      - Reject non-empty `tools` / `tool_choice` in the request → HTTP 400
@@ -66,7 +90,7 @@ expose:
        assistant message with `finish_reason: "stop"`.
    - `GET /v1/models` — optional SDK-compatibility listing (returns `model.name`).
    - `GET /healthz` — liveness.
-6. Network posture (plan §10):
+7. Network posture (plan §10):
    - Bind `127.0.0.1` by default.
    - Binding `0.0.0.0` (env `AGENTKIT_BIND=0.0.0.0`) REQUIRES `AGENTKIT_AUTH_TOKEN`;
      requests must then present `Authorization: Bearer <token>`.
@@ -76,6 +100,6 @@ expose:
 
 - Resolve `instructions` (inline string or file contents from the build context)
   into the single `instructions:` scalar — serve never fetches sources.
-- Emit `tools[].command`, `tools[].env`, and optional top-level `env[]`
-  declarations verbatim from the agentkitfile.
+- Emit `tools[]`, optional top-level `env[]`, `context`, and `observability`
+  declarations verbatim from the agentkitfile after validation/defaulting.
 - Never write secret values; only env var NAMES (enforced by config.Validate).

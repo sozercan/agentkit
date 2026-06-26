@@ -21,7 +21,7 @@ dependencies = [
     # lazily imported by agent_framework._mcp and only bundled via the heavy
     # `[all]` extra (which drags in azure/foundry). Declare it directly so stdio
     # MCP tools work without crossing the lock-in boundary. (Verified in M0.)
-    "mcp>=1.24,<2",
+    "mcp>=1.24,<2.0.0a0",
     # The framework-neutral core (ABI loader, /v1 facade, CLI). Brings fastapi,
     # uvicorn, pydantic, pyyaml transitively. Resolved from the sibling path in dev
     # (see [tool.uv.sources]) and COPYed + installed in the Docker image build.

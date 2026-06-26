@@ -41,7 +41,7 @@ from __future__ import annotations
 
 from types import TracebackType
 
-from agent_framework import Agent, MCPStdioTool, Message
+from agent_framework import Agent, MCPStdioTool, MCPStreamableHTTPTool, Message
 from agent_framework.openai import OpenAIChatCompletionClient
 from agentkit_serve_common.adapter_support import (
     FORWARDED_ROLES,
@@ -50,6 +50,9 @@ from agentkit_serve_common.adapter_support import (
     normalize_agent_run_error,
     positive_int_env,
     resolve_api_key,
+    resolve_tool_headers,
+    resolve_tool_url,
+    same_origin_mcp_httpx_client_factory,
     split_tool_command,
     upstream_status_code,
 )
@@ -91,15 +94,49 @@ def _tool_env(tool: ToolSpec) -> dict[str, str]:
     return declared_tool_env(tool)
 
 
-def build_tool(tool: ToolSpec) -> MCPStdioTool:
-    """Create a stdio MCP server for one tool spec.
+def build_tool(tool: ToolSpec):
+    """Create a stdio or Streamable HTTP MCP server for one tool spec.
 
-    ``MCPStdioTool`` is an async context manager (``connect()``/``close()``); the
-    server starts its subprocess once inside the agent's lifespan, mirroring the
-    pydantic-ai adapter's ``async with agent:``.
+    MCP tools are async context managers (``connect()``/``close()``); the server
+    starts once inside the agent's lifespan, mirroring the pydantic-ai adapter's
+    ``async with agent:``.
     """
+    timeout = _mcp_request_timeout()
+    if tool.url_env:
+        from httpx import AsyncClient, URL
+
+        url = resolve_tool_url(tool)
+        target_url = URL(url)
+        target_origin = (target_url.scheme, target_url.host, target_url.port)
+        remote_timeout = float(timeout if timeout is not None else 120)
+
+        async def inject_headers(request):  # noqa: ANN001
+            request_origin = (request.url.scheme, request.url.host, request.url.port)
+            if request_origin != target_origin:
+                return
+            for key, value in resolve_tool_headers(tool).items():
+                request.headers[key] = value
+
+        kwargs: dict[str, object] = {
+            "name": tool.name,
+            "url": url,
+            "tool_name_prefix": tool.name,
+            # Headers must be present during initialize/list-tools and tool calls.
+            # The event hook refreshes workload tokens for each same-origin HTTP
+            # request. Redirect following is disabled so credential-bearing
+            # headers cannot be replayed to another origin.
+            "http_client": AsyncClient(
+                event_hooks={"request": [inject_headers]},
+                follow_redirects=False,
+                timeout=remote_timeout,
+            ),
+            "httpx_client_factory": same_origin_mcp_httpx_client_factory(tool, url, timeout=remote_timeout),
+        }
+        kwargs["request_timeout"] = int(remote_timeout)
+        return MCPStreamableHTTPTool(**kwargs)
+
     command, args = split_tool_command(tool, example='["uvx", "mcp-server-fetch"]')
-    kwargs: dict[str, object] = {
+    kwargs = {
         "name": tool.name,  # the server's identity (used in error messages/spans)
         "command": command,
         "args": args,
@@ -112,7 +149,6 @@ def build_tool(tool: ToolSpec) -> MCPStdioTool:
         # _build_prefixed_mcp_name).
         "tool_name_prefix": tool.name,
     }
-    timeout = _mcp_request_timeout()
     if timeout is not None:
         kwargs["request_timeout"] = timeout
     return MCPStdioTool(**kwargs)
