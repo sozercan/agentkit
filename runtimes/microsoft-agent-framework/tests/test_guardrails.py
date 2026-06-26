@@ -261,12 +261,9 @@ def test_build_client_uses_foundry_for_model_workload_identity(monkeypatch):
     assert isinstance(calls["credential"], FakeCredential)
 
 
-def test_build_agent_adds_filesystem_skills_provider(tmp_path):
+def test_build_agent_adds_filesystem_skills_provider():
     from agentkit_serve_common.config import AgentSpec
 
-    skill_dir = tmp_path / "skills" / "support-style"
-    skill_dir.mkdir(parents=True)
-    (skill_dir / "SKILL.md").write_text("---\nname: support-style\ndescription: Test skill.\n---\n# Skill\n", encoding="utf-8")
     spec = AgentSpec.model_validate({
         "abiVersion": "v0",
         "metadata": {"name": "x"},
@@ -277,7 +274,7 @@ def test_build_agent_adds_filesystem_skills_provider(tmp_path):
         },
         "instructions": "hi",
         "tools": [],
-        "context": {"providers": [{"type": "skills", "source": "filesystem", "path": str(skill_dir.parent)}]},
+        "context": {"providers": [{"type": "skills", "source": "filesystem", "path": "/agent/skills"}]},
         "expose": {"openai": True, "port": 8080},
     })
     runtime = agent_factory.MAFRuntime(spec)
@@ -370,7 +367,7 @@ def test_build_agent_adds_search_context_provider(monkeypatch):
 
     assert providers is not None
     assert providers[0].__class__.__name__ == "FakeSearchProvider"
-    assert calls["source_id"] == "knowledge"
+    assert "source_id" not in calls
     assert calls["endpoint"] == "https://example.search.windows.net"
     assert calls["index_name"] == "kb"
     assert calls["credential"] == "credential"
@@ -531,3 +528,36 @@ def test_context_credential_uses_async_default_for_search(monkeypatch):
     )
 
     assert isinstance(credential, FakeAsyncCredential)
+
+
+def test_build_client_uses_generic_workload_identity_hook_for_model(monkeypatch):
+    from agentkit_serve_common.config import AgentSpec
+
+    calls = {}
+
+    class FakeOpenAIClient:
+        def __init__(self, **kwargs):
+            calls.update(kwargs)
+
+    monkeypatch.setattr(agent_factory, "OpenAIChatCompletionClient", FakeOpenAIClient)
+    monkeypatch.setattr(agent_factory, "resolve_workload_identity_token", lambda audience: f"token-for-{audience}")
+    monkeypatch.delenv("AGENTKIT_MODEL_WORKLOAD_IDENTITY_TOKEN", raising=False)
+    monkeypatch.setenv("AGENTKIT_WORKLOAD_IDENTITY_TOKEN_COMMAND", "/bin/token")
+    spec = AgentSpec.model_validate({
+        "abiVersion": "v0",
+        "metadata": {"name": "x"},
+        "model": {
+            "provider": "openai-compatible",
+            "baseURL": "https://example.services.ai.azure.com/api/projects/proj/openai/v1",
+            "name": "gpt-4.1-mini",
+            "auth": {"type": "workload-identity-token", "audience": "https://ai.azure.com/.default"},
+        },
+        "instructions": "hi",
+        "tools": [],
+        "expose": {"openai": True, "port": 8080},
+    })
+
+    client = agent_factory.build_client(spec)
+
+    assert isinstance(client, FakeOpenAIClient)
+    assert calls["api_key"] == "token-for-https://ai.azure.com/.default"

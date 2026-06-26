@@ -99,7 +99,7 @@ expose:
 | `instructions` | yes | Fully-resolved system prompt scalar. |
 | `tools` | no | Owned MCP tools, either stdio or Streamable HTTP. |
 | `env` | no | Runtime env var requirements by name only. |
-| `context` | no | Provider-neutral context providers; runtime capability-gated. |
+| `context` | no | Provider-neutral context providers; runtime capability-gated. Filesystem skills paths must be pre-staged under `/agent/skills`; arbitrary build-context directories are not copied into the image. |
 | `observability` | no | Provider-neutral observability env names; runtime capability-gated. |
 | `expose` | yes | Serving surface and port. |
 

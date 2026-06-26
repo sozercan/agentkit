@@ -25,6 +25,11 @@ _SECRET_VALUE_PREFIXES = ("sk-", "sk_", "ghp_", "github_pat_", "xoxb-", "AKIA")
 _TOOL_TYPE_MCP = "mcp"
 _TRANSPORT_STDIO = "stdio"
 _TRANSPORT_STREAMABLE_HTTP = "streamable-http"
+_CONTEXT_TYPE_SEARCH = "search"
+_CONTEXT_TYPE_SKILLS = "skills"
+_CONTEXT_TYPE_MEMORY = "memory"
+_CONTEXT_SOURCE_FILESYSTEM = "filesystem"
+_CONTEXT_SOURCE_MCP = "mcp"
 _AUTH_BEARER = "bearer"
 _AUTH_WORKLOAD_IDENTITY = "workload-identity-token"
 _APPROVAL_VALUES = {"never", "auto", "always"}
@@ -258,9 +263,15 @@ class ContextProviderSpec(_Strict):
         return _validate_env_name(value, field="context.providers[].env")
 
     @model_validator(mode="after")
-    def _context_auth_supported(self) -> "ContextProviderSpec":
+    def _valid_context_provider_shape(self) -> "ContextProviderSpec":
         if self.auth is not None and self.auth.type == _AUTH_BEARER:
             raise ValueError("context providers do not support bearer auth; use workload-identity-token")
+        if self.type == _CONTEXT_TYPE_SKILLS and self.source == _CONTEXT_SOURCE_FILESYSTEM:
+            if not self.path:
+                raise ValueError("filesystem skills require path")
+            normalized = str(Path(self.path))
+            if normalized != "/agent/skills" and not normalized.startswith("/agent/skills/"):
+                raise ValueError("filesystem skills path must be an absolute path under /agent/skills")
         return self
 
 
@@ -347,6 +358,20 @@ class AgentSpec(_Strict):
             names = ", ".join(sorted(set(duplicates)))
             raise ValueError(f"duplicate env var declarations: {names}")
         return value
+
+    @model_validator(mode="after")
+    def _valid_context_tool_refs(self) -> "AgentSpec":
+        tools = {tool.name: tool for tool in self.tools}
+        for provider in self.context.providers:
+            if provider.type == _CONTEXT_TYPE_SKILLS and provider.source == _CONTEXT_SOURCE_MCP:
+                if not provider.tool_ref:
+                    raise ValueError("MCP skills require toolRef")
+                tool = tools.get(provider.tool_ref)
+                if tool is None:
+                    raise ValueError(f"MCP skills toolRef {provider.tool_ref!r} references unknown tool")
+                if not tool.url_env or tool.transport != _TRANSPORT_STREAMABLE_HTTP:
+                    raise ValueError(f"MCP skills toolRef {provider.tool_ref!r} must reference a streamable-http MCP tool")
+        return self
 
 
 class ConfigError(Exception):

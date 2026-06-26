@@ -163,7 +163,12 @@ def build_client(spec: AgentSpec):
     """Construct the chat client for the configured model auth mode."""
     auth = spec.model.auth
     if auth is not None and auth.type == _AUTH_WORKLOAD_IDENTITY:
-        if token := os.environ.get("AGENTKIT_MODEL_WORKLOAD_IDENTITY_TOKEN"):
+        if (
+            os.environ.get("AGENTKIT_MODEL_WORKLOAD_IDENTITY_TOKEN")
+            or os.environ.get("AGENTKIT_WORKLOAD_IDENTITY_TOKEN")
+            or os.environ.get("AGENTKIT_WORKLOAD_IDENTITY_TOKEN_COMMAND")
+        ):
+            token = os.environ.get("AGENTKIT_MODEL_WORKLOAD_IDENTITY_TOKEN") or resolve_workload_identity_token(auth.audience or _DEFAULT_FOUNDRY_AUDIENCE)
             return OpenAIChatCompletionClient(
                 model=spec.model.name,
                 base_url=spec.model.base_url,
@@ -334,7 +339,6 @@ class MAFRuntime:
         if callable(close):
             self.stack.push_async_callback(close)
         return search_provider(
-            source_id=provider.name or "search",
             endpoint=endpoint,
             index_name=index,
             credential=credential,

@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -191,6 +192,8 @@ func validateContext(add func(string, ...any), ctx Context, tools []Tool) {
 			case ContextSourceFilesystem:
 				if provider.Path == "" {
 					add("%s.path is required for filesystem skills", path)
+				} else if !isAgentSkillsPath(provider.Path) {
+					add("%s.path %q must be an absolute path under /agent/skills; AgentKit does not copy arbitrary filesystem skill directories into images", path, provider.Path)
 				}
 			case ContextSourceMCP:
 				if provider.ToolRef == "" {
@@ -213,6 +216,11 @@ func validateContext(add func(string, ...any), ctx Context, tools []Tool) {
 			add("%s.type %q is not supported (expected search, skills, or memory)", path, provider.Type)
 		}
 	}
+}
+
+func isAgentSkillsPath(path string) bool {
+	clean := filepath.Clean(path)
+	return clean == "/agent/skills" || strings.HasPrefix(clean, "/agent/skills/")
 }
 
 func validateContextAuth(add func(string, ...any), path string, auth *Auth) {

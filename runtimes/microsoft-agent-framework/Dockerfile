@@ -66,7 +66,7 @@ RUN python -m venv /opt/agentkit \
 # --- non-root user + agent config mount point --------------------------------
 # uid 1000 owns /agent so a writer/runtime can place agent.yaml there.
 RUN useradd --uid 1000 --create-home --shell /usr/sbin/nologin agentkit \
-    && mkdir -p /agent \
+    && mkdir -p /agent/skills \
     && chown -R 1000:1000 /agent /opt/agentkit
 
 # Loopback-only by default; binding 0.0.0.0 requires AGENTKIT_AUTH_TOKEN (§10).

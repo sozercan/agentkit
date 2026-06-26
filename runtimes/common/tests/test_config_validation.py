@@ -304,3 +304,35 @@ def test_load_rejects_bearer_auth_for_context_provider(tmp_path):
         load(_write_spec(tmp_path, spec_dict))
 
     assert "context providers do not support bearer auth" in str(exc.value)
+
+
+def test_load_rejects_relative_filesystem_skills_path(tmp_path):
+    spec_dict = deepcopy(_BASE_SPEC)
+    spec_dict["context"] = {
+        "providers": [{"type": "skills", "source": "filesystem", "path": "./skills"}]
+    }
+
+    with pytest.raises(ConfigError) as exc:
+        load(_write_spec(tmp_path, spec_dict))
+
+    assert "/agent/skills" in str(exc.value)
+
+
+def test_load_rejects_mcp_skills_unknown_tool_ref(tmp_path):
+    spec_dict = deepcopy(_BASE_SPEC)
+    spec_dict["tools"] = [
+        {
+            "name": "toolbox",
+            "type": "mcp",
+            "transport": "streamable-http",
+            "urlEnv": "TOOLBOX_ENDPOINT",
+        }
+    ]
+    spec_dict["context"] = {
+        "providers": [{"type": "skills", "source": "mcp", "toolRef": "missing"}]
+    }
+
+    with pytest.raises(ConfigError) as exc:
+        load(_write_spec(tmp_path, spec_dict))
+
+    assert "references unknown tool" in str(exc.value)
