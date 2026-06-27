@@ -348,3 +348,14 @@ def test_load_rejects_escaped_filesystem_skills_path(tmp_path):
         load(_write_spec(tmp_path, spec_dict))
 
     assert "/agent/skills" in str(exc.value)
+
+
+def test_load_rejects_model_bearer_auth(tmp_path):
+    spec_dict = deepcopy(_BASE_SPEC)
+    spec_dict["model"].pop("apiKeyEnv", None)
+    spec_dict["model"]["auth"] = {"type": "bearer", "tokenEnv": "MODEL_TOKEN"}
+
+    with pytest.raises(ConfigError) as exc:
+        load(_write_spec(tmp_path, spec_dict))
+
+    assert "model.auth supports only workload-identity-token" in str(exc.value)

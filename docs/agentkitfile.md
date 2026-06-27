@@ -196,7 +196,8 @@ context:
 
 AgentKit does not copy arbitrary local skill directories into the image. If you
 use filesystem skills, stage them under `/agent/skills` in the runtime/deployment
-image or prefer MCP-backed skills.
+image or prefer MCP-backed skills. Memory providers require an explicit
+`AGENTKIT_MEMORY_SCOPE` runtime env var; choose a per-user/session-safe scope.
 
 ### `expose`
 

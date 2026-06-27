@@ -318,7 +318,8 @@ def test_build_client_uses_env_token_for_model_workload_identity_standalone(monk
     client = agent_factory.build_client(spec)
 
     assert isinstance(client, FakeOpenAIClient)
-    assert calls["api_key"] == "token"
+    import asyncio
+    assert asyncio.run(calls["api_key"]()) == "token"
     assert calls["base_url"].endswith("/openai/v1")
 
 
@@ -393,6 +394,7 @@ def test_build_agent_adds_memory_context_provider(monkeypatch):
     monkeypatch.setattr(agent_factory, "_credential_for_context", lambda provider, default_audience, async_credential=False: "credential")
     monkeypatch.setenv("MEMORY_ENDPOINT", "https://example.services.ai.azure.com/api/projects/proj")
     monkeypatch.setenv("MEMORY_STORE_NAME", "agentkit-memory")
+    monkeypatch.setenv("AGENTKIT_MEMORY_SCOPE", "scope-1")
     spec = AgentSpec.model_validate({
         "abiVersion": "v0",
         "metadata": {"name": "x"},
@@ -423,7 +425,7 @@ def test_build_agent_adds_memory_context_provider(monkeypatch):
     assert calls["project_endpoint"] == "https://example.services.ai.azure.com/api/projects/proj"
     assert calls["memory_store_name"] == "agentkit-memory"
     assert calls["credential"] == "credential"
-    assert calls["scope"] == "memory"
+    assert calls["scope"] == "scope-1"
     assert calls["update_delay"] == 0
 
 
@@ -434,7 +436,7 @@ def test_runtime_reuses_sessions_by_request_session_id(monkeypatch):
 
     seen_sessions = []
 
-    async def fake_run_agent(agent, request, *, session=None):
+    async def fake_run_agent(agent, request, *, session=None, include_history=True):
         seen_sessions.append(session)
         return RunResult(text="ok")
 
@@ -466,7 +468,7 @@ def test_runtime_session_cache_is_bounded(monkeypatch):
     from agentkit_serve_common.conversation import RunRequest
     from agentkit_serve_common.runtime import RunResult
 
-    async def fake_run_agent(agent, request, *, session=None):
+    async def fake_run_agent(agent, request, *, session=None, include_history=True):
         return RunResult(text=session.session_id if session else "none")
 
     monkeypatch.setattr(agent_factory, "run_agent", fake_run_agent)
@@ -560,4 +562,86 @@ def test_build_client_uses_generic_workload_identity_hook_for_model(monkeypatch)
     client = agent_factory.build_client(spec)
 
     assert isinstance(client, FakeOpenAIClient)
-    assert calls["api_key"] == "token-for-https://ai.azure.com/.default"
+    import asyncio
+    assert asyncio.run(calls["api_key"]()) == "token-for-https://ai.azure.com/.default"
+
+
+def test_memory_context_requires_explicit_scope(monkeypatch):
+    from agentkit_serve_common.config import AgentSpec
+
+    class FakeMemoryProvider:
+        def __init__(self, **kwargs):
+            pass
+
+    class FakeModule:
+        FoundryMemoryProvider = FakeMemoryProvider
+
+    monkeypatch.setattr(agent_factory.importlib, "import_module", lambda name: FakeModule)
+    monkeypatch.setattr(agent_factory, "_credential_for_context", lambda provider, default_audience, async_credential=False: "credential")
+    monkeypatch.setenv("MEMORY_ENDPOINT", "https://example.services.ai.azure.com/api/projects/proj")
+    monkeypatch.setenv("MEMORY_STORE_NAME", "agentkit-memory")
+    monkeypatch.delenv("AGENTKIT_MEMORY_SCOPE", raising=False)
+    spec = AgentSpec.model_validate({
+        "abiVersion": "v0",
+        "metadata": {"name": "x"},
+        "model": {"provider": "openai-compatible", "baseURL": "https://api.openai.com/v1", "name": "gpt-4o-mini"},
+        "instructions": "hi",
+        "tools": [],
+        "context": {"providers": [{"type": "memory", "endpointEnv": "MEMORY_ENDPOINT", "storeNameEnv": "MEMORY_STORE_NAME"}]},
+        "expose": {"openai": True, "port": 8080},
+    })
+    runtime = agent_factory.MAFRuntime(spec)
+
+    import asyncio
+    import pytest
+    with pytest.raises(agent_factory.AgentBuildError, match="AGENTKIT_MEMORY_SCOPE"):
+        asyncio.run(runtime._build_context_providers())
+
+
+def test_reused_session_does_not_duplicate_explicit_history(monkeypatch):
+    from agentkit_serve_common.config import AgentSpec
+    from agentkit_serve_common.conversation import ConversationTurn, RunRequest
+    from agentkit_serve_common.runtime import RunResult
+
+    include_history_values = []
+
+    async def fake_run_agent(agent, request, *, session=None, include_history=True):
+        include_history_values.append(include_history)
+        return RunResult(text="ok")
+
+    monkeypatch.setattr(agent_factory, "run_agent", fake_run_agent)
+    spec = AgentSpec.model_validate({
+        "abiVersion": "v0",
+        "metadata": {"name": "x"},
+        "model": {"provider": "openai-compatible", "baseURL": "https://api.openai.com/v1", "name": "gpt-4o-mini"},
+        "instructions": "hi",
+        "tools": [],
+        "expose": {"openai": True, "port": 8080},
+    })
+    runtime = agent_factory.MAFRuntime(spec)
+    runtime.agent = object()
+    request = RunRequest(
+        prompt="current",
+        history=(ConversationTurn(role="user", text="old"),),
+        session_id="s1",
+    )
+
+    import asyncio
+    asyncio.run(runtime.run(request))
+    asyncio.run(runtime.run(request))
+
+    assert include_history_values == [True, False]
+
+
+def test_remote_mcp_disables_ping(monkeypatch):
+    tool = ToolSpec.model_validate({
+        "name": "toolbox",
+        "type": "mcp",
+        "transport": "streamable-http",
+        "urlEnv": "TOOLBOX_ENDPOINT",
+    })
+    monkeypatch.setenv("TOOLBOX_ENDPOINT", "https://example.test/mcp")
+
+    mcp_tool = agent_factory.build_tool(tool)
+
+    assert getattr(mcp_tool, "_ping_available") is False

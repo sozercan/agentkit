@@ -159,6 +159,30 @@ def _session_cache_max() -> int:
     return positive_int_env("AGENTKIT_SESSION_CACHE_MAX", default=_DEFAULT_SESSION_CACHE_MAX) or _DEFAULT_SESSION_CACHE_MAX
 
 
+def _memory_scope() -> str:
+    value = os.environ.get("AGENTKIT_MEMORY_SCOPE")
+    if not value:
+        raise AgentBuildError(
+            "memory context provider requires AGENTKIT_MEMORY_SCOPE; choose a per-user/session-safe scope"
+        )
+    return value
+
+
+def _model_workload_api_key_provider(audience: str):
+    async def _provider() -> str:
+        explicit = os.environ.get("AGENTKIT_MODEL_WORKLOAD_IDENTITY_TOKEN")
+        if explicit:
+            return explicit
+        return await asyncio.to_thread(resolve_workload_identity_token, audience)
+
+    return _provider
+
+
+def _disable_mcp_ping(mcp_tool: object) -> None:
+    if hasattr(mcp_tool, "_ping_available"):
+        setattr(mcp_tool, "_ping_available", False)
+
+
 def build_client(spec: AgentSpec):
     """Construct the chat client for the configured model auth mode."""
     auth = spec.model.auth
@@ -168,11 +192,10 @@ def build_client(spec: AgentSpec):
             or os.environ.get("AGENTKIT_WORKLOAD_IDENTITY_TOKEN")
             or os.environ.get("AGENTKIT_WORKLOAD_IDENTITY_TOKEN_COMMAND")
         ):
-            token = os.environ.get("AGENTKIT_MODEL_WORKLOAD_IDENTITY_TOKEN") or resolve_workload_identity_token(auth.audience or _DEFAULT_FOUNDRY_AUDIENCE)
             return OpenAIChatCompletionClient(
                 model=spec.model.name,
                 base_url=spec.model.base_url,
-                api_key=token,
+                api_key=_model_workload_api_key_provider(auth.audience or _DEFAULT_FOUNDRY_AUDIENCE),
             )
         try:
             from agent_framework.foundry import FoundryChatClient
@@ -229,7 +252,12 @@ def build_tool(tool: ToolSpec):
             ),
         }
         kwargs["request_timeout"] = int(remote_timeout)
-        return MCPStreamableHTTPTool(**kwargs)
+        mcp_tool = MCPStreamableHTTPTool(**kwargs)
+        # Some Streamable HTTP MCP services, including Foundry Toolbox, do not
+        # implement MCP ping. The framework handles request-time connection
+        # errors separately, so skip proactive pings for remote HTTP tools.
+        _disable_mcp_ping(mcp_tool)
+        return mcp_tool
 
     command, args = split_tool_command(tool, example='["uvx", "mcp-server-fetch"]')
     kwargs = {
@@ -291,19 +319,21 @@ class MAFRuntime:
     async def run(self, request: RunRequest) -> RunResult:
         if self.agent is None:
             raise AgentBuildError("MAF runtime session is not initialized")
-        session = self._session_for(request.session_id)
-        return await run_agent(self.agent, request, session=session)
+        session, existed = self._session_for(request.session_id)
+        include_history = not (session is not None and existed)
+        return await run_agent(self.agent, request, session=session, include_history=include_history)
 
-    def _session_for(self, session_id: str | None) -> AgentSession | None:
+    def _session_for(self, session_id: str | None) -> tuple[AgentSession | None, bool]:
         if not session_id:
-            return None
+            return None, False
         session = self.sessions.pop(session_id, None)
+        existed = session is not None
         if session is None:
             session = AgentSession(session_id=session_id)
         self.sessions[session_id] = session
         while len(self.sessions) > self.session_cache_max:
             self.sessions.pop(next(iter(self.sessions)))
-        return session
+        return session, existed
 
     async def _build_context_providers(self):
         providers = []
@@ -360,7 +390,7 @@ class MAFRuntime:
             project_endpoint=endpoint,
             credential=_credential_for_context(provider, default_audience=_DEFAULT_FOUNDRY_AUDIENCE),
             memory_store_name=store_name,
-            scope=os.environ.get("AGENTKIT_MEMORY_SCOPE") or provider.name or "default",
+            scope=_memory_scope(),
             update_delay=_memory_update_delay(),
         )
 
@@ -422,19 +452,26 @@ def _result_usage(result: object) -> dict[str, int]:
     }
 
 
-def _to_messages(request: RunRequest) -> list[Message]:
+def _to_messages(request: RunRequest, *, include_history: bool = True) -> list[Message]:
     """Map a neutral RunRequest to MAF messages."""
     messages: list[Message] = []
-    for turn in request.history:
-        if turn.role in FORWARDED_ROLES and turn.text:
-            messages.append(Message(role=turn.role, contents=[turn.text]))
+    if include_history:
+        for turn in request.history:
+            if turn.role in FORWARDED_ROLES and turn.text:
+                messages.append(Message(role=turn.role, contents=[turn.text]))
     messages.append(Message(role="user", contents=[request.prompt]))
     return messages
 
 
-async def run_agent(agent: Agent, request: RunRequest, *, session: AgentSession | None = None) -> RunResult:
+async def run_agent(
+    agent: Agent,
+    request: RunRequest,
+    *,
+    session: AgentSession | None = None,
+    include_history: bool = True,
+) -> RunResult:
     """Run the MAF agent and return the neutral result shape."""
-    messages = _to_messages(request)
+    messages = _to_messages(request, include_history=include_history)
     try:
         result = await agent.run(messages, session=session)
     except Exception as exc:  # noqa: BLE001 — normalized for the façade

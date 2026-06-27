@@ -139,9 +139,11 @@ context:
         audience: https://ai.azure.com/.default
 ```
 
-The deployment environment supplies the endpoint, index/store name, and identity
-material. Provider-specific provisioning remains in deployment profiles such as
-`deploy/foundry/`; AgentKit core does not add keys like `foundry.memoryStore`.
+The deployment environment supplies the endpoint, index/store name, memory scope,
+and identity material. Memory context providers require an explicit
+`AGENTKIT_MEMORY_SCOPE` so durable memory is not accidentally shared across users
+or sessions. Provider-specific provisioning remains in deployment profiles such
+as `deploy/foundry/`; AgentKit core does not add keys like `foundry.memoryStore`.
 
 
 ## Declare runtime env requirements

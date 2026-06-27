@@ -131,6 +131,12 @@ class ModelSpec(_Strict):
             return value
         return _validate_env_name(value, field="model.apiKeyEnv")
 
+    @model_validator(mode="after")
+    def _model_auth_supported(self) -> "ModelSpec":
+        if self.auth is not None and self.auth.type != _AUTH_WORKLOAD_IDENTITY:
+            raise ValueError("model.auth supports only workload-identity-token")
+        return self
+
 
 class ToolHeaderSpec(_Strict):
     name: str = Field(min_length=1)
