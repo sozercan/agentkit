@@ -430,3 +430,65 @@ def test_orka_terminal_turn_retention_is_bounded():
     assert evicted.status_code == 404
     assert kept.status_code == 200
     assert [frame["type"] for frame in _frames(kept.text)] == ["RuntimeOutput", "TurnCompleted"]
+
+
+class EnvRuntime:
+    def __init__(self, token: str) -> None:
+        self.token = token
+        self.requests: list[RunRequest] = []
+        self.entered = 0
+        self.exited = 0
+
+    async def __aenter__(self) -> RuntimeSession:
+        self.entered += 1
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool | None:
+        self.exited += 1
+        return None
+
+    async def run(self, request: RunRequest) -> RunResult:
+        import os
+
+        self.requests.append(request)
+        return RunResult(text=f"token={self.token};run={os.environ.get('MODEL_TOKEN')}")
+
+
+class EnvFactory:
+    def __init__(self) -> None:
+        self.runtimes: list[EnvRuntime] = []
+
+    def build_runtime(self, spec: AgentSpec) -> RuntimeSession:
+        import os
+
+        token = os.environ["MODEL_TOKEN"]
+        runtime = EnvRuntime(token)
+        self.runtimes.append(runtime)
+        return runtime
+
+
+def test_orka_runtime_build_is_deferred_until_turn_env_is_available(monkeypatch):
+    monkeypatch.delenv("MODEL_TOKEN", raising=False)
+    factory = EnvFactory()
+    app = create_orka_app(_spec(), factory, auth_token="test-token")
+    assert factory.runtimes == []
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(
+            client,
+            turnID="turn-env-build",
+            input={"prompt": "hello", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "turn-token"}]},
+        )
+        frames = _frames(client.get(f"/v1/turns/{turn_id}/events", headers=AUTH).text)
+        assert frames[-1]["type"] == "TurnCompleted"
+        assert frames[-1]["completed"]["result"] == "token=turn-token;run=turn-token"
+
+    assert len(factory.runtimes) == 1
+    assert factory.runtimes[0].entered == 1
+    assert factory.runtimes[0].exited == 1
+    assert "MODEL_TOKEN" not in __import__("os").environ

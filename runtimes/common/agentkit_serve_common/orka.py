@@ -13,10 +13,10 @@ import asyncio
 import json
 import os
 import re
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, Mapping
+from typing import Any, Awaitable, Callable, Mapping
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
@@ -35,6 +35,29 @@ _DEFAULT_MAX_TERMINAL_TURNS = 256
 _MAX_TERMINAL_TURNS_ENV = "AGENTKIT_ORKA_MAX_TERMINAL_TURNS"
 _TURN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+@dataclass
+class ActiveRuntime:
+    context: Any
+    session: Any
+
+
+@contextmanager
+def _scoped_process_env(env: Mapping[str, str]):
+    if not env:
+        yield
+        return
+    old_values: dict[str, str | None] = {name: os.environ.get(name) for name in env}
+    try:
+        os.environ.update(env)
+        yield
+    finally:
+        for name, old_value in old_values.items():
+            if old_value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = old_value
 
 
 def _now_iso() -> str:
@@ -535,7 +558,7 @@ def frame_cancelled(turn: TurnState, seq: int, reason: str = "cancelled") -> dic
 
 
 async def _run_turn(
-    runtime: Any,
+    get_runtime: Callable[[RunRequest], Awaitable[Any]],
     turns: dict[str, TurnState],
     terminal_order: list[str],
     state: TurnState,
@@ -544,14 +567,17 @@ async def _run_turn(
     max_terminal_turns: int,
 ) -> None:
     try:
+        runtime = await get_runtime(run_request)
         if run_request.deadline is None:
-            result = await runtime.run(run_request)
+            with _scoped_process_env(run_request.env):
+                result = await runtime.run(run_request)
         else:
             seconds = (run_request.deadline - datetime.now(UTC)).total_seconds()
             if seconds <= 0:
                 raise TimeoutError("turn deadline has already expired")
             async with asyncio.timeout(seconds):
-                result = await runtime.run(run_request)
+                with _scoped_process_env(run_request.env):
+                    result = await runtime.run(run_request)
     except asyncio.CancelledError:
         await _append_terminal_if_missing(
             state,
@@ -630,19 +656,34 @@ def create_orka_app(
     if not auth_token:
         raise ValueError("Orka mode requires a bearer auth token")
     retention_limit = _max_terminal_turns(max_terminal_turns)
-    runtime = factory.build_runtime(spec)
     turns: dict[str, TurnState] = {}
     terminal_order: list[str] = []
+    active_runtimes: dict[str, ActiveRuntime] = {}
+
+    async def get_runtime(run_request: RunRequest) -> Any:
+        runtime_session_id = run_request.session_id or ""
+        active = active_runtimes.get(runtime_session_id)
+        if active is not None:
+            return active.session
+        with _scoped_process_env(run_request.env):
+            context = factory.build_runtime(spec)
+            session = await context.__aenter__()
+        active_runtimes[runtime_session_id] = ActiveRuntime(context=context, session=session)
+        return session
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        async with runtime:
-            app.state.runtime = runtime
-            app.state.turns = turns
+        app.state.turns = turns
+        app.state.active_runtimes = active_runtimes
+        try:
             yield
+        finally:
             for state in turns.values():
                 if state.task is not None and not state.task.done():
                     state.task.cancel()
+            for active in reversed(list(active_runtimes.values())):
+                await active.context.__aexit__(None, None, None)
+            active_runtimes.clear()
 
     app = FastAPI(title="agentkit-serve-orka", lifespan=lifespan)
     auth = Depends(make_auth_dependency(auth_token))
@@ -683,7 +724,7 @@ def create_orka_app(
         await state.append("TurnStarted", summary="turn started")
         state.task = asyncio.create_task(
             _run_turn(
-                request.app.state.runtime,
+                get_runtime,
                 turns,
                 terminal_order,
                 state,
