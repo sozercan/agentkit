@@ -30,7 +30,7 @@ from typing import NoReturn
 
 import uvicorn
 
-from .config import load_or_exit
+from .config import ConfigError, load, load_or_exit
 from .foundry import create_foundry_app
 from .orka import create_orka_app
 from .runtime import RuntimeFactory
@@ -99,6 +99,17 @@ def _resolve_port(protocol: str, spec_port: int | None) -> int:
     return spec_port or DEFAULT_PORT
 
 
+
+def _load_spec_or_exit(path: str, protocol: str):  # noqa: ANN001
+    if protocol != "orka":
+        return load_or_exit(path)
+    try:
+        return load(path)
+    except ConfigError as exc:
+        print(f"agentkit-serve: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+
+
 def _create_protocol_app(protocol: str, spec, factory: RuntimeFactory, auth_token: str | None):  # noqa: ANN001
     if protocol == "openai":
         return create_app(spec, factory, auth_token=auth_token)
@@ -113,8 +124,8 @@ def run(factory: RuntimeFactory, argv: list[str] | None = None) -> None:
     """Entry point: serve an agent built by ``factory`` (the adapter's module)."""
     args = _parse_args(argv)
 
-    spec = load_or_exit(args.config)
     protocol = _resolve_protocol(args.protocol)
+    spec = _load_spec_or_exit(args.config, protocol)
 
     # --- resolve bind/port ------------------------------------------------
     bind = os.environ.get("AGENTKIT_BIND", "127.0.0.1").strip()

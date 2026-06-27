@@ -258,6 +258,7 @@ def _ensure_terminal_on_task_done(
     terminal_order: list[str],
     turns: dict[str, TurnState],
     max_terminal_turns: int,
+    background_tasks: set[asyncio.Task[None]],
 ) -> None:
     if state.terminal_event is not None:
         return
@@ -274,7 +275,7 @@ def _ensure_terminal_on_task_done(
         summary = "turn failed"
         failed = {"reason": code, "message": message, "retryable": False}
         error = {"code": code, "message": message, "retryable": False}
-    asyncio.create_task(
+    terminal_task = asyncio.create_task(
         _append_terminal_if_missing(
             state,
             terminal_order,
@@ -286,6 +287,8 @@ def _ensure_terminal_on_task_done(
             error=error,
         )
     )
+    background_tasks.add(terminal_task)
+    terminal_task.add_done_callback(background_tasks.discard)
 
 
 def _sse_frame(event: TurnEvent) -> str:
@@ -469,11 +472,26 @@ def _request_to_run_request(data: dict[str, Any], *, turn_id: str, spec: AgentSp
         metadata["contextRefs"] = json.dumps(context_refs, separators=(",", ":"), sort_keys=True)
     _ = (namespace, task_name, session_name)
 
+    env = _env_from_input(input_value, allowed_names=_allowed_turn_env_names(spec))
+    missing_required = []
+    for entry in spec.env:
+        if not entry.required:
+            continue
+        if entry.name in env:
+            if env[entry.name] == "":
+                missing_required.append(entry.name)
+            continue
+        if not os.environ.get(entry.name):
+            missing_required.append(entry.name)
+    if missing_required:
+        names = ", ".join(missing_required)
+        raise HTTPException(status_code=400, detail=f"required env var(s) missing from input.env or process env: {names}")
+
     return RunRequest(
         prompt=prompt,
         history=(),
         session_id=runtime_session_id,
-        env=_env_from_input(input_value, allowed_names=_allowed_turn_env_names(spec)),
+        env=env,
         deadline=deadline,
         turn_id=turn_id,
         correlation_id=correlation_id,
@@ -540,73 +558,6 @@ def cancel_turn_response(turn: TurnState, request_data: Mapping[str, Any]) -> di
     }
 
 
-def _frame_base(
-    turn: TurnState,
-    seq: int,
-    frame_type: str,
-    *,
-    severity: str = "info",
-    summary: str = "",
-    content: Mapping[str, Any] | None = None,
-    content_text: str = "",
-    completed: Mapping[str, Any] | None = None,
-    failed: Mapping[str, Any] | None = None,
-    error: Mapping[str, Any] | None = None,
-    metadata: Mapping[str, str] | None = None,
-) -> dict[str, Any]:
-    return {
-        "version": ORKA_HARNESS_VERSION,
-        "type": frame_type,
-        "runtimeSessionID": turn.runtime_session_id,
-        "turnID": turn.turn_id,
-        "correlationID": turn.correlation_id,
-        "seq": seq,
-        "createdAt": _now_iso(),
-        "severity": severity,
-        "summary": summary,
-        "content": dict(content or {}),
-        "contentText": content_text,
-        "completed": dict(completed) if completed is not None else None,
-        "failed": dict(failed) if failed is not None else None,
-        "error": dict(error) if error is not None else None,
-        "metadata": dict(metadata or turn.metadata),
-    }
-
-
-def frame_started(turn: TurnState, seq: int) -> dict[str, Any]:
-    return _frame_base(turn, seq, "TurnStarted", summary="turn started")
-
-
-def frame_runtime_output(turn: TurnState, seq: int, text: str, content: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    return _frame_base(turn, seq, "RuntimeOutput", summary="runtime output", content=content, content_text=text)
-
-
-def frame_completed(turn: TurnState, seq: int, result_text: str) -> dict[str, Any]:
-    return _frame_base(
-        turn,
-        seq,
-        "TurnCompleted",
-        summary="turn completed",
-        completed={"result": result_text, "finalEventSeq": seq},
-    )
-
-
-def frame_failed(turn: TurnState, seq: int, reason: str, message: str, retryable: bool = False) -> dict[str, Any]:
-    failed = {"reason": reason, "message": message, "retryable": retryable}
-    return _frame_base(
-        turn,
-        seq,
-        "TurnFailed",
-        severity="error",
-        summary="turn failed",
-        failed=failed,
-        error={"code": reason, "message": message, "retryable": retryable},
-    )
-
-
-def frame_cancelled(turn: TurnState, seq: int, reason: str = "cancelled") -> dict[str, Any]:
-    return _frame_base(turn, seq, "TurnCancelled", summary=f"turn {reason}")
-
 
 async def _run_turn(
     get_runtime: Callable[[RunRequest], Awaitable[Any]],
@@ -617,18 +568,20 @@ async def _run_turn(
     *,
     max_terminal_turns: int,
 ) -> None:
-    try:
+    async def _run_with_runtime() -> RunResult:
         runtime = await get_runtime(run_request)
+        with _scoped_process_env(run_request.env):
+            return await runtime.run(run_request)
+
+    try:
         if run_request.deadline is None:
-            with _scoped_process_env(run_request.env):
-                result = await runtime.run(run_request)
+            result = await _run_with_runtime()
         else:
             seconds = (run_request.deadline - datetime.now(UTC)).total_seconds()
             if seconds <= 0:
                 raise TimeoutError("turn deadline has already expired")
             async with asyncio.timeout(seconds):
-                with _scoped_process_env(run_request.env):
-                    result = await runtime.run(run_request)
+                result = await _run_with_runtime()
     except asyncio.CancelledError:
         await _append_terminal_if_missing(
             state,
@@ -713,6 +666,7 @@ def create_orka_app(
     terminal_order: list[str] = []
     active_runtimes: dict[str, ActiveRuntime] = {}
     runtime_order: list[str] = []
+    background_tasks: set[asyncio.Task[None]] = set()
 
     async def get_runtime(run_request: RunRequest) -> Any:
         runtime_session_id = run_request.session_id or ""
@@ -722,6 +676,9 @@ def create_orka_app(
                 runtime_order.remove(runtime_session_id)
             runtime_order.append(runtime_session_id)
             return active.session
+        # Runtime factories read the process environment today. Keep this scoped
+        # section on the event loop thread so cancellation cannot leave a worker
+        # thread running with turn credentials in process-global os.environ.
         with _scoped_process_env(run_request.env):
             context = factory.build_runtime(spec)
             session = await context.__aenter__()
@@ -744,6 +701,11 @@ def create_orka_app(
             for state in turns.values():
                 if state.task is not None and not state.task.done():
                     state.task.cancel()
+            for task in list(background_tasks):
+                task.cancel()
+            if background_tasks:
+                await asyncio.gather(*background_tasks, return_exceptions=True)
+            background_tasks.clear()
             for active in reversed(list(active_runtimes.values())):
                 await active.context.__aexit__(None, None, None)
             active_runtimes.clear()
@@ -803,6 +765,7 @@ def create_orka_app(
                 terminal_order,
                 turns,
                 retention_limit,
+                background_tasks,
             )
         )
         return start_turn_response(state)

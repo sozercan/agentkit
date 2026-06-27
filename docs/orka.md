@@ -173,6 +173,8 @@ The current Orka `AgentRuntime` CRD supports external endpoints first. Deploy th
 AgentKit image yourself (for example as a Kubernetes Deployment/Service) with:
 
 - `AGENTKIT_PROTOCOL=orka`
+- `AGENTKIT_BIND=0.0.0.0` so the Kubernetes Service can reach the harness outside
+  the container network namespace
 - `AGENTKIT_AUTH_TOKEN` sourced from the same Secret referenced by
   `spec.clientAuth.bearerTokenSecretRef`
 

@@ -533,3 +533,81 @@ def test_orka_runtime_session_cache_is_bounded_and_closes_evicted_runtime(monkey
         assert factory.runtimes[1].exited == 0
 
     assert factory.runtimes[1].exited == 1
+
+
+def test_orka_required_env_must_be_supplied_per_turn_or_process(monkeypatch):
+    spec = AgentSpec.model_validate(
+        {
+            "abiVersion": "v0",
+            "metadata": {"name": "orka-required-env"},
+            "model": {
+                "provider": "openai-compatible",
+                "baseURL": "https://api.openai.com/v1",
+                "name": "gpt-4o-mini",
+            },
+            "instructions": "Be helpful.",
+            "tools": [],
+            "env": [{"name": "MODEL_TOKEN", "required": True}],
+            "expose": {"openai": True, "port": 8080},
+        }
+    )
+    monkeypatch.delenv("MODEL_TOKEN", raising=False)
+    app = create_orka_app(spec, EchoFactory(), auth_token="test-token")
+
+    with TestClient(app) as client:
+        missing = client.post(
+            "/v1/turns",
+            json=_start_payload(turnID="turn-missing-env", input={"prompt": "hello", "contextRefs": [], "env": []}),
+            headers=AUTH,
+        )
+        supplied = client.post(
+            "/v1/turns",
+            json=_start_payload(
+                turnID="turn-supplied-env",
+                input={"prompt": "hello", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "turn-token"}]},
+            ),
+            headers=AUTH,
+        )
+
+    assert missing.status_code == 400
+    assert "MODEL_TOKEN" in missing.text
+    assert supplied.status_code == 202
+
+
+def test_orka_required_env_rejects_empty_turn_override_even_when_process_has_value(monkeypatch):
+    spec = AgentSpec.model_validate(
+        {
+            "abiVersion": "v0",
+            "metadata": {"name": "orka-required-env"},
+            "model": {
+                "provider": "openai-compatible",
+                "baseURL": "https://api.openai.com/v1",
+                "name": "gpt-4o-mini",
+            },
+            "instructions": "Be helpful.",
+            "tools": [],
+            "env": [{"name": "MODEL_TOKEN", "required": True}],
+            "expose": {"openai": True, "port": 8080},
+        }
+    )
+    monkeypatch.setenv("MODEL_TOKEN", "process-token")
+    app = create_orka_app(spec, EchoFactory(), auth_token="test-token")
+
+    with TestClient(app) as client:
+        empty_override = client.post(
+            "/v1/turns",
+            json=_start_payload(
+                turnID="turn-empty-env",
+                input={"prompt": "hello", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": ""}]},
+            ),
+            headers=AUTH,
+        )
+        process_fallback = client.post(
+            "/v1/turns",
+            json=_start_payload(turnID="turn-process-env", input={"prompt": "hello", "contextRefs": [], "env": []}),
+            headers=AUTH,
+        )
+
+    assert empty_override.status_code == 400
+    assert "MODEL_TOKEN" in empty_override.text
+    assert process_fallback.status_code == 202
