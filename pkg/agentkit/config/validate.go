@@ -3,7 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
-	"path/filepath"
+	pathpkg "path"
 	"sort"
 	"strings"
 
@@ -220,7 +220,7 @@ func validateContext(add func(string, ...any), ctx Context, tools []Tool) {
 }
 
 func isAgentSkillsPath(path string) bool {
-	clean := filepath.Clean(path)
+	clean := pathpkg.Clean(path)
 	return clean == "/agent/skills" || strings.HasPrefix(clean, "/agent/skills/")
 }
 

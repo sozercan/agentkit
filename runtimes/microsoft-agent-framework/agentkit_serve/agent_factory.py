@@ -402,17 +402,16 @@ class MAFRuntime:
             raise AgentBuildError("MCP skills provider currently requires a streamable-http MCP toolRef")
 
         from mcp.client.session import ClientSession
-        from mcp.client.streamable_http import streamable_http_client
+        from mcp.client.streamable_http import streamablehttp_client
 
         url = resolve_tool_url(tool)
-        http_client = same_origin_mcp_httpx_client_factory(
+        http_client_factory = same_origin_mcp_httpx_client_factory(
             tool,
             url,
             timeout=_remote_mcp_timeout(),
-        )()
-        await self.stack.enter_async_context(http_client)
+        )
         read, write, _ = await self.stack.enter_async_context(
-            streamable_http_client(url=url, http_client=http_client)
+            streamablehttp_client(url=url, httpx_client_factory=http_client_factory)
         )
         session = await self.stack.enter_async_context(ClientSession(read, write))
         await session.initialize()

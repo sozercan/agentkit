@@ -645,3 +645,61 @@ def test_remote_mcp_disables_ping(monkeypatch):
     mcp_tool = agent_factory.build_tool(tool)
 
     assert getattr(mcp_tool, "_ping_available") is False
+
+
+def test_build_mcp_skills_provider_uses_pinned_streamable_http_factory(monkeypatch):
+    from agentkit_serve_common.config import AgentSpec
+
+    calls = {}
+
+    class FakeTransport:
+        async def __aenter__(self):
+            calls["transport_entered"] = True
+            return "read", "write", lambda: None
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    def fake_streamablehttp_client(**kwargs):
+        calls.update(kwargs)
+        return FakeTransport()
+
+    class FakeClientSession:
+        def __init__(self, read, write):
+            calls["session_args"] = (read, write)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def initialize(self):
+            calls["initialized"] = True
+
+    import mcp.client.session as session_mod
+    import mcp.client.streamable_http as streamable_mod
+
+    monkeypatch.setattr(streamable_mod, "streamablehttp_client", fake_streamablehttp_client)
+    monkeypatch.setattr(session_mod, "ClientSession", FakeClientSession)
+    monkeypatch.setenv("TOOLBOX_ENDPOINT", "https://example.test/toolboxes/t/mcp")
+    spec = AgentSpec.model_validate({
+        "abiVersion": "v0",
+        "metadata": {"name": "x"},
+        "model": {"provider": "openai-compatible", "baseURL": "https://api.openai.com/v1", "name": "gpt-4o-mini"},
+        "instructions": "hi",
+        "tools": [{"name": "toolbox", "type": "mcp", "transport": "streamable-http", "urlEnv": "TOOLBOX_ENDPOINT"}],
+        "context": {"providers": [{"type": "skills", "source": "mcp", "toolRef": "toolbox"}]},
+        "expose": {"openai": True, "port": 8080},
+    })
+    runtime = agent_factory.MAFRuntime(spec)
+
+    import asyncio
+    provider = asyncio.run(runtime._build_mcp_skills_provider(spec.context.providers[0]))
+    asyncio.run(runtime.stack.aclose())
+
+    assert provider.__class__.__name__ == "SkillsProvider"
+    assert calls["url"] == "https://example.test/toolboxes/t/mcp"
+    assert "httpx_client_factory" in calls
+    assert "http_client" not in calls
+    assert calls["initialized"] is True

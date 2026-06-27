@@ -824,3 +824,31 @@ expose:
 		t.Fatalf("expected context auth error, got: %v", verr)
 	}
 }
+
+func TestFilesystemSkillsPathUsesPOSIXSemantics(t *testing.T) {
+	in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: skills-agent
+runtime: microsoft-agent-framework
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: hi
+context:
+  providers:
+    - type: skills
+      source: filesystem
+      path: /agent/skills/support-style
+expose:
+  openai: true
+`)
+	cfg, err := NewFromBytes(in)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if verr := cfg.Validate(); verr != nil {
+		t.Fatalf("POSIX /agent/skills subpath should validate: %v", verr)
+	}
+}

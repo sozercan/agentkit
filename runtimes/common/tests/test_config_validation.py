@@ -359,3 +359,15 @@ def test_load_rejects_model_bearer_auth(tmp_path):
         load(_write_spec(tmp_path, spec_dict))
 
     assert "model.auth supports only workload-identity-token" in str(exc.value)
+
+
+def test_load_rejects_unknown_skills_source(tmp_path):
+    spec_dict = deepcopy(_BASE_SPEC)
+    spec_dict["context"] = {
+        "providers": [{"type": "skills", "source": "filesytem", "path": "/agent/skills"}]
+    }
+
+    with pytest.raises(ConfigError) as exc:
+        load(_write_spec(tmp_path, spec_dict))
+
+    assert "skills context source must be filesystem or mcp" in str(exc.value)

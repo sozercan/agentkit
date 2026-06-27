@@ -273,12 +273,18 @@ class ContextProviderSpec(_Strict):
     def _valid_context_provider_shape(self) -> "ContextProviderSpec":
         if self.auth is not None and self.auth.type == _AUTH_BEARER:
             raise ValueError("context providers do not support bearer auth; use workload-identity-token")
-        if self.type == _CONTEXT_TYPE_SKILLS and self.source == _CONTEXT_SOURCE_FILESYSTEM:
-            if not self.path:
-                raise ValueError("filesystem skills require path")
-            normalized = posixpath.normpath(self.path)
-            if normalized != "/agent/skills" and not normalized.startswith("/agent/skills/"):
-                raise ValueError("filesystem skills path must be an absolute path under /agent/skills")
+        if self.type == _CONTEXT_TYPE_SKILLS:
+            if self.source == _CONTEXT_SOURCE_FILESYSTEM:
+                if not self.path:
+                    raise ValueError("filesystem skills require path")
+                normalized = posixpath.normpath(self.path)
+                if normalized != "/agent/skills" and not normalized.startswith("/agent/skills/"):
+                    raise ValueError("filesystem skills path must be an absolute path under /agent/skills")
+            elif self.source == _CONTEXT_SOURCE_MCP:
+                if not self.tool_ref:
+                    raise ValueError("MCP skills require toolRef")
+            else:
+                raise ValueError("skills context source must be filesystem or mcp")
         return self
 
 
