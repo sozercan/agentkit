@@ -173,8 +173,16 @@ class LangGraphRuntime:
         return tools
 
 
+def validate_supported_spec(spec: AgentSpec) -> None:
+    if spec.model.auth is not None:
+        raise AgentBuildError("langgraph runtime does not support model.auth; use apiKeyEnv")
+    if spec.context.providers:
+        raise AgentBuildError("langgraph runtime does not support context providers")
+
+
 def build_runtime(spec: AgentSpec) -> LangGraphRuntime:
     """Build the runtime session consumed by the shared server."""
+    validate_supported_spec(spec)
     return LangGraphRuntime(spec)
 
 

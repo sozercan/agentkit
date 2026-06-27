@@ -322,3 +322,22 @@ def test_no_azure_or_foundry_imports_in_generic_langgraph_adapter():
     for path in pkg_dir.glob("*.py"):
         leaked = _imported_roots(path) & forbidden
         assert not leaked, f"{path.name} imports Azure/Foundry symbols {sorted(leaked)}"
+
+
+
+def test_langgraph_rejects_model_workload_identity_auth():
+    data = _spec_data()
+    data["model"]["auth"] = {"type": "workload-identity-token", "audience": "https://ai.azure.com/.default"}
+    spec = AgentSpec.model_validate(data)
+
+    with pytest.raises(agent_factory.AgentBuildError, match="model.auth"):
+        agent_factory.build_runtime(spec)
+
+
+def test_langgraph_rejects_context_providers():
+    data = _spec_data()
+    data["context"] = {"providers": [{"type": "skills", "source": "filesystem", "path": "/agent/skills"}]}
+    spec = AgentSpec.model_validate(data)
+
+    with pytest.raises(agent_factory.AgentBuildError, match="context providers"):
+        agent_factory.build_runtime(spec)

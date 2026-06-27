@@ -207,7 +207,7 @@ def test_load_rejects_invalid_remote_mcp_tool(tmp_path):
     assert "static credential" in msg
 
 
-def test_load_accepts_context_and_observability_shapes(tmp_path):
+def test_load_accepts_context_shape(tmp_path):
     spec_dict = deepcopy(_BASE_SPEC)
     spec_dict["context"] = {
         "providers": [
@@ -219,14 +219,9 @@ def test_load_accepts_context_and_observability_shapes(tmp_path):
             }
         ]
     }
-    spec_dict["observability"] = {
-        "otel": {"endpointEnv": "OTEL_EXPORTER_OTLP_ENDPOINT"},
-    }
-
     spec = load(_write_spec(tmp_path, spec_dict))
 
     assert spec.context.providers[0].endpoint_env == "SEARCH_ENDPOINT"
-    assert spec.observability.otel.endpoint_env == "OTEL_EXPORTER_OTLP_ENDPOINT"
 
 
 @pytest.mark.parametrize("header", ["X-API-Key", "Cookie"])
@@ -429,3 +424,14 @@ def test_load_rejects_unsupported_log_observability(tmp_path):
         load(_write_spec(tmp_path, spec_dict))
 
     assert "observability.logs.levelEnv is not supported" in str(exc.value)
+
+
+
+def test_load_rejects_unsupported_otel_observability(tmp_path):
+    spec_dict = deepcopy(_BASE_SPEC)
+    spec_dict["observability"] = {"otel": {"endpointEnv": "OTEL_EXPORTER_OTLP_ENDPOINT"}}
+
+    with pytest.raises(ConfigError) as exc:
+        load(_write_spec(tmp_path, spec_dict))
+
+    assert "observability.otel.endpointEnv is not supported" in str(exc.value)

@@ -63,6 +63,17 @@ Framework/model failures are normalized to an OpenAI-shaped error envelope with
 `type: agent_error`. The adapters preserve upstream HTTP status codes when the
 framework exposes them.
 
+## Model endpoint compatibility
+
+Adapters use the baked `model.baseURL` and `model.name` to construct their
+OpenAI-compatible chat client. They do not special-case a provider: the endpoint
+can be OpenAI, another hosted provider, a local gateway, an in-cluster service,
+or a prebuilt or custom [AIKit](https://github.com/kaito-project/aikit) model
+image. AIKit is just an example of an OpenAI-compatible endpoint. For no-auth
+endpoints, omit `model.apiKeyEnv` unless you place an auth proxy in front of the
+endpoint, and make sure the generated AgentKit container can resolve the
+configured `baseURL` at runtime.
+
 ## Network posture
 
 The generated image defaults to `AGENTKIT_BIND=127.0.0.1`. At runtime:

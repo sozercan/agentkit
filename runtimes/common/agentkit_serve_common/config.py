@@ -319,7 +319,8 @@ class ObservabilityOTelSpec(_Strict):
     def _endpoint_env_name(cls, value: str | None) -> str | None:
         if value is None:
             return value
-        return _validate_env_name(value, field="observability.otel.endpointEnv")
+        _validate_env_name(value, field="observability.otel.endpointEnv")
+        raise ValueError("observability.otel.endpointEnv is not supported by current runtimes")
 
 
 class ObservabilityLogsSpec(_Strict):

@@ -74,6 +74,13 @@ def _mcp_init_timeout() -> float:
     return positive_float_env(default=_DEFAULT_MCP_INIT_TIMEOUT)
 
 
+def validate_supported_spec(spec: AgentSpec) -> None:
+    if spec.model.auth is not None:
+        raise AgentBuildError("pydantic-ai runtime does not support model.auth; use apiKeyEnv")
+    if spec.context.providers:
+        raise AgentBuildError("pydantic-ai runtime does not support context providers")
+
+
 def build_model(spec: AgentSpec) -> OpenAIChatModel:
     """Construct the OpenAI-compatible chat model pointed at ``model.baseURL``."""
     provider = OpenAIProvider(
@@ -168,6 +175,7 @@ class PydanticRuntime:
 
 def build_runtime(spec: AgentSpec) -> PydanticRuntime:
     """Build the runtime session consumed by the shared server."""
+    validate_supported_spec(spec)
     return PydanticRuntime(build_agent(spec))
 
 
