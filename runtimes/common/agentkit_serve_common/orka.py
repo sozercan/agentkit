@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -30,6 +31,7 @@ ORKA_HARNESS_VERSION = "orka.harness.v1"
 _TERMINAL_TYPES = frozenset({"TurnCompleted", "TurnFailed", "TurnCancelled"})
 _DEFAULT_MAX_TERMINAL_TURNS = 256
 _MAX_TERMINAL_TURNS_ENV = "AGENTKIT_ORKA_MAX_TERMINAL_TURNS"
+_TURN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 
 def _now_iso() -> str:
@@ -69,10 +71,10 @@ class TurnState:
         self.condition = asyncio.Condition()
         self.terminal_event: TurnEvent | None = None
 
-    async def append(self, event_type: str, payload: Mapping[str, Any] | None = None) -> TurnEvent:
+    async def append(self, event_type: str, payload: Mapping[str, Any] | None = None) -> tuple[TurnEvent, bool]:
         async with self.condition:
             if event_type in _TERMINAL_TYPES and self.terminal_event is not None:
-                return self.terminal_event
+                return self.terminal_event, False
             event = TurnEvent(
                 seq=len(self.events) + 1,
                 type=event_type,
@@ -83,7 +85,7 @@ class TurnState:
             if event.terminal:
                 self.terminal_event = event
             self.condition.notify_all()
-            return event
+            return event, True
 
     async def events_after(self, seq: int) -> list[TurnEvent]:
         async with self.condition:
@@ -109,13 +111,66 @@ def _max_terminal_turns(value: int | None = None) -> int:
     return parsed if parsed > 0 else _DEFAULT_MAX_TERMINAL_TURNS
 
 
-def _evict_terminal_turns(turns: dict[str, TurnState], max_terminal_turns: int) -> None:
-    terminal_ids = [turn_id for turn_id, state in turns.items() if state.terminal_event is not None]
-    overflow = len(terminal_ids) - max_terminal_turns
+def _record_terminal_turn(
+    turn_id: str,
+    terminal_order: list[str],
+    turns: dict[str, TurnState],
+    max_terminal_turns: int,
+) -> None:
+    if turn_id in terminal_order:
+        terminal_order.remove(turn_id)
+    terminal_order.append(turn_id)
+    overflow = len(terminal_order) - max_terminal_turns
     if overflow <= 0:
         return
-    for turn_id in terminal_ids[:overflow]:
-        turns.pop(turn_id, None)
+    for evict_id in terminal_order[:overflow]:
+        turns.pop(evict_id, None)
+    del terminal_order[:overflow]
+
+
+async def _append_terminal_if_missing(
+    state: TurnState,
+    terminal_order: list[str],
+    turns: dict[str, TurnState],
+    max_terminal_turns: int,
+    event_type: str,
+    payload: Mapping[str, Any],
+) -> None:
+    _, created = await state.append(event_type, payload)
+    if created:
+        _record_terminal_turn(state.turn_id, terminal_order, turns, max_terminal_turns)
+
+
+def _ensure_terminal_on_task_done(
+    task: asyncio.Task[None],
+    state: TurnState,
+    terminal_order: list[str],
+    turns: dict[str, TurnState],
+    max_terminal_turns: int,
+) -> None:
+    if state.terminal_event is not None:
+        return
+    if task.cancelled():
+        event_type = "TurnCancelled"
+        payload: Mapping[str, Any] = {"reason": "cancelled"}
+    else:
+        exc = task.exception()
+        event_type = "TurnFailed"
+        payload = (
+            {"code": exc.__class__.__name__, "message": str(exc), "status": 502}
+            if exc is not None
+            else {"code": "RuntimeTaskEndedWithoutTerminal", "message": "runtime task ended without a terminal frame", "status": 502}
+        )
+    asyncio.create_task(
+        _append_terminal_if_missing(
+            state,
+            terminal_order,
+            turns,
+            max_terminal_turns,
+            event_type,
+            payload,
+        )
+    )
 
 
 def _sse_frame(event: TurnEvent) -> str:
@@ -128,6 +183,18 @@ def _clean(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _turn_id_from_payload(data: dict[str, Any]) -> str:
+    turn_id = _clean(data.get("turnID", data.get("turnId", data.get("turn_id"))))
+    if turn_id is None:
+        return f"turn_{uuid.uuid4().hex}"
+    if not _TURN_ID_RE.fullmatch(turn_id):
+        raise HTTPException(
+            status_code=400,
+            detail="turnID must be URL-safe: letters, numbers, '.', '_', or '-'",
+        )
+    return turn_id
 
 
 def _mapping_of_strings(data: Any, *, field_name: str) -> dict[str, str]:
@@ -226,6 +293,7 @@ def _usage_payload(result: RunResult) -> dict[str, int]:
 async def _run_turn(
     runtime: Any,
     turns: dict[str, TurnState],
+    terminal_order: list[str],
     state: TurnState,
     run_request: RunRequest,
     *,
@@ -259,8 +327,14 @@ async def _run_turn(
         terminal_type = "TurnFailed"
         terminal_payload = {"code": exc.__class__.__name__, "message": str(exc), "status": 502}
 
-    await state.append(terminal_type, terminal_payload)
-    _evict_terminal_turns(turns, max_terminal_turns)
+    await _append_terminal_if_missing(
+        state,
+        terminal_order,
+        turns,
+        max_terminal_turns,
+        terminal_type,
+        terminal_payload,
+    )
 
 
 def create_orka_app(
@@ -276,6 +350,7 @@ def create_orka_app(
     retention_limit = _max_terminal_turns(max_terminal_turns)
     runtime = factory.build_runtime(spec)
     turns: dict[str, TurnState] = {}
+    terminal_order: list[str] = []
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -319,7 +394,7 @@ def create_orka_app(
         if not isinstance(data, dict):
             raise HTTPException(status_code=400, detail="Request body must be a JSON object")
 
-        turn_id = _clean(data.get("turnID", data.get("turnId", data.get("turn_id")))) or f"turn_{uuid.uuid4().hex}"
+        turn_id = _turn_id_from_payload(data)
         if turn_id in turns:
             raise HTTPException(status_code=409, detail=f"turn {turn_id!r} already exists")
 
@@ -338,9 +413,19 @@ def create_orka_app(
             _run_turn(
                 request.app.state.runtime,
                 turns,
+                terminal_order,
                 state,
                 run_request,
                 max_terminal_turns=retention_limit,
+            )
+        )
+        state.task.add_done_callback(
+            lambda task, state=state: _ensure_terminal_on_task_done(
+                task,
+                state,
+                terminal_order,
+                turns,
+                retention_limit,
             )
         )
         return {
@@ -386,8 +471,16 @@ def create_orka_app(
         if state.terminal_event is None and state.task is not None and not state.task.done():
             state.task.cancel()
         elif state.terminal_event is None:
-            await state.append("TurnCancelled", {"reason": "cancelled"})
-            _evict_terminal_turns(turns, retention_limit)
+            await _append_terminal_if_missing(
+                state,
+                terminal_order,
+                turns,
+                retention_limit,
+                "TurnCancelled" if state.task is None or state.task.cancelled() else "TurnFailed",
+                {"reason": "cancelled"}
+                if state.task is None or state.task.cancelled()
+                else {"code": "RuntimeTaskEndedWithoutTerminal", "message": "runtime task ended without a terminal frame", "status": 502},
+            )
         return {"version": ORKA_HARNESS_VERSION, "turnID": turn_id, "status": "accepted"}
 
     @app.get("/v1/turns/{turn_id}/output", dependencies=[auth])

@@ -34,9 +34,10 @@ def _spec() -> AgentSpec:
 
 
 class EchoRuntime:
-    def __init__(self, *, delay: float = 0) -> None:
+    def __init__(self, *, delay: float = 0, delays: dict[str, float] | None = None) -> None:
         self.requests: list[RunRequest] = []
         self.delay = delay
+        self.delays = delays or {}
 
     async def __aenter__(self) -> RuntimeSession:
         return self
@@ -53,14 +54,15 @@ class EchoRuntime:
         import asyncio
 
         self.requests.append(request)
-        if self.delay:
-            await asyncio.sleep(self.delay)
+        delay = self.delays.get(request.prompt, self.delay)
+        if delay:
+            await asyncio.sleep(delay)
         return RunResult(text=f"echo: {request.prompt}", usage={"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3})
 
 
 class EchoFactory:
-    def __init__(self, *, delay: float = 0) -> None:
-        self.runtime = EchoRuntime(delay=delay)
+    def __init__(self, *, delay: float = 0, delays: dict[str, float] | None = None) -> None:
+        self.runtime = EchoRuntime(delay=delay, delays=delays)
 
     def build_runtime(self, spec: AgentSpec) -> RuntimeSession:
         return self.runtime
@@ -173,6 +175,27 @@ def test_orka_protected_endpoints_require_bearer_token():
     assert cancel.status_code == 401
 
 
+
+def test_orka_rejects_turn_ids_that_do_not_fit_route_path():
+    app = create_orka_app(_spec(), EchoFactory(), auth_token="test-token")
+
+    with TestClient(app) as client:
+        slash = client.post(
+            "/v1/turns",
+            json={"version": ORKA_HARNESS_VERSION, "turnID": "bad/id", "prompt": "hi"},
+            headers=AUTH,
+        )
+        query = client.post(
+            "/v1/turns",
+            json={"version": ORKA_HARNESS_VERSION, "turnID": "bad?id", "prompt": "hi"},
+            headers=AUTH,
+        )
+
+    assert slash.status_code == 400
+    assert query.status_code == 400
+    assert "URL-safe" in slash.text
+
+
 def test_orka_cancel_produces_cancelled_terminal_frame():
     app = create_orka_app(_spec(), EchoFactory(delay=60), auth_token="test-token")
 
@@ -208,3 +231,31 @@ def test_orka_terminal_turn_retention_is_bounded():
     assert evicted.status_code == 404
     assert kept.status_code == 200
     assert [frame["type"] for frame in _frames(kept.text)] == ["TurnCompleted"]
+
+
+def test_orka_terminal_turn_retention_uses_completion_order():
+    app = create_orka_app(
+        _spec(),
+        EchoFactory(delays={"slow": 0.05, "fast": 0}),
+        auth_token="test-token",
+        max_terminal_turns=1,
+    )
+
+    with TestClient(app) as client:
+        slow_id = _create_turn(client, turnID="turn-slow", prompt="slow")
+        fast_id = _create_turn(client, turnID="turn-fast", prompt="fast")
+
+        fast_events = client.get(f"/v1/turns/{fast_id}/events", headers=AUTH)
+        assert fast_events.status_code == 200
+        assert _frames(fast_events.text)[-1]["type"] == "TurnCompleted"
+
+        slow_events = client.get(f"/v1/turns/{slow_id}/events", headers=AUTH)
+        assert slow_events.status_code == 200
+        assert _frames(slow_events.text)[-1]["type"] == "TurnCompleted"
+
+        evicted_fast = client.get(f"/v1/turns/{fast_id}/events", headers=AUTH)
+        kept_slow = client.get(f"/v1/turns/{slow_id}/events?afterSeq=1", headers=AUTH)
+
+    assert evicted_fast.status_code == 404
+    assert kept_slow.status_code == 200
+    assert [frame["type"] for frame in _frames(kept_slow.text)] == ["TurnCompleted"]
