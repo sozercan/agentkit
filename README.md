@@ -197,9 +197,11 @@ context:
         audience: https://ai.azure.com/.default
 ```
 
-The deployment environment supplies the endpoint, index/store name, and identity
-material. Provider-specific provisioning remains in deployment profiles such as
-`deploy/foundry/`; AgentKit core does not add keys like `foundry.memoryStore`.
+The deployment environment supplies the endpoint, index/store name, memory scope,
+and identity material. Memory context providers require an explicit
+`AGENTKIT_MEMORY_SCOPE` so durable memory is not accidentally shared across users
+or sessions. Provider-specific provisioning remains in deployment profiles such
+as `deploy/foundry/`; AgentKit core does not add keys like `foundry.memoryStore`.
 
 
 ## Declare runtime env requirements
@@ -268,8 +270,9 @@ The most important rules are:
 - `apiKeyEnv`, tool `env`, top-level `env`, and env-suffixed fields such as
   `urlEnv` or `valueEnv` are env var names, not secret values.
 - `expose.openai` must be `true`; `expose.port` defaults to `8080`.
-- Context provider, model workload-identity, observability export, and tool
-  approval schemas are capability-gated; the MAF runtime currently declares
+- Context provider, model workload-identity, OTel export, and tool
+  approval schemas are capability-gated; log-level observability is reserved but
+  rejected until a runtime wires it through. The MAF runtime currently declares
   skills, search, and memory context-provider support.
 
 Full reference: [`docs/agentkitfile.md`](docs/agentkitfile.md).

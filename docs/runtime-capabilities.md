@@ -50,5 +50,5 @@ side-effect governance.
 
 Context-provider schemas are capability-gated per runtime; the MAF adapter
 currently declares skills, search, and memory support. OTel export, local tool
-approval enforcement, and Orka brokered-tool mode remain gated until a runtime and
-protocol contract declare support.
+approval enforcement, log-level observability, and Orka brokered-tool mode remain
+gated until a runtime and protocol contract declare support.

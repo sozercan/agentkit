@@ -9,6 +9,7 @@ minimal non-streaming ``/responses``) while reusing the same ``RuntimeFactory`` 
 from __future__ import annotations
 
 import json
+import os
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -69,6 +70,9 @@ def _session_id_from_request(request: Request) -> str | None:
         value = request.headers.get(name)
         if value and value.strip():
             return value.strip()
+    value = os.environ.get("FOUNDRY_AGENT_SESSION_ID")
+    if value and value.strip():
+        return value.strip()
     return None
 
 

@@ -9,6 +9,7 @@ the *baked* file: ``instructions`` is already a fully-resolved scalar string and
 from __future__ import annotations
 
 import os
+import posixpath
 import re
 import sys
 from pathlib import Path
@@ -25,6 +26,11 @@ _SECRET_VALUE_PREFIXES = ("sk-", "sk_", "ghp_", "github_pat_", "xoxb-", "AKIA")
 _TOOL_TYPE_MCP = "mcp"
 _TRANSPORT_STDIO = "stdio"
 _TRANSPORT_STREAMABLE_HTTP = "streamable-http"
+_CONTEXT_TYPE_SEARCH = "search"
+_CONTEXT_TYPE_SKILLS = "skills"
+_CONTEXT_TYPE_MEMORY = "memory"
+_CONTEXT_SOURCE_FILESYSTEM = "filesystem"
+_CONTEXT_SOURCE_MCP = "mcp"
 _AUTH_BEARER = "bearer"
 _AUTH_WORKLOAD_IDENTITY = "workload-identity-token"
 _APPROVAL_VALUES = {"never", "auto", "always"}
@@ -64,6 +70,7 @@ def _looks_like_secret_literal(value: str) -> bool:
 
 class Metadata(_Strict):
     name: str = Field(min_length=1)
+
 
 class AuthSpec(_Strict):
     type: str = Field(min_length=1)
@@ -124,6 +131,12 @@ class ModelSpec(_Strict):
             return value
         return _validate_env_name(value, field="model.apiKeyEnv")
 
+    @model_validator(mode="after")
+    def _model_auth_supported(self) -> "ModelSpec":
+        if self.auth is not None and self.auth.type != _AUTH_WORKLOAD_IDENTITY:
+            raise ValueError("model.auth supports only workload-identity-token")
+        return self
+
 
 class ToolHeaderSpec(_Strict):
     name: str = Field(min_length=1)
@@ -155,7 +168,6 @@ class ToolHeaderSpec(_Strict):
         if self.value and _looks_like_secret_literal(self.value):
             raise ValueError("header value looks like a secret; use valueEnv")
         return self
-
 
 
 class ToolSpec(_Strict):
@@ -198,6 +210,8 @@ class ToolSpec(_Strict):
     def _approval_supported(cls, value: str | None) -> str | None:
         if value is not None and value not in _APPROVAL_VALUES:
             raise ValueError("approval must be one of never, auto, or always")
+        if value in {"auto", "always"}:
+            raise ValueError("tool approval policies are not supported by this runtime")
         return value
 
     @model_validator(mode="after")
@@ -258,10 +272,37 @@ class ContextProviderSpec(_Strict):
         return _validate_env_name(value, field="context.providers[].env")
 
     @model_validator(mode="after")
-    def _context_auth_supported(self) -> "ContextProviderSpec":
+    def _valid_context_provider_shape(self) -> "ContextProviderSpec":
         if self.auth is not None and self.auth.type == _AUTH_BEARER:
             raise ValueError("context providers do not support bearer auth; use workload-identity-token")
-        return self
+        if self.type == _CONTEXT_TYPE_SEARCH:
+            if not self.endpoint_env:
+                raise ValueError("search context providers require endpointEnv")
+            if not self.index_env:
+                raise ValueError("search context providers require indexEnv")
+            return self
+        if self.type == _CONTEXT_TYPE_MEMORY:
+            if not self.endpoint_env:
+                raise ValueError("memory context providers require endpointEnv")
+            if not self.store_name_env:
+                raise ValueError("memory context providers require storeNameEnv")
+            return self
+        if self.type == _CONTEXT_TYPE_SKILLS:
+            if self.auth is not None:
+                raise ValueError("skills context providers must not set auth; configure auth on the referenced MCP tool")
+            if self.source == _CONTEXT_SOURCE_FILESYSTEM:
+                if not self.path:
+                    raise ValueError("filesystem skills require path")
+                normalized = posixpath.normpath(self.path)
+                if normalized != "/agent/skills" and not normalized.startswith("/agent/skills/"):
+                    raise ValueError("filesystem skills path must be an absolute path under /agent/skills")
+            elif self.source == _CONTEXT_SOURCE_MCP:
+                if not self.tool_ref:
+                    raise ValueError("MCP skills require toolRef")
+            else:
+                raise ValueError("skills context source must be filesystem or mcp")
+            return self
+        raise ValueError("context provider type must be search, skills, or memory")
 
 
 class ContextSpec(_Strict):
@@ -291,7 +332,8 @@ class ObservabilityLogsSpec(_Strict):
     def _level_env_name(cls, value: str | None) -> str | None:
         if value is None:
             return value
-        return _validate_env_name(value, field="observability.logs.levelEnv")
+        _validate_env_name(value, field="observability.logs.levelEnv")
+        raise ValueError("observability.logs.levelEnv is not supported by current runtimes")
 
 
 class ObservabilitySpec(_Strict):
@@ -347,6 +389,20 @@ class AgentSpec(_Strict):
             names = ", ".join(sorted(set(duplicates)))
             raise ValueError(f"duplicate env var declarations: {names}")
         return value
+
+    @model_validator(mode="after")
+    def _valid_context_tool_refs(self) -> "AgentSpec":
+        tools = {tool.name: tool for tool in self.tools}
+        for provider in self.context.providers:
+            if provider.type == _CONTEXT_TYPE_SKILLS and provider.source == _CONTEXT_SOURCE_MCP:
+                if not provider.tool_ref:
+                    raise ValueError("MCP skills require toolRef")
+                tool = tools.get(provider.tool_ref)
+                if tool is None:
+                    raise ValueError(f"MCP skills toolRef {provider.tool_ref!r} references unknown tool")
+                if not tool.url_env or tool.transport != _TRANSPORT_STREAMABLE_HTTP:
+                    raise ValueError(f"MCP skills toolRef {provider.tool_ref!r} must reference a streamable-http MCP tool")
+        return self
 
 
 class ConfigError(Exception):

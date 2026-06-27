@@ -188,11 +188,16 @@ context:
 ```
 
 - `search` requires `endpointEnv` and `indexEnv`.
-- `skills` uses `source: filesystem` with `path`, or `source: mcp` with a
-  remote MCP `toolRef`.
+- `skills` uses `source: filesystem` with an absolute `path` under
+  `/agent/skills`, or `source: mcp` with a remote streamable-http MCP `toolRef`.
 - `memory` requires `endpointEnv` and `storeNameEnv`.
 - Env-suffixed fields name environment variables; they never contain endpoint
   secrets or token values directly.
+
+AgentKit does not copy arbitrary local skill directories into the image. If you
+use filesystem skills, stage them under `/agent/skills` in the runtime/deployment
+image or prefer MCP-backed skills. Memory providers require an explicit
+`AGENTKIT_MEMORY_SCOPE` runtime env var; choose a per-user/session-safe scope.
 
 ### `expose`
 

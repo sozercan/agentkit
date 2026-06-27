@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	pathpkg "path"
 	"sort"
 	"strings"
 
@@ -187,10 +188,15 @@ func validateContext(add func(string, ...any), ctx Context, tools []Tool) {
 			validateEnvField(add, path+".indexEnv", provider.IndexEnv, true)
 			validateContextAuth(add, path+".auth", provider.Auth)
 		case ContextTypeSkills:
+			if provider.Auth != nil {
+				add("%s.auth must not be set for skills context providers; configure auth on the referenced MCP tool", path)
+			}
 			switch provider.Source {
 			case ContextSourceFilesystem:
 				if provider.Path == "" {
 					add("%s.path is required for filesystem skills", path)
+				} else if !isAgentSkillsPath(provider.Path) {
+					add("%s.path %q must be an absolute path under /agent/skills; AgentKit does not copy arbitrary filesystem skill directories into images", path, provider.Path)
 				}
 			case ContextSourceMCP:
 				if provider.ToolRef == "" {
@@ -215,6 +221,11 @@ func validateContext(add func(string, ...any), ctx Context, tools []Tool) {
 	}
 }
 
+func isAgentSkillsPath(path string) bool {
+	clean := pathpkg.Clean(path)
+	return clean == "/agent/skills" || strings.HasPrefix(clean, "/agent/skills/")
+}
+
 func validateContextAuth(add func(string, ...any), path string, auth *Auth) {
 	validateAuth(add, path, auth)
 	if auth != nil && auth.Type == AuthTypeBearer {
@@ -225,6 +236,9 @@ func validateContextAuth(add func(string, ...any), path string, auth *Auth) {
 func validateObservability(add func(string, ...any), obs Observability) {
 	validateEnvField(add, "observability.otel.endpointEnv", obs.OTel.EndpointEnv, false)
 	validateEnvField(add, "observability.logs.levelEnv", obs.Logs.LevelEnv, false)
+	if obs.Logs.LevelEnv != "" {
+		add("observability.logs.levelEnv is not supported by current runtimes; omit it until log-level wiring is implemented")
+	}
 }
 
 func validateEnvField(add func(string, ...any), path, value string, required bool) {

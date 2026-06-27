@@ -173,3 +173,15 @@ def test_foundry_protocols_require_auth_when_token_configured_but_readiness_stay
     assert readiness.status_code == 200
     assert unauth_inv.status_code == 401
     assert auth_inv.status_code == 200
+
+
+def test_foundry_protocol_uses_platform_session_env_fallback(monkeypatch):
+    factory = EchoFactory()
+    app = create_foundry_app(_spec(), factory)
+    monkeypatch.setenv("FOUNDRY_AGENT_SESSION_ID", "platform-session")
+
+    with TestClient(app) as client:
+        resp = client.post("/invocations", json={"message": "hello"})
+
+    assert resp.status_code == 200
+    assert factory.runtime.requests[0].session_id == "platform-session"

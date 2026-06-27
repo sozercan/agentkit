@@ -76,6 +76,11 @@ def render(profile: dict[str, Any]) -> dict[str, Any]:
         raise SystemExit("profile must set name")
     if not image:
         raise SystemExit("profile must set image")
+    if not (profile.get("foundryWrapper") is True or profile.get("imageKind") == "foundry-wrapper"):
+        raise SystemExit(
+            "profile image must be a Foundry protocol wrapper image; set "
+            "foundryWrapper: true after wrapping the AgentKit image with foundry_live.py"
+        )
 
     out: dict[str, Any] = {
         "kind": "hosted",
