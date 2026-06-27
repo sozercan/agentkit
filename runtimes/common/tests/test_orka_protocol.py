@@ -34,6 +34,7 @@ def _spec() -> AgentSpec:
             },
             "instructions": "Be helpful.",
             "tools": [],
+            "env": [{"name": "MODEL_TOKEN"}],
             "expose": {"openai": True, "port": 8080},
         }
     )
@@ -261,6 +262,10 @@ def test_orka_start_turn_requires_contract_fields():
         prompt_resp = client.post("/v1/turns", json=missing_prompt, headers=AUTH)
         bad_env = _start_payload(input={"prompt": "hi", "env": [{"name": "1_BAD", "value": "x"}]})
         env_resp = client.post("/v1/turns", json=bad_env, headers=AUTH)
+        undeclared_env = _start_payload(input={"prompt": "hi", "env": [{"name": "OTHER_TOKEN", "value": "x"}]})
+        undeclared_env_resp = client.post("/v1/turns", json=undeclared_env, headers=AUTH)
+        reserved_env = _start_payload(input={"prompt": "hi", "env": [{"name": "AGENTKIT_WORKLOAD_IDENTITY_TOKEN_COMMAND", "value": "echo nope"}]})
+        reserved_env_resp = client.post("/v1/turns", json=reserved_env, headers=AUTH)
         bad_context_refs = _start_payload(input={"prompt": "hi", "contextRefs": [{"kind": "artifact"}], "env": []})
         context_resp = client.post("/v1/turns", json=bad_context_refs, headers=AUTH)
         brokered = _start_payload(toolExecutionMode="brokered")
@@ -272,6 +277,10 @@ def test_orka_start_turn_requires_contract_fields():
     assert "input.prompt" in prompt_resp.text
     assert env_resp.status_code == 400
     assert "input.env" in env_resp.text
+    assert undeclared_env_resp.status_code == 400
+    assert "not declared" in undeclared_env_resp.text
+    assert reserved_env_resp.status_code == 400
+    assert "reserved" in reserved_env_resp.text
     assert context_resp.status_code == 400
     assert "contextRefs" in context_resp.text
     assert brokered_resp.status_code == 400
@@ -492,3 +501,35 @@ def test_orka_runtime_build_is_deferred_until_turn_env_is_available(monkeypatch)
     assert factory.runtimes[0].entered == 1
     assert factory.runtimes[0].exited == 1
     assert "MODEL_TOKEN" not in __import__("os").environ
+
+
+def test_orka_runtime_session_cache_is_bounded_and_closes_evicted_runtime(monkeypatch):
+    monkeypatch.delenv("MODEL_TOKEN", raising=False)
+    factory = EnvFactory()
+    app = create_orka_app(_spec(), factory, auth_token="test-token", max_runtime_sessions=1)
+
+    with TestClient(app) as client:
+        first_id = _create_turn(
+            client,
+            turnID="turn-session-one",
+            runtimeSessionID="runtime-session-one",
+            correlationID="corr-one",
+            input={"prompt": "one", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "one-token"}]},
+        )
+        first_frames = _frames(client.get(f"/v1/turns/{first_id}/events", headers=AUTH).text)
+        assert first_frames[-1]["completed"]["result"] == "token=one-token;run=one-token"
+
+        second_id = _create_turn(
+            client,
+            turnID="turn-session-two",
+            runtimeSessionID="runtime-session-two",
+            correlationID="corr-two",
+            input={"prompt": "two", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "two-token"}]},
+        )
+        second_frames = _frames(client.get(f"/v1/turns/{second_id}/events", headers=AUTH).text)
+        assert second_frames[-1]["completed"]["result"] == "token=two-token;run=two-token"
+        assert len(factory.runtimes) == 2
+        assert factory.runtimes[0].exited == 1
+        assert factory.runtimes[1].exited == 0
+
+    assert factory.runtimes[1].exited == 1

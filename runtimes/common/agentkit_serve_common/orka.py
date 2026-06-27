@@ -32,7 +32,9 @@ PROVIDER_KIND_KUBERNETES_SERVICE = "kubernetes-service"
 TOOL_MODE_OBSERVED = "observed"
 _TERMINAL_TYPES = frozenset({"TurnCompleted", "TurnFailed", "TurnCancelled"})
 _DEFAULT_MAX_TERMINAL_TURNS = 256
+_DEFAULT_MAX_RUNTIME_SESSIONS = 64
 _MAX_TERMINAL_TURNS_ENV = "AGENTKIT_ORKA_MAX_TERMINAL_TURNS"
+_MAX_RUNTIME_SESSIONS_ENV = "AGENTKIT_ORKA_MAX_RUNTIME_SESSIONS"
 _TURN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -176,19 +178,37 @@ class TurnState:
                 await self.condition.wait()
 
 
-def _max_terminal_turns(value: int | None = None) -> int:
+def _positive_int_setting(value: int | None, *, env_name: str, default: int, field_name: str) -> int:
     if value is not None:
         if value < 1:
-            raise ValueError("max_terminal_turns must be at least 1")
+            raise ValueError(f"{field_name} must be at least 1")
         return value
-    raw = os.environ.get(_MAX_TERMINAL_TURNS_ENV)
+    raw = os.environ.get(env_name)
     if not raw:
-        return _DEFAULT_MAX_TERMINAL_TURNS
+        return default
     try:
         parsed = int(raw)
     except ValueError:
-        return _DEFAULT_MAX_TERMINAL_TURNS
-    return parsed if parsed > 0 else _DEFAULT_MAX_TERMINAL_TURNS
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _max_terminal_turns(value: int | None = None) -> int:
+    return _positive_int_setting(
+        value,
+        env_name=_MAX_TERMINAL_TURNS_ENV,
+        default=_DEFAULT_MAX_TERMINAL_TURNS,
+        field_name="max_terminal_turns",
+    )
+
+
+def _max_runtime_sessions(value: int | None = None) -> int:
+    return _positive_int_setting(
+        value,
+        env_name=_MAX_RUNTIME_SESSIONS_ENV,
+        default=_DEFAULT_MAX_RUNTIME_SESSIONS,
+        field_name="max_runtime_sessions",
+    )
 
 
 def _record_terminal_turn(
@@ -329,7 +349,34 @@ def _parse_deadline(value: Any) -> datetime:
     return parsed.astimezone(UTC)
 
 
-def _env_from_input(input_value: Mapping[str, Any]) -> dict[str, str]:
+def _allowed_turn_env_names(spec: AgentSpec) -> set[str]:
+    names = {entry.name for entry in spec.env}
+    if spec.model.api_key_env:
+        names.add(spec.model.api_key_env)
+    if spec.model.auth and spec.model.auth.token_env:
+        names.add(spec.model.auth.token_env)
+    for tool in spec.tools:
+        names.update(tool.env)
+        if tool.url_env:
+            names.add(tool.url_env)
+        for header in tool.headers:
+            if header.value_env:
+                names.add(header.value_env)
+        if tool.auth and tool.auth.token_env:
+            names.add(tool.auth.token_env)
+    for provider in spec.context.providers:
+        for name in (provider.endpoint_env, provider.index_env, provider.store_name_env):
+            if name:
+                names.add(name)
+        if provider.auth and provider.auth.token_env:
+            names.add(provider.auth.token_env)
+    for name in (spec.observability.otel.endpoint_env, spec.observability.logs.level_env):
+        if name:
+            names.add(name)
+    return names
+
+
+def _env_from_input(input_value: Mapping[str, Any], *, allowed_names: set[str]) -> dict[str, str]:
     raw_env = input_value.get("env", [])
     if raw_env in (None, ""):
         return {}
@@ -344,6 +391,10 @@ def _env_from_input(input_value: Mapping[str, Any]) -> dict[str, str]:
             raise HTTPException(status_code=400, detail=f"input.env[{idx}].name is required")
         if not _ENV_NAME_RE.fullmatch(name):
             raise HTTPException(status_code=400, detail=f"input.env[{idx}].name is invalid")
+        if name.startswith("AGENTKIT_"):
+            raise HTTPException(status_code=400, detail=f"input.env[{idx}].name {name!r} is reserved")
+        if name not in allowed_names:
+            raise HTTPException(status_code=400, detail=f"input.env[{idx}].name {name!r} is not declared by this agent")
         value = item.get("value", "")
         if not isinstance(value, str):
             raise HTTPException(status_code=400, detail=f"input.env[{idx}].value must be a string")
@@ -385,7 +436,7 @@ def _validate_auth_identity(data: Mapping[str, Any]) -> None:
         raise HTTPException(status_code=400, detail="authIdentity.subject or authIdentity.username is required")
 
 
-def _request_to_run_request(data: dict[str, Any], *, turn_id: str) -> RunRequest:
+def _request_to_run_request(data: dict[str, Any], *, turn_id: str, spec: AgentSpec) -> RunRequest:
     version = data.get("version")
     if version != ORKA_HARNESS_VERSION:
         raise HTTPException(status_code=400, detail=f"version must be {ORKA_HARNESS_VERSION!r}")
@@ -422,7 +473,7 @@ def _request_to_run_request(data: dict[str, Any], *, turn_id: str) -> RunRequest
         prompt=prompt,
         history=(),
         session_id=runtime_session_id,
-        env=_env_from_input(input_value),
+        env=_env_from_input(input_value, allowed_names=_allowed_turn_env_names(spec)),
         deadline=deadline,
         turn_id=turn_id,
         correlation_id=correlation_id,
@@ -651,24 +702,36 @@ def create_orka_app(
     auth_token: str | None = None,
     *,
     max_terminal_turns: int | None = None,
+    max_runtime_sessions: int | None = None,
 ) -> FastAPI:
     """Create an observed-mode Orka harness app for one AgentKit runtime."""
     if not auth_token:
         raise ValueError("Orka mode requires a bearer auth token")
     retention_limit = _max_terminal_turns(max_terminal_turns)
+    runtime_session_limit = _max_runtime_sessions(max_runtime_sessions)
     turns: dict[str, TurnState] = {}
     terminal_order: list[str] = []
     active_runtimes: dict[str, ActiveRuntime] = {}
+    runtime_order: list[str] = []
 
     async def get_runtime(run_request: RunRequest) -> Any:
         runtime_session_id = run_request.session_id or ""
         active = active_runtimes.get(runtime_session_id)
         if active is not None:
+            if runtime_session_id in runtime_order:
+                runtime_order.remove(runtime_session_id)
+            runtime_order.append(runtime_session_id)
             return active.session
         with _scoped_process_env(run_request.env):
             context = factory.build_runtime(spec)
             session = await context.__aenter__()
         active_runtimes[runtime_session_id] = ActiveRuntime(context=context, session=session)
+        runtime_order.append(runtime_session_id)
+        while len(runtime_order) > runtime_session_limit:
+            evict_id = runtime_order.pop(0)
+            evicted = active_runtimes.pop(evict_id, None)
+            if evicted is not None:
+                await evicted.context.__aexit__(None, None, None)
         return session
 
     @asynccontextmanager
@@ -684,6 +747,7 @@ def create_orka_app(
             for active in reversed(list(active_runtimes.values())):
                 await active.context.__aexit__(None, None, None)
             active_runtimes.clear()
+            runtime_order.clear()
 
     app = FastAPI(title="agentkit-serve-orka", lifespan=lifespan)
     auth = Depends(make_auth_dependency(auth_token))
@@ -711,7 +775,7 @@ def create_orka_app(
         if any(state.terminal_event is None for state in turns.values()):
             raise HTTPException(status_code=429, detail="maxConcurrentTurns limit reached")
 
-        run_request = _request_to_run_request(data, turn_id=turn_id)
+        run_request = _request_to_run_request(data, turn_id=turn_id, spec=spec)
         runtime_session_id = run_request.session_id or ""
         correlation_id = run_request.correlation_id or ""
         state = TurnState(
