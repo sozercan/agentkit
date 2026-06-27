@@ -291,6 +291,7 @@ class MAFRuntime:
         self.stack = AsyncExitStack()
         self.agent: Agent | None = None
         self.sessions: dict[str, AgentSession] = {}
+        self.session_locks: dict[str, asyncio.Lock] = {}
         self.session_cache_max = _session_cache_max()
 
     async def __aenter__(self) -> RuntimeSession:
@@ -319,21 +320,37 @@ class MAFRuntime:
     async def run(self, request: RunRequest) -> RunResult:
         if self.agent is None:
             raise AgentBuildError("MAF runtime session is not initialized")
-        session, existed = self._session_for(request.session_id)
+        session, existed, lock = self._session_for(request.session_id)
         include_history = not (session is not None and existed)
-        return await run_agent(self.agent, request, session=session, include_history=include_history)
+        if lock is None:
+            return await run_agent(self.agent, request, session=session, include_history=include_history)
+        async with lock:
+            return await run_agent(self.agent, request, session=session, include_history=include_history)
 
-    def _session_for(self, session_id: str | None) -> tuple[AgentSession | None, bool]:
+    def _session_for(self, session_id: str | None) -> tuple[AgentSession | None, bool, asyncio.Lock | None]:
         if not session_id:
-            return None, False
+            return None, False, None
         session = self.sessions.pop(session_id, None)
+        lock = self.session_locks.pop(session_id, None)
         existed = session is not None
         if session is None:
             session = AgentSession(session_id=session_id)
+        if lock is None:
+            lock = asyncio.Lock()
         self.sessions[session_id] = session
-        while len(self.sessions) > self.session_cache_max:
-            self.sessions.pop(next(iter(self.sessions)))
-        return session, existed
+        self.session_locks[session_id] = lock
+        self._evict_idle_sessions()
+        return session, existed, lock
+
+    def _evict_idle_sessions(self) -> None:
+        for session_id in list(self.sessions):
+            if len(self.sessions) <= self.session_cache_max:
+                return
+            lock = self.session_locks.get(session_id)
+            if lock is not None and lock.locked():
+                continue
+            self.sessions.pop(session_id, None)
+            self.session_locks.pop(session_id, None)
 
     async def _build_context_providers(self):
         providers = []

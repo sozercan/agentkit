@@ -735,3 +735,53 @@ def test_result_usage_reads_usage_details_to_dict():
         "completion_tokens": 6,
         "total_tokens": 11,
     }
+
+
+
+def test_concurrent_same_session_waits_before_dropping_history(monkeypatch):
+    from agentkit_serve_common.config import AgentSpec
+    from agentkit_serve_common.conversation import ConversationTurn, RunRequest
+    from agentkit_serve_common.runtime import RunResult
+
+    started: list[bool] = []
+    include_history_values: list[bool] = []
+
+    import asyncio
+    first_can_finish = asyncio.Event()
+
+    async def fake_run_agent(agent, request, *, session=None, include_history=True):
+        started.append(True)
+        include_history_values.append(include_history)
+        if len(started) == 1:
+            await first_can_finish.wait()
+        return RunResult(text="ok")
+
+    monkeypatch.setattr(agent_factory, "run_agent", fake_run_agent)
+    spec = AgentSpec.model_validate({
+        "abiVersion": "v0",
+        "metadata": {"name": "x"},
+        "model": {"provider": "openai-compatible", "baseURL": "https://api.openai.com/v1", "name": "gpt-4o-mini"},
+        "instructions": "hi",
+        "tools": [],
+        "expose": {"openai": True, "port": 8080},
+    })
+    runtime = agent_factory.MAFRuntime(spec)
+    runtime.agent = object()
+    request = RunRequest(
+        prompt="current",
+        history=(ConversationTurn(role="user", text="old"),),
+        session_id="s1",
+    )
+
+    async def run_two():
+        first = asyncio.create_task(runtime.run(request))
+        await asyncio.sleep(0)
+        second = asyncio.create_task(runtime.run(request))
+        await asyncio.sleep(0.05)
+        assert len(started) == 1
+        first_can_finish.set()
+        await asyncio.gather(first, second)
+
+    asyncio.run(run_two())
+
+    assert include_history_values == [True, False]
