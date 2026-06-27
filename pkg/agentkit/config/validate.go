@@ -188,7 +188,9 @@ func validateContext(add func(string, ...any), ctx Context, tools []Tool) {
 			validateEnvField(add, path+".indexEnv", provider.IndexEnv, true)
 			validateContextAuth(add, path+".auth", provider.Auth)
 		case ContextTypeSkills:
-			validateContextAuth(add, path+".auth", provider.Auth)
+			if provider.Auth != nil {
+				add("%s.auth must not be set for skills context providers; configure auth on the referenced MCP tool", path)
+			}
 			switch provider.Source {
 			case ContextSourceFilesystem:
 				if provider.Path == "" {

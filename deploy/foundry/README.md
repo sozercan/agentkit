@@ -56,7 +56,7 @@ as a Foundry-hosted protocol image.
 - `search/setup.sh` records Azure Search context-provider env names.
 - `memory/setup.sh` records external memory context-provider env names.
 - `rbac/assign-agent-identity.sh` grants the newly-created hosted agent identity
-  the project/account role required for workload-identity model/tool calls.
+  the project/account role required for workload-identity model/tool calls (defaults to `Foundry User`).
 - `scripts/invoke_responses.sh` sends the minimal portable hosted Responses
   payload (`{"input":"..."}`), avoiding gateway-specific optional fields.
 - `doctor.sh` checks the expected Foundry/project env and local CLI prerequisites.

@@ -371,3 +371,52 @@ def test_load_rejects_unknown_skills_source(tmp_path):
         load(_write_spec(tmp_path, spec_dict))
 
     assert "skills context source must be filesystem or mcp" in str(exc.value)
+
+
+def test_load_rejects_unknown_context_provider_type(tmp_path):
+    spec_dict = deepcopy(_BASE_SPEC)
+    spec_dict["context"] = {"providers": [{"type": "serach"}]}
+
+    with pytest.raises(ConfigError) as exc:
+        load(_write_spec(tmp_path, spec_dict))
+
+    assert "context provider type must be search, skills, or memory" in str(exc.value)
+
+
+def test_load_rejects_search_context_missing_env_fields(tmp_path):
+    spec_dict = deepcopy(_BASE_SPEC)
+    spec_dict["context"] = {"providers": [{"type": "search", "endpointEnv": "SEARCH_ENDPOINT"}]}
+
+    with pytest.raises(ConfigError) as exc:
+        load(_write_spec(tmp_path, spec_dict))
+
+    assert "search context providers require indexEnv" in str(exc.value)
+
+
+def test_load_rejects_auth_on_skills_context_provider(tmp_path):
+    spec_dict = deepcopy(_BASE_SPEC)
+    spec_dict["context"] = {
+        "providers": [
+            {
+                "type": "skills",
+                "source": "filesystem",
+                "path": "/agent/skills",
+                "auth": {"type": "workload-identity-token", "audience": "https://ai.azure.com/.default"},
+            }
+        ]
+    }
+
+    with pytest.raises(ConfigError) as exc:
+        load(_write_spec(tmp_path, spec_dict))
+
+    assert "skills context providers must not set auth" in str(exc.value)
+
+
+def test_load_rejects_unsupported_tool_approval_policy(tmp_path):
+    spec_dict = deepcopy(_BASE_SPEC)
+    spec_dict["tools"] = [{"name": "fetch", "command": ["uvx", "mcp-server-fetch"], "approval": "always"}]
+
+    with pytest.raises(ConfigError) as exc:
+        load(_write_spec(tmp_path, spec_dict))
+
+    assert "tool approval policies are not supported" in str(exc.value)

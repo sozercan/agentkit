@@ -4,7 +4,7 @@ set -euo pipefail
 : "${AZURE_RESOURCE_GROUP:?set AZURE_RESOURCE_GROUP}"
 : "${AZURE_AI_ACCOUNT_NAME:?set AZURE_AI_ACCOUNT_NAME}"
 : "${AZURE_AI_PROJECT_NAME:?set AZURE_AI_PROJECT_NAME}"
-role_name="${AGENTKIT_FOUNDRY_AGENT_ROLE:-Cognitive Services User}"
+role_name="${AGENTKIT_FOUNDRY_AGENT_ROLE:-Foundry User}"
 show_json="${AGENTKIT_FOUNDRY_AGENT_SHOW_JSON:-}"
 if [[ -n "$show_json" ]]; then
   principal_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["instance_identity"]["principal_id"])' "$show_json")

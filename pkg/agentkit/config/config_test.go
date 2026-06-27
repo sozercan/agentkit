@@ -820,7 +820,7 @@ expose:
 	if verr == nil {
 		t.Fatal("expected bearer auth validation error for skills context provider, got nil")
 	}
-	if !strings.Contains(verr.Error(), "not supported for context providers") {
+	if !strings.Contains(verr.Error(), "must not be set for skills context providers") {
 		t.Fatalf("expected context auth error, got: %v", verr)
 	}
 }
@@ -850,5 +850,40 @@ expose:
 	}
 	if verr := cfg.Validate(); verr != nil {
 		t.Fatalf("POSIX /agent/skills subpath should validate: %v", verr)
+	}
+}
+
+func TestValidateRejectsAuthForSkillsContextProvider(t *testing.T) {
+	in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: skills-agent
+runtime: microsoft-agent-framework
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: hi
+context:
+  providers:
+    - type: skills
+      source: filesystem
+      path: /agent/skills
+      auth:
+        type: workload-identity-token
+        audience: https://ai.azure.com/.default
+expose:
+  openai: true
+`)
+	cfg, err := NewFromBytes(in)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	verr := cfg.Validate()
+	if verr == nil {
+		t.Fatal("expected skills auth validation error, got nil")
+	}
+	if !strings.Contains(verr.Error(), "auth must not be set for skills context providers") {
+		t.Fatalf("expected skills auth error, got: %v", verr)
 	}
 }

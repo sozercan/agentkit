@@ -210,6 +210,8 @@ class ToolSpec(_Strict):
     def _approval_supported(cls, value: str | None) -> str | None:
         if value is not None and value not in _APPROVAL_VALUES:
             raise ValueError("approval must be one of never, auto, or always")
+        if value in {"auto", "always"}:
+            raise ValueError("tool approval policies are not supported by this runtime")
         return value
 
     @model_validator(mode="after")
@@ -273,7 +275,21 @@ class ContextProviderSpec(_Strict):
     def _valid_context_provider_shape(self) -> "ContextProviderSpec":
         if self.auth is not None and self.auth.type == _AUTH_BEARER:
             raise ValueError("context providers do not support bearer auth; use workload-identity-token")
+        if self.type == _CONTEXT_TYPE_SEARCH:
+            if not self.endpoint_env:
+                raise ValueError("search context providers require endpointEnv")
+            if not self.index_env:
+                raise ValueError("search context providers require indexEnv")
+            return self
+        if self.type == _CONTEXT_TYPE_MEMORY:
+            if not self.endpoint_env:
+                raise ValueError("memory context providers require endpointEnv")
+            if not self.store_name_env:
+                raise ValueError("memory context providers require storeNameEnv")
+            return self
         if self.type == _CONTEXT_TYPE_SKILLS:
+            if self.auth is not None:
+                raise ValueError("skills context providers must not set auth; configure auth on the referenced MCP tool")
             if self.source == _CONTEXT_SOURCE_FILESYSTEM:
                 if not self.path:
                     raise ValueError("filesystem skills require path")
@@ -285,7 +301,8 @@ class ContextProviderSpec(_Strict):
                     raise ValueError("MCP skills require toolRef")
             else:
                 raise ValueError("skills context source must be filesystem or mcp")
-        return self
+            return self
+        raise ValueError("context provider type must be search, skills, or memory")
 
 
 class ContextSpec(_Strict):

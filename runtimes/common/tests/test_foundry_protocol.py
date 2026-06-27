@@ -157,3 +157,15 @@ def test_foundry_responses_rejects_request_supplied_tools():
     assert tools.json()["error"]["code"] == "tools_unsupported"
     assert choice.status_code == 400
     assert choice.json()["error"]["code"] == "tool_choice_unsupported"
+
+
+def test_foundry_protocol_uses_platform_session_env_fallback(monkeypatch):
+    factory = EchoFactory()
+    app = create_foundry_app(_spec(), factory)
+    monkeypatch.setenv("FOUNDRY_AGENT_SESSION_ID", "platform-session")
+
+    with TestClient(app) as client:
+        resp = client.post("/invocations", json={"message": "hello"})
+
+    assert resp.status_code == 200
+    assert factory.runtime.requests[0].session_id == "platform-session"
