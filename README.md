@@ -212,8 +212,9 @@ The most important rules are:
 - `apiKeyEnv`, tool `env`, top-level `env`, and env-suffixed fields such as
   `urlEnv` or `valueEnv` are env var names, not secret values.
 - `expose.openai` must be `true`; `expose.port` defaults to `8080`.
-- Context provider, model workload-identity, observability export, and tool
-  approval schemas are capability-gated; the MAF runtime currently declares
+- Context provider, model workload-identity, OTel export, and tool
+  approval schemas are capability-gated; log-level observability is reserved but
+  rejected until a runtime wires it through. The MAF runtime currently declares
   skills, search, and memory context-provider support.
 
 Full reference: [`docs/agentkitfile.md`](docs/agentkitfile.md).

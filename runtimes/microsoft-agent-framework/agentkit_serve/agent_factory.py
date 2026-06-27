@@ -434,16 +434,28 @@ def _result_text(result: object) -> str:
     return text if isinstance(text, str) else str(result)
 
 
+def _usage_value(details: object, name: str, default: int | None = 0) -> int | None:
+    get = getattr(details, "get", None)
+    if callable(get):
+        value = get(name, default)
+    else:
+        to_dict = getattr(details, "to_dict", None)
+        if callable(to_dict):
+            value = to_dict().get(name, default)
+        else:
+            value = getattr(details, name, default)
+    return int(value) if value is not None else None
+
+
 def _result_usage(result: object) -> dict[str, int]:
     """Map MAF ``usage_details`` to the OpenAI usage block (zeros if unknown)."""
     details = getattr(result, "usage_details", None)
-    get = getattr(details, "get", None)
-    if not callable(get):
+    if details is None:
         return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-    prompt_tokens = int(get("input_token_count", 0) or 0)
-    completion_tokens = int(get("output_token_count", 0) or 0)
-    total = get("total_token_count", None)
-    total_tokens = int(total) if total is not None else prompt_tokens + completion_tokens
+    prompt_tokens = _usage_value(details, "input_token_count", 0) or 0
+    completion_tokens = _usage_value(details, "output_token_count", 0) or 0
+    total = _usage_value(details, "total_token_count", None)
+    total_tokens = total if total is not None else prompt_tokens + completion_tokens
     return {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,

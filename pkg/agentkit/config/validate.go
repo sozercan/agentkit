@@ -236,6 +236,9 @@ func validateContextAuth(add func(string, ...any), path string, auth *Auth) {
 func validateObservability(add func(string, ...any), obs Observability) {
 	validateEnvField(add, "observability.otel.endpointEnv", obs.OTel.EndpointEnv, false)
 	validateEnvField(add, "observability.logs.levelEnv", obs.Logs.LevelEnv, false)
+	if obs.Logs.LevelEnv != "" {
+		add("observability.logs.levelEnv is not supported by current runtimes; omit it until log-level wiring is implemented")
+	}
 }
 
 func validateEnvField(add func(string, ...any), path, value string, required bool) {

@@ -332,7 +332,8 @@ class ObservabilityLogsSpec(_Strict):
     def _level_env_name(cls, value: str | None) -> str | None:
         if value is None:
             return value
-        return _validate_env_name(value, field="observability.logs.levelEnv")
+        _validate_env_name(value, field="observability.logs.levelEnv")
+        raise ValueError("observability.logs.levelEnv is not supported by current runtimes")
 
 
 class ObservabilitySpec(_Strict):

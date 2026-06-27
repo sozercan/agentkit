@@ -887,3 +887,32 @@ expose:
 		t.Fatalf("expected skills auth error, got: %v", verr)
 	}
 }
+
+func TestValidateRejectsUnsupportedLogObservability(t *testing.T) {
+	in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: logs-agent
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: hi
+observability:
+  logs:
+    levelEnv: LOG_LEVEL
+expose:
+  openai: true
+`)
+	cfg, err := NewFromBytes(in)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	verr := cfg.Validate()
+	if verr == nil {
+		t.Fatal("expected unsupported log observability validation error, got nil")
+	}
+	if !strings.Contains(verr.Error(), "observability.logs.levelEnv is not supported") {
+		t.Fatalf("expected logs support error, got: %v", verr)
+	}
+}

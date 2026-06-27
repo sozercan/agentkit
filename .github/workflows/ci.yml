@@ -40,7 +40,15 @@ jobs:
         run: |
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/*.yml
           bash -n scripts/live-copilot-agent-e2e.sh
-          bash -n deploy/foundry/doctor.sh deploy/foundry/toolbox/setup.sh deploy/foundry/search/setup.sh deploy/foundry/memory/setup.sh deploy/foundry/rbac/assign-agent-identity.sh deploy/foundry/scripts/invoke_responses.sh
+          for script in \
+            deploy/foundry/doctor.sh \
+            deploy/foundry/toolbox/setup.sh \
+            deploy/foundry/search/setup.sh \
+            deploy/foundry/memory/setup.sh \
+            deploy/foundry/rbac/assign-agent-identity.sh \
+            deploy/foundry/scripts/invoke_responses.sh; do
+            bash -n "$script"
+          done
           python3 -m py_compile test/foundry-hosted-agent/foundry_live.py
           python3 - <<'PY'
           from pathlib import Path

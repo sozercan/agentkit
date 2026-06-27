@@ -38,4 +38,4 @@ and auth wiring.
 | `microsoft-agent-framework` / `maf` | `stdio-mcp`, `streamable-http-mcp`, `workload-identity-token-auth`, `model-workload-identity-auth`, `context-provider-skills`, `filesystem-skills`, `mcp-skills`, `context-provider-search`, `context-provider-memory` |
 | `langgraph` | `stdio-mcp`, `streamable-http-mcp` |
 
-Context-provider schemas are capability-gated per runtime; the MAF adapter currently declares skills, search, and memory support. OTel export and tool approval schemas remain gated until a runtime declares support.
+Context-provider schemas are capability-gated per runtime; the MAF adapter currently declares skills, search, and memory support. OTel export and tool approval schemas remain gated until a runtime declares support. Log-level observability is reserved but rejected until a runtime wires it through.

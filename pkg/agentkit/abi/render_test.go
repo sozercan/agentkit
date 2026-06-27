@@ -209,7 +209,6 @@ func TestRenderAgentYAMLIncludesContextAndObservability(t *testing.T) {
 		IndexEnv:    "SEARCH_INDEX",
 	}}
 	cfg.Observability.OTel.EndpointEnv = "OTEL_EXPORTER_OTLP_ENDPOINT"
-	cfg.Observability.Logs.LevelEnv = "LOG_LEVEL"
 	out, err := Render(effective.FromConfig(cfg, testInstructions))
 	if err != nil {
 		t.Fatalf("render error: %v", err)
@@ -225,7 +224,6 @@ func TestRenderAgentYAMLIncludesContextAndObservability(t *testing.T) {
 		"indexEnv: SEARCH_INDEX",
 		"observability:",
 		"endpointEnv: OTEL_EXPORTER_OTLP_ENDPOINT",
-		"levelEnv: LOG_LEVEL",
 	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("rendered agent.yaml missing %q\n---\n%s", want, s)

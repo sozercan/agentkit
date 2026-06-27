@@ -703,3 +703,35 @@ def test_build_mcp_skills_provider_uses_pinned_streamable_http_factory(monkeypat
     assert "httpx_client_factory" in calls
     assert "http_client" not in calls
     assert calls["initialized"] is True
+
+
+
+def test_result_usage_reads_usage_details_attributes():
+    class Usage:
+        input_token_count = 3
+        output_token_count = 4
+        total_token_count = 7
+
+    class Result:
+        usage_details = Usage()
+
+    assert agent_factory._result_usage(Result()) == {
+        "prompt_tokens": 3,
+        "completion_tokens": 4,
+        "total_tokens": 7,
+    }
+
+
+def test_result_usage_reads_usage_details_to_dict():
+    class Usage:
+        def to_dict(self):
+            return {"input_token_count": 5, "output_token_count": 6, "total_token_count": 11}
+
+    class Result:
+        usage_details = Usage()
+
+    assert agent_factory._result_usage(Result()) == {
+        "prompt_tokens": 5,
+        "completion_tokens": 6,
+        "total_tokens": 11,
+    }

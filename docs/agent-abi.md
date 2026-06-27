@@ -81,8 +81,7 @@ context:
 observability:
   otel:
     endpointEnv: OTEL_EXPORTER_OTLP_ENDPOINT
-  logs:
-    levelEnv: LOG_LEVEL
+  # logs.levelEnv is reserved but rejected until a runtime wires log-level support.
 
 expose:
   openai: true
