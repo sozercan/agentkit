@@ -98,6 +98,27 @@ agentkit render --target orka-agentruntime \
   --name fibey-agentkit
 ```
 
+Orka mode uses the native `orka.harness.v1` JSON contract. A turn starts with
+Orka `StartTurnRequest` fields such as `runtimeSessionID`, `turnID`,
+`correlationID`, `deadline`, and `input.prompt`, and AgentKit replies with an
+Orka `StartTurnResponse`:
+
+```json
+{
+  "version": "orka.harness.v1",
+  "accepted": true,
+  "runtimeSessionID": "runtime-session-1",
+  "turnID": "turn-1",
+  "correlationID": "corr-1",
+  "eventStreamPath": "/v1/turns/turn-1/events"
+}
+```
+
+The event stream emits Orka `HarnessEventFrame` SSE payloads using flat identity
+fields (`runtimeSessionID`, `turnID`, `correlationID`), `createdAt`,
+`contentText` for runtime output, and `completed` / `failed` terminal payloads.
+See [`docs/orka.md`](docs/orka.md) for complete request/response examples.
+
 ## Add MCP tools
 
 Declare MCP servers in `tools:`. Tools are owned by the built agent, not supplied

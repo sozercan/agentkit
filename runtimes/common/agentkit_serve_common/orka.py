@@ -13,7 +13,6 @@ import asyncio
 import json
 import os
 import re
-import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -23,15 +22,19 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from .config import AgentSpec
-from .conversation import FORWARDED_ROLES, ConversationTurn, RunRequest, text_of
+from .conversation import RunRequest
 from .runtime import AgentRunError, RunResult, RuntimeFactory
 from .server import make_auth_dependency
 
 ORKA_HARNESS_VERSION = "orka.harness.v1"
+HTTP_TRANSPORT = "http+sse"
+PROVIDER_KIND_KUBERNETES_SERVICE = "kubernetes-service"
+TOOL_MODE_OBSERVED = "observed"
 _TERMINAL_TYPES = frozenset({"TurnCompleted", "TurnFailed", "TurnCancelled"})
 _DEFAULT_MAX_TERMINAL_TURNS = 256
 _MAX_TERMINAL_TURNS_ENV = "AGENTKIT_ORKA_MAX_TERMINAL_TURNS"
 _TURN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _now_iso() -> str:
@@ -42,9 +45,18 @@ def _now_iso() -> str:
 class TurnEvent:
     seq: int
     type: str
+    runtime_session_id: str
     turn_id: str
-    payload: Mapping[str, Any] = field(default_factory=dict)
-    timestamp: str = field(default_factory=_now_iso)
+    correlation_id: str
+    created_at: str = field(default_factory=_now_iso)
+    severity: str = "info"
+    summary: str = ""
+    content: Mapping[str, Any] | None = None
+    content_text: str = ""
+    completed: Mapping[str, Any] | None = None
+    failed: Mapping[str, Any] | None = None
+    error: Mapping[str, Any] | None = None
+    metadata: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def terminal(self) -> bool:
@@ -53,33 +65,78 @@ class TurnEvent:
     def as_frame(self) -> dict[str, Any]:
         return {
             "version": ORKA_HARNESS_VERSION,
-            "turnID": self.turn_id,
-            "seq": self.seq,
             "type": self.type,
-            "timestamp": self.timestamp,
-            "payload": dict(self.payload),
+            "runtimeSessionID": self.runtime_session_id,
+            "turnID": self.turn_id,
+            "correlationID": self.correlation_id,
+            "seq": self.seq,
+            "createdAt": self.created_at,
+            "severity": self.severity,
+            "summary": self.summary,
+            "content": dict(self.content or {}),
+            "contentText": self.content_text,
+            "completed": dict(self.completed) if self.completed is not None else None,
+            "failed": dict(self.failed) if self.failed is not None else None,
+            "error": dict(self.error) if self.error is not None else None,
+            "metadata": dict(self.metadata),
         }
 
 
 class TurnState:
     """Buffered turn event state with replay support for SSE clients."""
 
-    def __init__(self, turn_id: str, task: asyncio.Task[None] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        runtime_session_id: str,
+        turn_id: str,
+        correlation_id: str,
+        metadata: Mapping[str, str] | None = None,
+        task: asyncio.Task[None] | None = None,
+    ) -> None:
+        self.runtime_session_id = runtime_session_id
         self.turn_id = turn_id
+        self.correlation_id = correlation_id
+        self.metadata = dict(metadata or {})
         self.task = task
         self.events: list[TurnEvent] = []
         self.condition = asyncio.Condition()
         self.terminal_event: TurnEvent | None = None
 
-    async def append(self, event_type: str, payload: Mapping[str, Any] | None = None) -> tuple[TurnEvent, bool]:
+    async def append(
+        self,
+        event_type: str,
+        *,
+        severity: str = "info",
+        summary: str = "",
+        content: Mapping[str, Any] | None = None,
+        content_text: str = "",
+        completed: Mapping[str, Any] | None = None,
+        failed: Mapping[str, Any] | None = None,
+        error: Mapping[str, Any] | None = None,
+        metadata: Mapping[str, str] | None = None,
+    ) -> tuple[TurnEvent, bool]:
         async with self.condition:
             if event_type in _TERMINAL_TYPES and self.terminal_event is not None:
                 return self.terminal_event, False
+            seq = len(self.events) + 1
+            if event_type == "TurnCompleted":
+                completed = dict(completed or {})
+                completed.setdefault("finalEventSeq", seq)
             event = TurnEvent(
-                seq=len(self.events) + 1,
+                seq=seq,
                 type=event_type,
+                runtime_session_id=self.runtime_session_id,
                 turn_id=self.turn_id,
-                payload=payload or {},
+                correlation_id=self.correlation_id,
+                severity=severity,
+                summary=summary,
+                content=content,
+                content_text=content_text,
+                completed=completed,
+                failed=failed,
+                error=error,
+                metadata=metadata or self.metadata,
             )
             self.events.append(event)
             if event.terminal:
@@ -134,9 +191,20 @@ async def _append_terminal_if_missing(
     turns: dict[str, TurnState],
     max_terminal_turns: int,
     event_type: str,
-    payload: Mapping[str, Any],
+    *,
+    summary: str,
+    failed: Mapping[str, Any] | None = None,
+    completed: Mapping[str, Any] | None = None,
+    error: Mapping[str, Any] | None = None,
 ) -> None:
-    _, created = await state.append(event_type, payload)
+    _, created = await state.append(
+        event_type,
+        severity="error" if event_type == "TurnFailed" else "info",
+        summary=summary,
+        completed=completed,
+        failed=failed,
+        error=error,
+    )
     if created:
         _record_terminal_turn(state.turn_id, terminal_order, turns, max_terminal_turns)
 
@@ -152,15 +220,17 @@ def _ensure_terminal_on_task_done(
         return
     if task.cancelled():
         event_type = "TurnCancelled"
-        payload: Mapping[str, Any] = {"reason": "cancelled"}
+        summary = "turn cancelled"
+        failed = None
+        error = None
     else:
         exc = task.exception()
         event_type = "TurnFailed"
-        payload = (
-            {"code": exc.__class__.__name__, "message": str(exc), "status": 502}
-            if exc is not None
-            else {"code": "RuntimeTaskEndedWithoutTerminal", "message": "runtime task ended without a terminal frame", "status": 502}
-        )
+        code = exc.__class__.__name__ if exc is not None else "RuntimeTaskEndedWithoutTerminal"
+        message = str(exc) if exc is not None else "runtime task ended without a terminal frame"
+        summary = "turn failed"
+        failed = {"reason": code, "message": message, "retryable": False}
+        error = {"code": code, "message": message, "retryable": False}
     asyncio.create_task(
         _append_terminal_if_missing(
             state,
@@ -168,7 +238,9 @@ def _ensure_terminal_on_task_done(
             turns,
             max_terminal_turns,
             event_type,
-            payload,
+            summary=summary,
+            failed=failed,
+            error=error,
         )
     )
 
@@ -185,10 +257,15 @@ def _clean(value: Any) -> str | None:
     return text or None
 
 
-def _turn_id_from_payload(data: dict[str, Any]) -> str:
-    turn_id = _clean(data.get("turnID", data.get("turnId", data.get("turn_id"))))
-    if turn_id is None:
-        return f"turn_{uuid.uuid4().hex}"
+def _required_string(data: Mapping[str, Any], field_name: str) -> str:
+    value = _clean(data.get(field_name))
+    if value is None:
+        raise HTTPException(status_code=400, detail=f"{field_name} is required")
+    return value
+
+
+def _turn_id_from_payload(data: Mapping[str, Any]) -> str:
+    turn_id = _required_string(data, "turnID")
     if not _TURN_ID_RE.fullmatch(turn_id):
         raise HTTPException(
             status_code=400,
@@ -212,9 +289,9 @@ def _mapping_of_strings(data: Any, *, field_name: str) -> dict[str, str]:
     return out
 
 
-def _parse_deadline(value: Any) -> datetime | None:
+def _parse_deadline(value: Any) -> datetime:
     if value in (None, ""):
-        return None
+        raise HTTPException(status_code=400, detail="deadline is required")
     if not isinstance(value, str):
         raise HTTPException(status_code=400, detail="deadline must be an RFC3339 timestamp string")
     raw = value.strip()
@@ -229,65 +306,232 @@ def _parse_deadline(value: Any) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
-def _prompt_from_payload(data: dict[str, Any]) -> str:
-    for key in ("prompt", "input", "message"):
-        if key not in data:
-            continue
-        value = data[key]
-        if isinstance(value, str):
-            return value
-        if isinstance(value, dict) and isinstance(value.get("prompt"), str):
-            return value["prompt"]
-        return json.dumps(value, separators=(",", ":"), sort_keys=True)
-    raise HTTPException(status_code=400, detail="turn request must include prompt, input, or message")
-
-
-def _history_from_payload(data: dict[str, Any]) -> tuple[ConversationTurn, ...]:
-    raw = data.get("history", data.get("messages", []))
-    if raw in (None, ""):
-        return ()
-    if not isinstance(raw, list):
-        raise HTTPException(status_code=400, detail="history/messages must be an array")
-    history: list[ConversationTurn] = []
-    for idx, item in enumerate(raw):
+def _env_from_input(input_value: Mapping[str, Any]) -> dict[str, str]:
+    raw_env = input_value.get("env", [])
+    if raw_env in (None, ""):
+        return {}
+    if not isinstance(raw_env, list):
+        raise HTTPException(status_code=400, detail="input.env must be an array")
+    env: dict[str, str] = {}
+    for idx, item in enumerate(raw_env):
         if not isinstance(item, dict):
-            raise HTTPException(status_code=400, detail=f"history[{idx}] must be an object")
-        role = str(item.get("role") or "")
-        if role not in FORWARDED_ROLES:
-            continue
-        if "text" in item:
-            text = str(item.get("text") or "")
-        else:
-            text = text_of(item.get("content"))
-        if text:
-            history.append(ConversationTurn(role=role, text=text))
-    return tuple(history)
+            raise HTTPException(status_code=400, detail=f"input.env[{idx}] must be an object")
+        name = _clean(item.get("name"))
+        if name is None:
+            raise HTTPException(status_code=400, detail=f"input.env[{idx}].name is required")
+        if not _ENV_NAME_RE.fullmatch(name):
+            raise HTTPException(status_code=400, detail=f"input.env[{idx}].name is invalid")
+        value = item.get("value", "")
+        if not isinstance(value, str):
+            raise HTTPException(status_code=400, detail=f"input.env[{idx}].value must be a string")
+        env[name] = value
+    return env
+
+
+def _context_refs_from_input(input_value: Mapping[str, Any]) -> list[dict[str, Any]]:
+    refs = input_value.get("contextRefs", [])
+    if refs in (None, ""):
+        return []
+    if not isinstance(refs, list):
+        raise HTTPException(status_code=400, detail="input.contextRefs must be an array")
+    out: list[dict[str, Any]] = []
+    for idx, item in enumerate(refs):
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=400, detail=f"input.contextRefs[{idx}] must be an object")
+        kind = _clean(item.get("kind"))
+        if kind is None:
+            raise HTTPException(status_code=400, detail=f"input.contextRefs[{idx}].kind is required")
+        name = _clean(item.get("name"))
+        if name is None:
+            raise HTTPException(status_code=400, detail=f"input.contextRefs[{idx}].name is required")
+        seq = item.get("seq", 0)
+        if not isinstance(seq, int) or seq < 0:
+            raise HTTPException(status_code=400, detail=f"input.contextRefs[{idx}].seq must be non-negative")
+        ref = {"kind": kind, "name": name}
+        if seq:
+            ref["seq"] = seq
+        out.append(ref)
+    return out
+
+
+def _validate_auth_identity(data: Mapping[str, Any]) -> None:
+    raw = data.get("authIdentity")
+    if not isinstance(raw, dict):
+        raise HTTPException(status_code=400, detail="authIdentity is required")
+    if _clean(raw.get("subject")) is None and _clean(raw.get("username")) is None:
+        raise HTTPException(status_code=400, detail="authIdentity.subject or authIdentity.username is required")
 
 
 def _request_to_run_request(data: dict[str, Any], *, turn_id: str) -> RunRequest:
-    version = data.get("version") or data.get("contractVersion")
+    version = data.get("version")
     if version != ORKA_HARNESS_VERSION:
         raise HTTPException(status_code=400, detail=f"version must be {ORKA_HARNESS_VERSION!r}")
+    namespace = _required_string(data, "namespace")
+    task_name = _required_string(data, "taskName")
+    session_name = _required_string(data, "sessionName")
+    runtime_session_id = _required_string(data, "runtimeSessionID")
+    correlation_id = _required_string(data, "correlationID")
+    deadline = _parse_deadline(data.get("deadline"))
+    _validate_auth_identity(data)
+    tool_mode = _clean(data.get("toolExecutionMode"))
+    if tool_mode not in (None, "", TOOL_MODE_OBSERVED):
+        raise HTTPException(status_code=400, detail=f"unsupported toolExecutionMode {tool_mode!r}")
+    if data.get("eventCursor", 0) not in (None, ""):
+        event_cursor = data.get("eventCursor", 0)
+        if not isinstance(event_cursor, int) or event_cursor < 0:
+            raise HTTPException(status_code=400, detail="eventCursor must be non-negative")
 
-    session_id = _clean(data.get("sessionID", data.get("sessionId", data.get("session_id"))))
-    correlation_id = _clean(
-        data.get("correlationID", data.get("correlationId", data.get("correlation_id")))
-    )
+    input_value = data.get("input")
+    if not isinstance(input_value, dict):
+        raise HTTPException(status_code=400, detail="input must be an object")
+    if "prompt" not in input_value:
+        raise HTTPException(status_code=400, detail="input.prompt is required")
+    prompt = input_value.get("prompt")
+    if not isinstance(prompt, str):
+        raise HTTPException(status_code=400, detail="input.prompt must be a string")
+    context_refs = _context_refs_from_input(input_value)
+    metadata = _mapping_of_strings(data.get("metadata"), field_name="metadata")
+    if context_refs:
+        metadata["contextRefs"] = json.dumps(context_refs, separators=(",", ":"), sort_keys=True)
+    _ = (namespace, task_name, session_name)
+
     return RunRequest(
-        prompt=_prompt_from_payload(data),
-        history=_history_from_payload(data),
-        session_id=session_id,
-        env=_mapping_of_strings(data.get("env"), field_name="env"),
-        deadline=_parse_deadline(data.get("deadline")),
+        prompt=prompt,
+        history=(),
+        session_id=runtime_session_id,
+        env=_env_from_input(input_value),
+        deadline=deadline,
         turn_id=turn_id,
         correlation_id=correlation_id,
-        metadata=_mapping_of_strings(data.get("metadata"), field_name="metadata"),
+        metadata=metadata,
     )
 
 
 def _usage_payload(result: RunResult) -> dict[str, int]:
     usage = result.usage or {}
     return {key: int(usage.get(key, 0) or 0) for key in sorted(usage)}
+
+
+def health_response(spec: AgentSpec) -> dict[str, Any]:
+    return {
+        "version": ORKA_HARNESS_VERSION,
+        "status": "ok",
+        "ready": True,
+        "checkedAt": _now_iso(),
+        "metadata": {"agentName": spec.metadata.name},
+    }
+
+
+def capabilities_response(spec: AgentSpec) -> dict[str, Any]:
+    return {
+        "version": ORKA_HARNESS_VERSION,
+        "protocolVersion": ORKA_HARNESS_VERSION,
+        "transport": HTTP_TRANSPORT,
+        "runtimeName": "agentkit-serve",
+        "runtimeVersion": "0.0.0",
+        "providerKind": PROVIDER_KIND_KUBERNETES_SERVICE,
+        "toolExecutionModes": [TOOL_MODE_OBSERVED],
+        "supportsCancel": True,
+        "supportsRuntimeSessions": True,
+        "supportsSuspend": False,
+        "supportsWorkspaceSnapshot": False,
+        "maxConcurrentTurns": 1,
+        "metadata": {
+            "agentName": spec.metadata.name,
+            "model": spec.model.name,
+            "agentkitProvider": spec.model.provider,
+        },
+    }
+
+
+def start_turn_response(turn: TurnState) -> dict[str, Any]:
+    return {
+        "version": ORKA_HARNESS_VERSION,
+        "accepted": True,
+        "runtimeSessionID": turn.runtime_session_id,
+        "turnID": turn.turn_id,
+        "correlationID": turn.correlation_id,
+        "eventStreamPath": f"/v1/turns/{turn.turn_id}/events",
+    }
+
+
+def cancel_turn_response(turn: TurnState, request_data: Mapping[str, Any]) -> dict[str, Any]:  # noqa: ARG001 - request is validated before response.
+    return {
+        "version": ORKA_HARNESS_VERSION,
+        "accepted": True,
+        "runtimeSessionID": turn.runtime_session_id,
+        "turnID": turn.turn_id,
+        "correlationID": turn.correlation_id,
+        "message": "cancel accepted",
+    }
+
+
+def _frame_base(
+    turn: TurnState,
+    seq: int,
+    frame_type: str,
+    *,
+    severity: str = "info",
+    summary: str = "",
+    content: Mapping[str, Any] | None = None,
+    content_text: str = "",
+    completed: Mapping[str, Any] | None = None,
+    failed: Mapping[str, Any] | None = None,
+    error: Mapping[str, Any] | None = None,
+    metadata: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "version": ORKA_HARNESS_VERSION,
+        "type": frame_type,
+        "runtimeSessionID": turn.runtime_session_id,
+        "turnID": turn.turn_id,
+        "correlationID": turn.correlation_id,
+        "seq": seq,
+        "createdAt": _now_iso(),
+        "severity": severity,
+        "summary": summary,
+        "content": dict(content or {}),
+        "contentText": content_text,
+        "completed": dict(completed) if completed is not None else None,
+        "failed": dict(failed) if failed is not None else None,
+        "error": dict(error) if error is not None else None,
+        "metadata": dict(metadata or turn.metadata),
+    }
+
+
+def frame_started(turn: TurnState, seq: int) -> dict[str, Any]:
+    return _frame_base(turn, seq, "TurnStarted", summary="turn started")
+
+
+def frame_runtime_output(turn: TurnState, seq: int, text: str, content: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    return _frame_base(turn, seq, "RuntimeOutput", summary="runtime output", content=content, content_text=text)
+
+
+def frame_completed(turn: TurnState, seq: int, result_text: str) -> dict[str, Any]:
+    return _frame_base(
+        turn,
+        seq,
+        "TurnCompleted",
+        summary="turn completed",
+        completed={"result": result_text, "finalEventSeq": seq},
+    )
+
+
+def frame_failed(turn: TurnState, seq: int, reason: str, message: str, retryable: bool = False) -> dict[str, Any]:
+    failed = {"reason": reason, "message": message, "retryable": retryable}
+    return _frame_base(
+        turn,
+        seq,
+        "TurnFailed",
+        severity="error",
+        summary="turn failed",
+        failed=failed,
+        error={"code": reason, "message": message, "retryable": retryable},
+    )
+
+
+def frame_cancelled(turn: TurnState, seq: int, reason: str = "cancelled") -> dict[str, Any]:
+    return _frame_base(turn, seq, "TurnCancelled", summary=f"turn {reason}")
 
 
 async def _run_turn(
@@ -299,8 +543,6 @@ async def _run_turn(
     *,
     max_terminal_turns: int,
 ) -> None:
-    terminal_type = "TurnCompleted"
-    terminal_payload: Mapping[str, Any]
     try:
         if run_request.deadline is None:
             result = await runtime.run(run_request)
@@ -310,30 +552,70 @@ async def _run_turn(
                 raise TimeoutError("turn deadline has already expired")
             async with asyncio.timeout(seconds):
                 result = await runtime.run(run_request)
-        terminal_payload = {
-            "result": {"text": result.text, "usage": _usage_payload(result)},
-            "finishReason": "stop",
-        }
     except asyncio.CancelledError:
-        terminal_type = "TurnCancelled"
-        terminal_payload = {"reason": "cancelled"}
+        await _append_terminal_if_missing(
+            state,
+            terminal_order,
+            turns,
+            max_terminal_turns,
+            "TurnCancelled",
+            summary="turn cancelled",
+        )
+        return
     except TimeoutError as exc:
-        terminal_type = "TurnFailed"
-        terminal_payload = {"code": "DeadlineExceeded", "message": str(exc) or "turn deadline exceeded"}
+        await _append_terminal_if_missing(
+            state,
+            terminal_order,
+            turns,
+            max_terminal_turns,
+            "TurnFailed",
+            summary="turn deadline exceeded",
+            failed={"reason": "DeadlineExceeded", "message": str(exc) or "turn deadline exceeded", "retryable": False},
+            error={"code": "DeadlineExceeded", "message": str(exc) or "turn deadline exceeded", "retryable": False},
+        )
+        return
     except AgentRunError as exc:
-        terminal_type = "TurnFailed"
-        terminal_payload = {"code": exc.code or exc.__class__.__name__, "message": str(exc), "status": exc.status}
+        code = exc.code or exc.__class__.__name__
+        await _append_terminal_if_missing(
+            state,
+            terminal_order,
+            turns,
+            max_terminal_turns,
+            "TurnFailed",
+            summary="turn failed",
+            failed={"reason": code, "message": str(exc), "retryable": False},
+            error={"code": code, "message": str(exc), "retryable": False},
+        )
+        return
     except Exception as exc:  # noqa: BLE001 - protocol envelope must be deterministic.
-        terminal_type = "TurnFailed"
-        terminal_payload = {"code": exc.__class__.__name__, "message": str(exc), "status": 502}
+        code = exc.__class__.__name__
+        await _append_terminal_if_missing(
+            state,
+            terminal_order,
+            turns,
+            max_terminal_turns,
+            "TurnFailed",
+            summary="turn failed",
+            failed={"reason": code, "message": str(exc), "retryable": False},
+            error={"code": code, "message": str(exc), "retryable": False},
+        )
+        return
 
+    if result.text:
+        await state.append(
+            "RuntimeOutput",
+            summary="runtime output",
+            content={"message": result.text, "usage": _usage_payload(result)},
+            content_text=result.text,
+        )
     await _append_terminal_if_missing(
         state,
         terminal_order,
         turns,
         max_terminal_turns,
-        terminal_type,
-        terminal_payload,
+        "TurnCompleted",
+        summary="turn completed",
+        completed={"result": result.text},
     )
 
 
@@ -367,23 +649,11 @@ def create_orka_app(
 
     @app.get("/v1/health")
     async def health() -> dict[str, Any]:
-        return {"version": ORKA_HARNESS_VERSION, "status": "ok", "ready": True}
+        return health_response(spec)
 
     @app.get("/v1/capabilities")
     async def capabilities() -> dict[str, Any]:
-        return {
-            "version": ORKA_HARNESS_VERSION,
-            "runtime": {
-                "name": "agentkit-serve",
-                "version": "0.0.0",
-                "agentName": spec.metadata.name,
-            },
-            "provider": {"kind": spec.model.provider, "model": spec.model.name},
-            "toolExecutionModes": ["observed"],
-            "supportsCancel": True,
-            "supportsRuntimeSessions": True,
-            "supportsReplay": True,
-        }
+        return capabilities_response(spec)
 
     @app.post("/v1/turns", dependencies=[auth], status_code=202)
     async def create_turn(request: Request):
@@ -397,18 +667,20 @@ def create_orka_app(
         turn_id = _turn_id_from_payload(data)
         if turn_id in turns:
             raise HTTPException(status_code=409, detail=f"turn {turn_id!r} already exists")
+        if any(state.terminal_event is None for state in turns.values()):
+            raise HTTPException(status_code=429, detail="maxConcurrentTurns limit reached")
 
         run_request = _request_to_run_request(data, turn_id=turn_id)
-        state = TurnState(turn_id)
-        turns[turn_id] = state
-        await state.append(
-            "TurnStarted",
-            {
-                "sessionID": run_request.session_id,
-                "correlationID": run_request.correlation_id,
-                "metadata": dict(run_request.metadata),
-            },
+        runtime_session_id = run_request.session_id or ""
+        correlation_id = run_request.correlation_id or ""
+        state = TurnState(
+            runtime_session_id=runtime_session_id,
+            turn_id=turn_id,
+            correlation_id=correlation_id,
+            metadata=run_request.metadata,
         )
+        turns[turn_id] = state
+        await state.append("TurnStarted", summary="turn started")
         state.task = asyncio.create_task(
             _run_turn(
                 request.app.state.runtime,
@@ -428,12 +700,7 @@ def create_orka_app(
                 retention_limit,
             )
         )
-        return {
-            "version": ORKA_HARNESS_VERSION,
-            "turnID": turn_id,
-            "status": "accepted",
-            "events": f"/v1/turns/{turn_id}/events",
-        }
+        return start_turn_response(state)
 
     @app.get("/v1/turns/{turn_id}/events", dependencies=[auth])
     async def turn_events(
@@ -464,10 +731,30 @@ def create_orka_app(
         )
 
     @app.post("/v1/turns/{turn_id}/cancel", dependencies=[auth], status_code=202)
-    async def cancel_turn(turn_id: str):
+    async def cancel_turn(turn_id: str, request: Request):
+        try:
+            data = await request.json()
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail="Request body must be JSON") from exc
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+        if data.get("version") != ORKA_HARNESS_VERSION:
+            raise HTTPException(status_code=400, detail=f"version must be {ORKA_HARNESS_VERSION!r}")
+        body_turn_id = _turn_id_from_payload(data)
+        if body_turn_id != turn_id:
+            raise HTTPException(status_code=400, detail="cancel turnID must match route turnID")
+        runtime_session_id = _required_string(data, "runtimeSessionID")
+        correlation_id = _required_string(data, "correlationID")
+        for field_name in ("namespace", "taskName", "sessionName"):
+            _required_string(data, field_name)
+
         state = turns.get(turn_id)
         if state is None:
             raise HTTPException(status_code=404, detail="turn not found")
+        if runtime_session_id != state.runtime_session_id:
+            raise HTTPException(status_code=400, detail="cancel runtimeSessionID must match turn runtimeSessionID")
+        if correlation_id != state.correlation_id:
+            raise HTTPException(status_code=400, detail="cancel correlationID must match turn correlationID")
         if state.terminal_event is None and state.task is not None and not state.task.done():
             state.task.cancel()
         elif state.terminal_event is None:
@@ -477,11 +764,15 @@ def create_orka_app(
                 turns,
                 retention_limit,
                 "TurnCancelled" if state.task is None or state.task.cancelled() else "TurnFailed",
-                {"reason": "cancelled"}
+                summary="turn cancelled" if state.task is None or state.task.cancelled() else "turn failed",
+                failed=None
                 if state.task is None or state.task.cancelled()
-                else {"code": "RuntimeTaskEndedWithoutTerminal", "message": "runtime task ended without a terminal frame", "status": 502},
+                else {"reason": "RuntimeTaskEndedWithoutTerminal", "message": "runtime task ended without a terminal frame", "retryable": False},
+                error=None
+                if state.task is None or state.task.cancelled()
+                else {"code": "RuntimeTaskEndedWithoutTerminal", "message": "runtime task ended without a terminal frame", "retryable": False},
             )
-        return {"version": ORKA_HARNESS_VERSION, "turnID": turn_id, "status": "accepted"}
+        return cancel_turn_response(state, data)
 
     @app.get("/v1/turns/{turn_id}/output", dependencies=[auth])
     async def turn_output(turn_id: str, ref: str):  # noqa: ARG001 - reserved optional endpoint.

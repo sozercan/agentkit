@@ -19,7 +19,7 @@ Current and reserved names:
 - `foundry-responses-minimal` — current Foundry `/responses` wrapper: synchronous
   and non-streaming. Do not treat this as full Responses parity for background,
   streaming, polling, cancel, or durable response IDs.
-- `orka-harness-v1` — observed-mode `orka.harness.v1` over HTTP+SSE.
+- `orka-harness-v1` — observed-mode native Orka `orka.harness.v1` wire protocol over HTTP+SSE (`HealthResponse`, flat `CapabilitiesResponse`, `StartTurnRequest`, `StartTurnResponse`, and `HarnessEventFrame`).
 - `orka-observed-tools` — AgentKit-owned tools/MCP execute inside the runtime;
   Orka observes lifecycle/output frames and governs externally.
 - `orka-brokered-tools` — reserved for a future mode where Orka brokers tool
