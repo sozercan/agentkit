@@ -156,6 +156,8 @@ text, not the file reference.
 
 ### `tools`
 
+Stdio MCP tools use `command`:
+
 ```yaml
 tools:
   - name: fetch
@@ -163,17 +165,77 @@ tools:
     env: ["FETCH_TIMEOUT"]
 ```
 
-Each tool is a stdio MCP server:
+Remote MCP tools use Streamable HTTP plus env-derived URL/auth material:
+
+```yaml
+tools:
+  - name: toolbox
+    type: mcp
+    transport: streamable-http
+    urlEnv: TOOLBOX_ENDPOINT
+    headers:
+      - name: Foundry-Features
+        value: Toolboxes=V1Preview
+    auth:
+      type: workload-identity-token
+      audience: https://ai.azure.com/.default
+```
+
+Tool rules:
 
 - `name` is required and must be unique within the agent.
-- `command` is required and must contain at least the executable; empty command
-  parts are rejected.
-- `env` is optional and lists env var names that may be passed to this tool
-  subprocess.
+- Stdio tools set `command`; remote tools set `type: mcp`,
+  `transport: streamable-http`, and `urlEnv`.
+- Stdio `env` lists env var names that may be passed to the subprocess.
+- Remote headers may use static non-secret values or `valueEnv`; static
+  credential headers are rejected.
+- Remote auth supports `bearer`/`tokenEnv` and, where the selected runtime
+  declares support, `workload-identity-token`/`audience`.
 
 Runtime adapters pass only declared, present env vars into tool subprocesses. A
 tool env value that references `${OTHER_VAR}` must also list `OTHER_VAR` in the
 same tool's allowlist, preventing accidental secret bleed from the parent process.
+
+
+### `context`
+
+Context providers describe external knowledge, skills, or memory without naming a
+cloud provider in AgentKit core. Runtime support is capability-gated.
+
+```yaml
+context:
+  providers:
+    - name: knowledge
+      type: search
+      endpointEnv: SEARCH_ENDPOINT
+      indexEnv: SEARCH_INDEX
+      auth:
+        type: workload-identity-token
+        audience: https://search.azure.com/.default
+    - name: support-style
+      type: skills
+      source: filesystem
+      path: /agent/skills
+    - name: user-memory
+      type: memory
+      endpointEnv: MEMORY_ENDPOINT
+      storeNameEnv: MEMORY_STORE_NAME
+      auth:
+        type: workload-identity-token
+        audience: https://ai.azure.com/.default
+```
+
+- `search` requires `endpointEnv` and `indexEnv`.
+- `skills` uses `source: filesystem` with an absolute `path` under
+  `/agent/skills`, or `source: mcp` with a remote streamable-http MCP `toolRef`.
+- `memory` requires `endpointEnv` and `storeNameEnv`.
+- Env-suffixed fields name environment variables; they never contain endpoint
+  secrets or token values directly.
+
+AgentKit does not copy arbitrary local skill directories into the image. If you
+use filesystem skills, stage them under `/agent/skills` in the runtime/deployment
+image or prefer MCP-backed skills. Memory providers require an explicit
+`AGENTKIT_MEMORY_SCOPE` runtime env var; choose a per-user/session-safe scope.
 
 ### `expose`
 

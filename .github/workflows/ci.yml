@@ -40,6 +40,16 @@ jobs:
         run: |
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/*.yml
           bash -n scripts/live-copilot-agent-e2e.sh
+          for script in \
+            deploy/foundry/doctor.sh \
+            deploy/foundry/toolbox/setup.sh \
+            deploy/foundry/search/setup.sh \
+            deploy/foundry/memory/setup.sh \
+            deploy/foundry/rbac/assign-agent-identity.sh \
+            deploy/foundry/scripts/invoke_responses.sh; do
+            bash -n "$script"
+          done
+          python3 -m py_compile test/foundry-hosted-agent/foundry_live.py
           python3 - <<'PY'
           from pathlib import Path
           import re
@@ -131,7 +141,22 @@ jobs:
           if [ "${{ matrix.path }}" != "runtimes/common" ]; then
             uv pip install --python .venv/bin/python -e ../common
           fi
-          uv pip install --python .venv/bin/python -e ".[dev]" build
+          prerelease_args=()
+          if [ "${{ matrix.path }}" = "runtimes/microsoft-agent-framework" ]; then
+            # The Azure AI Search MAF adapter is currently published as a beta
+            # package and depends on a beta azure-search-documents build.
+            prerelease_args+=(--prerelease=allow)
+          fi
+          uv pip install --python .venv/bin/python "${prerelease_args[@]}" -e ".[dev]" build
+
+
+      - name: Validate Foundry helper rendering
+        if: matrix.path == 'runtimes/common'
+        run: |
+          set -euxo pipefail
+          python3 -m py_compile deploy/foundry/render_agent.py test/foundry-hosted-agent/foundry_live.py
+          runtimes/common/.venv/bin/python deploy/foundry/render_agent.py deploy/foundry/agentkit.foundry.yaml.example >/tmp/agentkit-foundry-agent.yaml
+          grep -q '^environment_variables:' /tmp/agentkit-foundry-agent.yaml
 
       - name: Compile Python modules
         working-directory: ${{ matrix.path }}

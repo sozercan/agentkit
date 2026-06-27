@@ -4,10 +4,10 @@
 // Runtime identity lives here so BOTH pkg/agentkit/config (the validator) and
 // pkg/build (the adapter registry) can agree on "what runtimes exist" without a
 // config→build import cycle. This package owns the WHOLE declaration — canonical
-// name, aliases, and the default adapter image ref — as a single source of truth;
-// pkg/build merely DERIVES its route/registry maps from it. Adding a runtime is
-// therefore one RuntimeSpec literal here (plus the adapter image itself); no
-// second registry to keep in sync.
+// name, aliases, capabilities, and the default adapter image ref — as a single
+// source of truth; pkg/build merely DERIVES its route/registry maps from it.
+// Adding a runtime is therefore one RuntimeSpec literal here (plus the adapter
+// image itself); no second registry to keep in sync.
 package runtimes
 
 const (
@@ -24,6 +24,31 @@ const (
 	LangGraph = "langgraph"
 )
 
+const (
+	// CapabilityStdioMCP means the runtime can start stdio MCP servers from
+	// tools[].command entries in the baked Agent YAML ABI.
+	CapabilityStdioMCP = "stdio-mcp"
+	// CapabilityStreamableHTTPMCP means the runtime can connect to remote MCP
+	// servers over Streamable HTTP. The schema for requesting it lands in a later
+	// phase; keep the capability provider-neutral.
+	CapabilityStreamableHTTPMCP = "streamable-http-mcp"
+	// CapabilityFoundryInvocationsProtocol means a runtime/protocol adapter can
+	// expose Foundry's /readiness + /invocations contract.
+	CapabilityFoundryInvocationsProtocol = "foundry-invocations-protocol"
+	// CapabilityFoundryResponsesProtocol means a runtime/protocol adapter can
+	// expose Foundry's /readiness + /responses contract.
+	CapabilityFoundryResponsesProtocol  = "foundry-responses-protocol"
+	CapabilityFilesystemSkills          = "filesystem-skills"
+	CapabilityMCPSkills                 = "mcp-skills"
+	CapabilityContextProviderSearch     = "context-provider-search"
+	CapabilityContextProviderMemory     = "context-provider-memory"
+	CapabilityContextProviderSkills     = "context-provider-skills"
+	CapabilityWorkloadIdentityTokenAuth = "workload-identity-token-auth"
+	CapabilityModelWorkloadIdentityAuth = "model-workload-identity-auth"
+	CapabilityOTelExport                = "otel-export"
+	CapabilityToolApproval              = "tool-approval"
+)
+
 // RuntimeSpec is the complete declaration of one runtime adapter.
 type RuntimeSpec struct {
 	// Name is the canonical runtime identifier used in agentkitfile `runtime:`,
@@ -31,9 +56,34 @@ type RuntimeSpec struct {
 	Name string
 	// Aliases are alternate user-writable spellings that resolve to Name.
 	Aliases []string
+	// Capabilities lists provider-neutral features this runtime supports. Config
+	// validation checks requested features against this set before any image build.
+	Capabilities []string
 	// DefaultAdapterRef is the OCI ref of the serve adapter image used as the LLB
 	// base when no `--build-arg adapter=` override is supplied.
 	DefaultAdapterRef string
+}
+
+// HasCapability reports whether this runtime declares cap.
+func (rt RuntimeSpec) HasCapability(capability string) bool {
+	for _, have := range rt.Capabilities {
+		if have == capability {
+			return true
+		}
+	}
+	return false
+}
+
+// MissingCapabilities returns requested capabilities that this runtime does not
+// declare, preserving requested order for deterministic error messages.
+func (rt RuntimeSpec) MissingCapabilities(requested []string) []string {
+	var missing []string
+	for _, capability := range requested {
+		if !rt.HasCapability(capability) {
+			missing = append(missing, capability)
+		}
+	}
+	return missing
 }
 
 // Runtimes is the canonical, ordered list of runtime adapters AgentKit ships.
@@ -42,15 +92,18 @@ type RuntimeSpec struct {
 var Runtimes = []RuntimeSpec{
 	{
 		Name:              PydanticAI,
+		Capabilities:      []string{CapabilityStdioMCP, CapabilityStreamableHTTPMCP},
 		DefaultAdapterRef: "ghcr.io/sozercan/agentkit/serve-pydantic-ai:latest",
 	},
 	{
 		Name:              MAF,
 		Aliases:           []string{MAFAlias}, // "maf" → "microsoft-agent-framework"
+		Capabilities:      []string{CapabilityStdioMCP, CapabilityStreamableHTTPMCP, CapabilityWorkloadIdentityTokenAuth, CapabilityModelWorkloadIdentityAuth, CapabilityContextProviderSkills, CapabilityFilesystemSkills, CapabilityMCPSkills, CapabilityContextProviderSearch, CapabilityContextProviderMemory},
 		DefaultAdapterRef: "ghcr.io/sozercan/agentkit/serve-maf:latest",
 	},
 	{
 		Name:              LangGraph,
+		Capabilities:      []string{CapabilityStdioMCP, CapabilityStreamableHTTPMCP},
 		DefaultAdapterRef: "ghcr.io/sozercan/agentkit/serve-langgraph:latest",
 	},
 }

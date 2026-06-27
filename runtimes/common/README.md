@@ -7,25 +7,30 @@ or LangGraph.
 
 ## Modules
 
-- `config.py` — strict `/agent/agent.yaml` ABI loader and version check.
+- `config.py` — strict `/agent/agent.yaml` ABI loader, version check, env
+  requirement validation, and provider-neutral schema validation.
 - `cli.py` — `agentkit-serve --config ...`, bind/port handling, and the startup
   auth gate for non-loopback binds.
 - `server.py` — FastAPI app for `/healthz`, `/v1/models`, and
   `/v1/chat/completions`.
+- `foundry.py` — reusable Foundry Hosted Agent protocol wrapper for
+  `/readiness`, `/invocations`, and minimal non-streaming `/responses`.
 - `conversation.py` — OpenAI message normalization into a framework-neutral
   `RunRequest`.
 - `runtime.py` — `RuntimeFactory`, `RuntimeSession`, `RunResult`, and
   `AgentRunError`.
 - `adapter_support.py` — API-key resolution, declared-only tool env projection,
-  MCP timeout parsing, and framework exception normalization.
+  remote MCP URL/header/auth resolution, MCP HTTP client factories, MCP timeout
+  parsing, and framework exception normalization.
 - `conformance.py` — shared HTTP behavior tests imported by adapter test suites.
 
 ## Adapter seam
 
-`server.create_app(spec, factory, auth_token)` receives an adapter module that
-satisfies `RuntimeFactory`. The shared server calls only
-`factory.build_runtime(spec)` and `RuntimeSession.run(request) -> RunResult`.
-It never imports framework packages or touches raw framework agent lifecycle.
+`server.create_app(spec, factory, auth_token)` and
+`foundry.create_foundry_app(spec, factory)` receive an adapter module that
+satisfies `RuntimeFactory`. The shared core calls only `factory.build_runtime(spec)`
+and `RuntimeSession.run(request) -> RunResult`. It never imports framework
+packages or touches raw framework agent lifecycle.
 
 This keeps framework dependency lock-in inside each adapter's `agent_factory.py`.
 

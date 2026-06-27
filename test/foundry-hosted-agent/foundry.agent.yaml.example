@@ -6,6 +6,8 @@ image: docker.io/YOUR_ORG/agentkit-foundry-invocations:TAG
 protocols:
   - protocol: invocations
     version: 1.0.0
+  - protocol: responses
+    version: 1.0.0
 resources:
   cpu: "0.25"
   memory: 0.5Gi

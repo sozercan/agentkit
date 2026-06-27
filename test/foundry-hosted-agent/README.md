@@ -1,15 +1,26 @@
 # Foundry Hosted Agent smoke test
 
 This fixture validates that a built AgentKit image can run behind the Microsoft
-Foundry Hosted Agents **invocations** protocol.
+Foundry Hosted Agents **invocations** and minimal non-streaming **responses** protocols.
 
 Foundry containers use a different serving contract than AgentKit's native
-OpenAI `/v1` façade: they listen on port `8088`, expose `/readiness`, and serve a
-protocol endpoint such as `/invocations`. This fixture wraps a normal AgentKit
-image with that protocol surface.
+OpenAI `/v1` façade: they listen on port `8088`, expose `/readiness`, and serve
+protocol endpoints such as `/invocations` or `/responses`. This fixture wraps a normal AgentKit
+image with those protocol surfaces.
 
-The smoke test intentionally uses an in-container OpenAI-compatible mock model at
-`127.0.0.1:9000` so validation does not depend on external model credentials.
+The default smoke test intentionally uses an in-container OpenAI-compatible mock
+model at `127.0.0.1:9000` so validation does not depend on external model
+credentials.
+
+## Live wrapper
+
+`foundry_live.py` is the non-mock variant used for real parity validation. It
+loads the baked `/agent/agent.yaml`, validates required generic env declarations,
+and exposes the same Foundry `/readiness`, `/invocations`, and non-streaming
+`/responses` surfaces against the selected AgentKit runtime. Use this wrapper
+when testing an AgentKit-built image against real model, search, memory, or
+remote MCP resources. Keep provider-specific endpoints and role assignments in
+deployment tooling rather than AgentKit core schema.
 
 ## Runtime lifecycle
 
@@ -47,13 +58,23 @@ docker buildx build --builder desktop-linux . \
   -t foundry-agentkit-base:test --load --provenance=false
 ```
 
-Wrap it with the Foundry invocations protocol:
+Wrap it with the mock Foundry hosted-agent protocol adapter:
 
 ```sh
 docker buildx build --builder desktop-linux test/foundry-hosted-agent \
   --platform linux/amd64 \
   --build-arg BASE_IMAGE=foundry-agentkit-base:test \
   -t agentkit-foundry-invocations:test --load --provenance=false
+```
+
+For live-resource validation, wrap the same base image with `foundry_live.py`
+instead of the mock wrapper, for example:
+
+```Dockerfile
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+COPY foundry_live.py /opt/agentkit/foundry_live.py
+ENTRYPOINT ["/opt/agentkit/bin/python", "/opt/agentkit/foundry_live.py"]
 ```
 
 ## Validate locally
@@ -70,6 +91,9 @@ curl -fsS http://127.0.0.1:18088/readiness
 curl -fsS -H 'content-type: application/json' \
   http://127.0.0.1:18088/invocations \
   -d @test/foundry-hosted-agent/request.json
+curl -fsS -H 'content-type: application/json' \
+  http://127.0.0.1:18088/responses \
+  -d '{"input":"hello from Foundry hosted AgentKit JSON"}'
 ```
 
 Expected response body:
@@ -85,9 +109,9 @@ Expected response body:
 }
 ```
 
-Use the same `request.json` body when invoking the hosted agent. The local and
-Foundry-hosted JSON response bodies should be identical; platform HTTP headers
-will differ.
+Use the same `request.json` body when invoking the hosted invocations protocol.
+For Responses protocol checks, compare the extracted final assistant text rather
+than generated response/message IDs or timestamps.
 
 ## Deploy to Foundry with azd
 
@@ -96,7 +120,7 @@ will differ.
 3. Copy `foundry.agent.yaml.example` to that azd project's `agent.yaml` and set
    `image:` to the pushed image tag.
 4. Run `azd provision` and `azd deploy`.
-5. Invoke with the invocations protocol and the JSON body from `request.json`.
+5. Invoke with the invocations protocol and the JSON body from `request.json`; optionally invoke the responses protocol with an `input` payload.
 
 `azd ai agent invoke --protocol invocations "message"` may send a non-JSON raw
 body depending on CLI behavior. Prefer `-f request.json` for this fixture so the

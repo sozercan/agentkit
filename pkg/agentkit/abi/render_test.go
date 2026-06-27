@@ -71,8 +71,8 @@ func TestRenderAgentYAMLShape(t *testing.T) {
 	}
 	s := string(out)
 
-	// The reader is extra=forbid: assert exactly the allowed top-level keys are
-	// present and no foreign key leaks in.
+	// The reader is extra=forbid: assert the required top-level keys are present
+	// and no foreign key leaks in. Optional env is covered below.
 	mustContain := []string{"abiVersion:", "metadata:", "model:", "instructions:", "tools:", "expose:", "baseURL:", "apiKeyEnv:"}
 	for _, k := range mustContain {
 		if !strings.Contains(s, k) {
@@ -120,6 +120,10 @@ func TestRenderAgentYAMLRoundTrips(t *testing.T) {
 			Command []string `yaml:"command"`
 			Env     []string `yaml:"env"`
 		} `yaml:"tools"`
+		Env []struct {
+			Name     string `yaml:"name"`
+			Required bool   `yaml:"required"`
+		} `yaml:"env"`
 		Expose struct {
 			OpenAI bool `yaml:"openai"`
 			Port   int  `yaml:"port"`
@@ -136,5 +140,108 @@ func TestRenderAgentYAMLRoundTrips(t *testing.T) {
 	}
 	if len(got.Tools) != 1 || got.Tools[0].Name != "fetch" {
 		t.Errorf("tools not round-tripped: %+v", got.Tools)
+	}
+}
+
+func TestRenderAgentYAMLIncludesEnvRequirements(t *testing.T) {
+	cfg := sampleConfig()
+	cfg.Env = []config.EnvVar{
+		{Name: "REQUIRED_FOO", Required: true},
+		{Name: "OPTIONAL_BAR"},
+	}
+	out, err := Render(effective.FromConfig(cfg, testInstructions))
+	if err != nil {
+		t.Fatalf("render error: %v", err)
+	}
+
+	s := string(out)
+	for _, want := range []string{"env:", "name: REQUIRED_FOO", "required: true", "name: OPTIONAL_BAR"} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("rendered agent.yaml missing %q\n---\n%s", want, s)
+		}
+	}
+	if strings.Contains(s, "required: false") {
+		t.Fatalf("optional env vars should omit required: false\n---\n%s", s)
+	}
+}
+
+func TestRenderAgentYAMLIncludesRemoteMCPTool(t *testing.T) {
+	cfg := sampleConfig()
+	cfg.Tools = []config.Tool{{
+		Name:      "toolbox",
+		Type:      config.ToolTypeMCP,
+		Transport: config.ToolTransportStreamableHTTP,
+		URLEnv:    "TOOLBOX_ENDPOINT",
+		Headers: []config.ToolHeader{{
+			Name:  "Foundry-Features",
+			Value: "Toolboxes=V1Preview",
+		}},
+		Auth: &config.Auth{Type: config.AuthTypeBearer, TokenEnv: "TOOLBOX_TOKEN"},
+	}}
+	out, err := Render(effective.FromConfig(cfg, testInstructions))
+	if err != nil {
+		t.Fatalf("render error: %v", err)
+	}
+
+	s := string(out)
+	for _, want := range []string{
+		"type: mcp",
+		"transport: streamable-http",
+		"urlEnv: TOOLBOX_ENDPOINT",
+		"name: Foundry-Features",
+		"value: Toolboxes=V1Preview",
+		"auth:",
+		"type: bearer",
+		"tokenEnv: TOOLBOX_TOKEN",
+	} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("rendered agent.yaml missing %q\n---\n%s", want, s)
+		}
+	}
+}
+
+func TestRenderAgentYAMLIncludesContextAndObservability(t *testing.T) {
+	cfg := sampleConfig()
+	cfg.Context.Providers = []config.ContextProvider{{
+		Name:        "knowledge",
+		Type:        config.ContextTypeSearch,
+		EndpointEnv: "SEARCH_ENDPOINT",
+		IndexEnv:    "SEARCH_INDEX",
+	}}
+	cfg.Observability.OTel.EndpointEnv = "OTEL_EXPORTER_OTLP_ENDPOINT"
+	out, err := Render(effective.FromConfig(cfg, testInstructions))
+	if err != nil {
+		t.Fatalf("render error: %v", err)
+	}
+
+	s := string(out)
+	for _, want := range []string{
+		"context:",
+		"providers:",
+		"name: knowledge",
+		"type: search",
+		"endpointEnv: SEARCH_ENDPOINT",
+		"indexEnv: SEARCH_INDEX",
+		"observability:",
+		"endpointEnv: OTEL_EXPORTER_OTLP_ENDPOINT",
+	} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("rendered agent.yaml missing %q\n---\n%s", want, s)
+		}
+	}
+}
+
+func TestRenderAgentYAMLIncludesModelWorkloadIdentityAuth(t *testing.T) {
+	cfg := sampleConfig()
+	cfg.Model.Auth = &config.Auth{Type: config.AuthTypeWorkloadIdentity, Audience: "https://ai.azure.com/.default"}
+	out, err := Render(effective.FromConfig(cfg, testInstructions))
+	if err != nil {
+		t.Fatalf("render error: %v", err)
+	}
+	s := string(out)
+	for _, want := range []string{"auth:", "type: workload-identity-token", "audience: https://ai.azure.com/.default"} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("rendered agent.yaml missing %q\n---\n%s", want, s)
+		}
 	}
 }

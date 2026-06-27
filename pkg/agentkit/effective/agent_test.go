@@ -8,7 +8,10 @@ import (
 	"github.com/sozercan/agentkit/pkg/utils"
 )
 
-const testAPIKeyEnvName = "OPENAI_API_KEY" //nolint:gosec // G101: env var NAME, not a credential
+const (
+	testAPIKeyEnvName = "OPENAI_API_KEY" //nolint:gosec // G101: env var NAME, not a credential
+	mutatedValue      = "MUTATED"
+)
 
 func baseConfig() *config.AgentConfig {
 	return &config.AgentConfig{
@@ -23,8 +26,15 @@ func baseConfig() *config.AgentConfig {
 			APIKeyEnv: testAPIKeyEnvName,
 		},
 		Tools: []config.Tool{
-			{Name: "fetch", Command: []string{"uvx", "mcp-server-fetch"}, Env: []string{"FETCH_TIMEOUT"}},
+			{
+				Name:    "fetch",
+				Command: []string{"uvx", "mcp-server-fetch"},
+				Env:     []string{"FETCH_TIMEOUT"},
+				Headers: []config.ToolHeader{{Name: "X-Trace", ValueEnv: "TRACE_HEADER"}},
+				Auth:    &config.Auth{Type: config.AuthTypeBearer, TokenEnv: "TOOL_TOKEN"},
+			},
 		},
+		Env:    []config.EnvVar{{Name: "REQUIRED_FOO", Required: true}},
 		Expose: config.Expose{OpenAI: true},
 	}
 }
@@ -64,7 +74,10 @@ func TestFromConfigCopiesMutableFields(t *testing.T) {
 
 	cfg.Metadata.Labels["team"] = "mutated"
 	cfg.Tools[0].Command[0] = "mutated"
-	cfg.Tools[0].Env[0] = "MUTATED"
+	cfg.Tools[0].Env[0] = mutatedValue
+	cfg.Tools[0].Headers[0].Name = mutatedValue
+	cfg.Tools[0].Auth.TokenEnv = mutatedValue
+	cfg.Env[0].Name = mutatedValue
 
 	if agent.Metadata.Labels["team"] != "agentkit" {
 		t.Fatalf("label was not copied: %#v", agent.Metadata.Labels)
@@ -73,6 +86,15 @@ func TestFromConfigCopiesMutableFields(t *testing.T) {
 		t.Fatalf("command was not copied: %q", got)
 	}
 	if got := agent.Tools[0].Env[0]; got != "FETCH_TIMEOUT" {
-		t.Fatalf("env was not copied: %q", got)
+		t.Fatalf("tool env was not copied: %q", got)
+	}
+	if got := agent.Tools[0].Headers[0].Name; got != "X-Trace" {
+		t.Fatalf("tool headers were not copied: %q", got)
+	}
+	if got := agent.Tools[0].Auth.TokenEnv; got != "TOOL_TOKEN" {
+		t.Fatalf("tool auth was not copied: %q", got)
+	}
+	if got := agent.Env[0].Name; got != "REQUIRED_FOO" {
+		t.Fatalf("agent env was not copied: %q", got)
 	}
 }

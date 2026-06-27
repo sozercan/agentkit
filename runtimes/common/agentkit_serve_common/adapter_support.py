@@ -9,8 +9,11 @@ normalizing framework/model failures into the common run error.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
+import shlex
+import subprocess
 
 from .config import AgentSpec, ToolSpec
 from .conversation import FORWARDED_ROLES
@@ -23,6 +26,8 @@ NO_AUTH_API_KEY = "not-needed"
 
 
 MCP_TIMEOUT_ENV = "AGENTKIT_MCP_TIMEOUT"
+WORKLOAD_TOKEN_ENV = "AGENTKIT_WORKLOAD_IDENTITY_TOKEN"
+WORKLOAD_TOKEN_COMMAND_ENV = "AGENTKIT_WORKLOAD_IDENTITY_TOKEN_COMMAND"
 _BRACED_ENV_REF_RE = re.compile(r"\$\{([^}]+)\}")
 
 
@@ -75,6 +80,156 @@ def declared_tool_env(tool: ToolSpec) -> dict[str, str]:
                 "env allowlist or remove the ${...} reference"
             )
     return out
+
+
+def resolve_tool_url(tool: ToolSpec) -> str:
+    """Resolve a remote MCP URL from the env var named by ``tool.urlEnv``."""
+    name = tool.url_env
+    if not name:
+        raise AgentBuildError(f"tool {tool.name!r} has no urlEnv")
+    value = os.environ.get(name)
+    if value is None or value == "":
+        raise AgentBuildError(
+            f"tool {tool.name!r} urlEnv {name!r} is declared in agent.yaml but env var "
+            f"{name!r} is not set; inject it at runtime, e.g. `docker run -e {name}=...`"
+        )
+    return value
+
+
+def resolve_tool_headers(tool: ToolSpec, *, include_workload_identity: bool = True) -> dict[str, str]:
+    """Resolve static/env/auth headers for a remote MCP tool without logging values."""
+    headers: dict[str, str] = {}
+    for header in tool.headers:
+        if header.value is not None and header.value != "":
+            headers[header.name] = header.value
+            continue
+        name = header.value_env
+        if not name:
+            raise AgentBuildError(f"tool {tool.name!r} header {header.name!r} has no value")
+        value = os.environ.get(name)
+        if value is None or value == "":
+            raise AgentBuildError(
+                f"tool {tool.name!r} header {header.name!r} uses valueEnv {name!r} but "
+                f"env var {name!r} is not set; inject it at runtime"
+            )
+        headers[header.name] = value
+
+    if tool.auth is None:
+        return headers
+
+    if any(name.lower() == "authorization" for name in headers):
+        raise AgentBuildError(
+            f"tool {tool.name!r} sets both Authorization header and auth; use one auth path"
+        )
+
+    if tool.auth.type == "bearer":
+        token_env = tool.auth.token_env
+        token = os.environ.get(token_env or "")
+        if not token_env or token is None or token == "":
+            raise AgentBuildError(
+                f"tool {tool.name!r} bearer auth tokenEnv {token_env!r} is declared in "
+                "agent.yaml but the env var is not set; inject it at runtime"
+            )
+        headers["Authorization"] = f"Bearer {token}"
+        return headers
+
+    if tool.auth.type == "workload-identity-token":
+        if not include_workload_identity:
+            return headers
+        token = resolve_workload_identity_token(tool.auth.audience or "")
+        headers["Authorization"] = f"Bearer {token}"
+        return headers
+
+    raise AgentBuildError(f"tool {tool.name!r} auth type {tool.auth.type!r} is not supported")
+
+
+def resolve_workload_identity_token(audience: str) -> str:
+    """Resolve a workload identity token through a provider-neutral runtime hook.
+
+    Deployment profiles may either inject ``AGENTKIT_WORKLOAD_IDENTITY_TOKEN`` for
+    simple smoke tests or set ``AGENTKIT_WORKLOAD_IDENTITY_TOKEN_COMMAND`` to a
+    command that accepts the opaque audience as argv[1] and prints a token. If
+    neither hook is configured, fall back to optional ``azure-identity`` when it
+    is installed in a runtime image. Values are returned to callers only; they are
+    never logged by this helper.
+    """
+    if not audience:
+        raise AgentBuildError("workload identity auth requires a non-empty audience")
+
+    token = os.environ.get(WORKLOAD_TOKEN_ENV)
+    if token:
+        return token
+
+    command = os.environ.get(WORKLOAD_TOKEN_COMMAND_ENV)
+    if command:
+        argv = shlex.split(command) + [audience]
+        try:
+            completed = subprocess.run(
+                argv,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise AgentBuildError(
+                f"workload identity token command failed for audience {audience!r}: {exc}"
+            ) from exc
+        token = completed.stdout.strip()
+        if not token:
+            raise AgentBuildError(
+                f"workload identity token command for audience {audience!r} returned no token"
+            )
+        return token
+
+    try:
+        from azure.identity import DefaultAzureCredential  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise AgentBuildError(
+            "workload identity auth is configured but no token hook is available; set "
+            f"{WORKLOAD_TOKEN_COMMAND_ENV}, set {WORKLOAD_TOKEN_ENV}, or install azure-identity"
+        ) from exc
+
+    credential = DefaultAzureCredential()
+    try:
+        return credential.get_token(audience).token
+    except Exception as exc:  # noqa: BLE001 - normalize provider failures.
+        raise AgentBuildError(
+            f"workload identity token acquisition failed for audience {audience!r}: {exc}"
+        ) from exc
+
+
+def same_origin_mcp_httpx_client_factory(tool: ToolSpec, url: str, *, timeout: float | int | None):
+    """Return an httpx AsyncClient factory that injects tool headers same-origin only.
+
+    FastMCP/LangChain factories may otherwise follow redirects with caller-supplied
+    headers. This factory disables redirects and resolves headers lazily for each
+    request so workload tokens can refresh and credentials are not replayed to a
+    redirected origin.
+    """
+    from httpx import AsyncClient, URL
+
+    target_url = URL(url)
+    target_origin = (target_url.scheme, target_url.host, target_url.port)
+
+    async def inject_headers(request):  # noqa: ANN001
+        request_origin = (request.url.scheme, request.url.host, request.url.port)
+        if request_origin != target_origin:
+            return
+        for key, value in (await asyncio.to_thread(resolve_tool_headers, tool)).items():
+            request.headers[key] = value
+
+    def factory(**kwargs):  # noqa: ANN003
+        base_headers = dict(kwargs.get("headers") or {})
+        return AsyncClient(
+            headers=base_headers,
+            auth=kwargs.get("auth"),
+            event_hooks={"request": [inject_headers]},
+            follow_redirects=False,
+            timeout=timeout if timeout is not None else kwargs.get("timeout"),
+        )
+
+    return factory
 
 
 def split_tool_command(tool: ToolSpec, *, example: str) -> tuple[str, list[str]]:

@@ -10,4 +10,7 @@
 # v0 — it is the human-readable catalog entry for this runtime.
 apiVersion: v1alpha1
 runtime: langgraph
+capabilities:
+  - stdio-mcp
+  - streamable-http-mcp
 adapter: ghcr.io/sozercan/agentkit/serve-langgraph:latest

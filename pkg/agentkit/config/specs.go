@@ -30,6 +30,53 @@ type Model struct {
 	// APIKeyEnv is the NAME of the env var holding the API key — never the value
 	// (plan §3 INJECT axis). The value is provided via `docker run -e` at runtime.
 	APIKeyEnv string `yaml:"apiKeyEnv,omitempty"`
+	// Auth is reserved for generic model auth beyond apiKeyEnv. v0 validates this
+	// behind runtime capability gates; no Foundry/Azure-specific keys live here.
+	Auth *Auth `yaml:"auth,omitempty"`
+}
+
+// EnvVar declares one runtime environment variable the agent expects. Values are
+// never stored in the agentkitfile or baked ABI; only the variable NAME and
+// whether it must be present at runtime are recorded.
+type EnvVar struct {
+	Name     string `yaml:"name"`
+	Required bool   `yaml:"required,omitempty"`
+}
+
+// Context groups provider-neutral external context sources such as search,
+// skills, and memory. Provider-specific provisioning stays outside core.
+type Context struct {
+	Providers []ContextProvider `yaml:"providers,omitempty"`
+}
+
+// ContextProvider is a deliberately small provider-neutral shape. Only the
+// fields needed by a provider type/source are populated.
+type ContextProvider struct {
+	Name         string `yaml:"name,omitempty"`
+	Type         string `yaml:"type"`
+	Source       string `yaml:"source,omitempty"`
+	Path         string `yaml:"path,omitempty"`
+	ToolRef      string `yaml:"toolRef,omitempty"`
+	Index        string `yaml:"index,omitempty"`
+	EndpointEnv  string `yaml:"endpointEnv,omitempty"`
+	IndexEnv     string `yaml:"indexEnv,omitempty"`
+	StoreNameEnv string `yaml:"storeNameEnv,omitempty"`
+	Auth         *Auth  `yaml:"auth,omitempty"`
+}
+
+// Observability declares provider-neutral runtime observability knobs. Values
+// are env var names, never literal connection strings.
+type Observability struct {
+	OTel ObservabilityOTel `yaml:"otel,omitempty"`
+	Logs ObservabilityLogs `yaml:"logs,omitempty"`
+}
+
+type ObservabilityOTel struct {
+	EndpointEnv string `yaml:"endpointEnv,omitempty"`
+}
+
+type ObservabilityLogs struct {
+	LevelEnv string `yaml:"levelEnv,omitempty"`
 }
 
 // Expose declares how the built agent is reachable. v0 supports the OpenAI
@@ -59,6 +106,13 @@ type AgentConfig struct {
 	Instructions Source `yaml:"instructions"`
 	// Tools are MCP servers. v0: stdio command servers (plan §5.2 ⚠).
 	Tools []Tool `yaml:"tools,omitempty"`
+	// Env declares runtime env var requirements by NAME only. Values are injected
+	// by the deployment/runtime environment and never baked into the image.
+	Env []EnvVar `yaml:"env,omitempty"`
+	// Context declares provider-neutral external context sources.
+	Context Context `yaml:"context,omitempty"`
+	// Observability declares optional logging/tracing env wiring.
+	Observability Observability `yaml:"observability,omitempty"`
 	// Expose declares the serving surface.
 	Expose Expose `yaml:"expose"`
 }

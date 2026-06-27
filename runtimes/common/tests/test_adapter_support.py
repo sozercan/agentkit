@@ -169,3 +169,70 @@ def test_normalize_agent_run_error_preserves_code_and_status():
     assert err.status == 503
     assert err.code == "Unavailable"
     assert "upstream down" in str(err)
+
+
+def _remote_tool(**overrides) -> ToolSpec:
+    data = {
+        "name": "toolbox",
+        "type": "mcp",
+        "transport": "streamable-http",
+        "urlEnv": "TOOLBOX_ENDPOINT",
+    }
+    data.update(overrides)
+    return ToolSpec.model_validate(data)
+
+
+def test_resolve_tool_url_uses_declared_env_name_only():
+    tool = _remote_tool()
+    with mock.patch.dict(os.environ, {"TOOLBOX_ENDPOINT": "http://127.0.0.1:8000/mcp"}, clear=True):
+        assert support.resolve_tool_url(tool) == "http://127.0.0.1:8000/mcp"
+
+
+def test_resolve_tool_url_missing_env_fails_secret_free():
+    tool = _remote_tool()
+    with mock.patch.dict(os.environ, {"OTHER_SECRET": "do-not-mention"}, clear=True):
+        with pytest.raises(support.AgentBuildError) as exc:
+            support.resolve_tool_url(tool)
+    msg = str(exc.value)
+    assert "TOOLBOX_ENDPOINT" in msg
+    assert "do-not-mention" not in msg
+
+
+def test_resolve_tool_headers_supports_static_env_and_bearer_auth():
+    tool = _remote_tool(
+        headers=[
+            {"name": "Foundry-Features", "value": "Toolboxes=V1Preview"},
+            {"name": "X-Trace", "valueEnv": "TRACE_HEADER"},
+        ],
+        auth={"type": "bearer", "tokenEnv": "TOOLBOX_TOKEN"},
+    )
+    with mock.patch.dict(os.environ, {"TRACE_HEADER": "trace", "TOOLBOX_TOKEN": "tok"}, clear=True):
+        headers = support.resolve_tool_headers(tool)
+    assert headers == {
+        "Foundry-Features": "Toolboxes=V1Preview",
+        "X-Trace": "trace",
+        "Authorization": "Bearer tok",
+    }
+
+
+def test_resolve_tool_headers_missing_value_env_fails_secret_free():
+    tool = _remote_tool(headers=[{"name": "X-Trace", "valueEnv": "TRACE_HEADER"}])
+    with mock.patch.dict(os.environ, {"OTHER_SECRET": "do-not-mention"}, clear=True):
+        with pytest.raises(support.AgentBuildError) as exc:
+            support.resolve_tool_headers(tool)
+    msg = str(exc.value)
+    assert "TRACE_HEADER" in msg
+    assert "do-not-mention" not in msg
+
+
+def test_resolve_workload_identity_token_uses_explicit_runtime_hook():
+    tool = _remote_tool(auth={"type": "workload-identity-token", "audience": "https://ai.azure.com/.default"})
+    with mock.patch.dict(os.environ, {"AGENTKIT_WORKLOAD_IDENTITY_TOKEN": "workload-token"}, clear=True):
+        assert support.resolve_tool_headers(tool)["Authorization"] == "Bearer workload-token"
+
+
+def test_resolve_tool_headers_can_defer_workload_identity_token():
+    tool = _remote_tool(auth={"type": "workload-identity-token", "audience": "https://ai.azure.com/.default"})
+    with mock.patch.dict(os.environ, {"AGENTKIT_WORKLOAD_IDENTITY_TOKEN": "workload-token"}, clear=True):
+        assert support.resolve_tool_headers(tool, include_workload_identity=False) == {}
+        assert support.resolve_tool_headers(tool)["Authorization"] == "Bearer workload-token"

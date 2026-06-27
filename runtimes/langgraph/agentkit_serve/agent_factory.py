@@ -44,6 +44,8 @@ from agentkit_serve_common.adapter_support import (
     normalize_agent_run_error,
     positive_float_env,
     resolve_api_key,
+    resolve_tool_url,
+    same_origin_mcp_httpx_client_factory,
     split_tool_command,
     upstream_status_code,
 )
@@ -82,9 +84,20 @@ def _tool_env(tool: ToolSpec) -> dict[str, str]:
 
 
 def build_mcp_connection(tool: ToolSpec) -> dict[str, Any]:
-    """Convert an AgentKit stdio tool declaration into a LangChain MCP connection."""
-    command, args = split_tool_command(tool, example='["uvx", "mcp-server-fetch"]')
+    """Convert an AgentKit tool declaration into a LangChain MCP connection."""
     timeout = _mcp_init_timeout()
+    if tool.url_env:
+        url = resolve_tool_url(tool)
+        return {
+            "transport": "streamable_http",
+            "url": url,
+            "timeout": timeout,
+            "sse_read_timeout": timeout,
+            "session_kwargs": {"read_timeout_seconds": timedelta(seconds=timeout)},
+            "httpx_client_factory": same_origin_mcp_httpx_client_factory(tool, url, timeout=timeout),
+        }
+
+    command, args = split_tool_command(tool, example='["uvx", "mcp-server-fetch"]')
     return {
         "transport": "stdio",
         "command": command,
@@ -160,8 +173,16 @@ class LangGraphRuntime:
         return tools
 
 
+def validate_supported_spec(spec: AgentSpec) -> None:
+    if spec.model.auth is not None:
+        raise AgentBuildError("langgraph runtime does not support model.auth; use apiKeyEnv")
+    if spec.context.providers:
+        raise AgentBuildError("langgraph runtime does not support context providers")
+
+
 def build_runtime(spec: AgentSpec) -> LangGraphRuntime:
     """Build the runtime session consumed by the shared server."""
+    validate_supported_spec(spec)
     return LangGraphRuntime(spec)
 
 

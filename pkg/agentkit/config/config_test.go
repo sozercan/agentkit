@@ -3,6 +3,8 @@ package config
 import (
 	"strings"
 	"testing"
+
+	"github.com/sozercan/agentkit/pkg/agentkit/runtimes"
 )
 
 // TestKindProbeRejectsKindlessFile is the regression guard for the AIKit
@@ -274,5 +276,643 @@ func TestValidateRejectsUnknownRuntime(t *testing.T) {
 		if !strings.Contains(verr.Error(), want) {
 			t.Errorf("error should list supported runtime %q; got: %v", want, verr)
 		}
+	}
+}
+
+func TestEnvDeclarationsValidateAndParse(t *testing.T) {
+	in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: env-agent
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+  apiKeyEnv: OPENAI_API_KEY
+instructions: hi
+env:
+  - name: REQUIRED_FOO
+    required: true
+  - name: OPTIONAL_BAR
+expose:
+  openai: true
+`)
+	cfg, err := NewFromBytes(in)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if len(cfg.Env) != 2 {
+		t.Fatalf("Env len = %d, want 2", len(cfg.Env))
+	}
+	if cfg.Env[0].Name != "REQUIRED_FOO" || !cfg.Env[0].Required {
+		t.Fatalf("first env = %+v, want required REQUIRED_FOO", cfg.Env[0])
+	}
+	if cfg.Env[1].Name != "OPTIONAL_BAR" || cfg.Env[1].Required {
+		t.Fatalf("second env = %+v, want optional OPTIONAL_BAR", cfg.Env[1])
+	}
+	if verr := cfg.Validate(); verr != nil {
+		t.Fatalf("valid env declarations failed validation: %v", verr)
+	}
+}
+
+func TestEnvDeclarationsRejectInvalidNamesDuplicatesAndValues(t *testing.T) {
+	in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: env-agent
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+  apiKeyEnv: OPENAI_API_KEY
+instructions: hi
+env:
+  - name: required-foo
+  - name: REQUIRED_FOO
+  - name: REQUIRED_FOO
+expose:
+  openai: true
+`)
+	cfg, err := NewFromBytes(in)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	verr := cfg.Validate()
+	if verr == nil {
+		t.Fatal("expected env validation errors, got nil")
+	}
+	msg := verr.Error()
+	for _, want := range []string{"env[0].name", "[A-Z0-9_]+", "duplicate env var name"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("validation error missing %q; full: %s", want, msg)
+		}
+	}
+
+	withValue := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: env-agent
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: hi
+env:
+  - name: REQUIRED_FOO
+    value: do-not-allow-literals
+expose:
+  openai: true
+`)
+	if _, err := NewFromBytes(withValue); err == nil || !strings.Contains(err.Error(), "value") {
+		t.Fatalf("expected strict parse rejection for env.value literal, got: %v", err)
+	}
+}
+
+func TestValidateRejectsStdioToolWhenRuntimeLacksCapability(t *testing.T) {
+	old := append([]runtimes.RuntimeSpec(nil), runtimes.Runtimes...)
+	t.Cleanup(func() { runtimes.Runtimes = old })
+	for i := range runtimes.Runtimes {
+		if runtimes.Runtimes[i].Name == runtimes.PydanticAI {
+			runtimes.Runtimes[i].Capabilities = nil
+		}
+	}
+
+	in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: caps-agent
+runtime: pydantic-ai
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: hi
+tools:
+  - name: fetch
+    command: ["uvx", "mcp-server-fetch"]
+expose:
+  openai: true
+`)
+	cfg, err := NewFromBytes(in)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	verr := cfg.Validate()
+	if verr == nil {
+		t.Fatal("expected runtime capability validation error, got nil")
+	}
+	msg := verr.Error()
+	for _, want := range []string{"runtime \"pydantic-ai\"", "stdio-mcp"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("validation error missing %q; full: %s", want, msg)
+		}
+	}
+}
+
+func TestValidateAcceptsRemoteMCPToolWithHeadersAndAuth(t *testing.T) {
+	in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: remote-mcp-agent
+runtime: maf
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: hi
+tools:
+  - name: toolbox
+    type: mcp
+    transport: streamable-http
+    urlEnv: TOOLBOX_ENDPOINT
+    headers:
+      - name: Foundry-Features
+        value: Toolboxes=V1Preview
+      - name: X-Trace
+        valueEnv: TOOLBOX_TRACE_HEADER
+    auth:
+      type: bearer
+      tokenEnv: TOOLBOX_TOKEN
+expose:
+  openai: true
+`)
+	cfg, err := NewFromBytes(in)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if verr := cfg.Validate(); verr != nil {
+		t.Fatalf("valid remote MCP tool failed validation: %v", verr)
+	}
+}
+
+func TestValidateRejectsInvalidRemoteMCPToolShapes(t *testing.T) {
+	cases := map[string]string{ //nolint:gosec // test YAML uses credential-looking field names/invalid examples, not real secrets
+		"missing type": `tools:
+  - name: remote
+    transport: streamable-http
+    urlEnv: REMOTE_MCP_URL
+`,
+		"bad url env": `tools:
+  - name: remote
+    type: mcp
+    transport: streamable-http
+    urlEnv: https://example.com/mcp
+`,
+		"static authorization": `tools:
+  - name: remote
+    type: mcp
+    transport: streamable-http
+    urlEnv: REMOTE_MCP_URL
+    headers:
+      - name: Authorization
+        value: static-auth-header
+`,
+		"static api key header": `tools:
+  - name: remote
+    type: mcp
+    transport: streamable-http
+    urlEnv: REMOTE_MCP_URL
+    headers:
+      - name: X-API-Key
+        value: not-secret-looking
+`,
+		"static cookie header": `tools:
+  - name: remote
+    type: mcp
+    transport: streamable-http
+    urlEnv: REMOTE_MCP_URL
+    headers:
+      - name: Cookie
+        value: cookie-static-value
+`,
+		"authorization value env plus auth": `tools:
+  - name: remote
+    type: mcp
+    transport: streamable-http
+    urlEnv: REMOTE_MCP_URL
+    headers:
+      - name: Authorization
+        valueEnv: AUTH_HEADER
+    auth:
+      type: bearer
+      tokenEnv: REMOTE_TOKEN
+`,
+		"missing token": `tools:
+  - name: remote
+    type: mcp
+    transport: streamable-http
+    urlEnv: REMOTE_MCP_URL
+    auth:
+      type: bearer
+`,
+	}
+	for name, toolYAML := range cases {
+		t.Run(name, func(t *testing.T) {
+			in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: remote-mcp-agent
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: hi
+` + toolYAML + `expose:
+  openai: true
+`)
+			cfg, err := NewFromBytes(in)
+			if err != nil {
+				t.Fatalf("parse error: %v", err)
+			}
+			if verr := cfg.Validate(); verr == nil {
+				t.Fatal("expected validation error, got nil")
+			}
+		})
+	}
+}
+
+func TestValidateRejectsUnsupportedContextProviderCapabilities(t *testing.T) {
+	in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: context-agent
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: hi
+context:
+  providers:
+    - name: knowledge
+      type: search
+      endpointEnv: SEARCH_ENDPOINT
+      indexEnv: SEARCH_INDEX
+expose:
+  openai: true
+`)
+	cfg, err := NewFromBytes(in)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	verr := cfg.Validate()
+	if verr == nil {
+		t.Fatal("expected unsupported context capability error, got nil")
+	}
+	if !strings.Contains(verr.Error(), runtimes.CapabilityContextProviderSearch) {
+		t.Fatalf("expected search capability error, got: %v", verr)
+	}
+}
+
+func TestValidateRejectsUnsupportedModelWorkloadIdentityAndApproval(t *testing.T) {
+	in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: capability-agent
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+  auth:
+    type: workload-identity-token
+    audience: https://example.com/.default
+instructions: hi
+tools:
+  - name: remote
+    type: mcp
+    transport: streamable-http
+    urlEnv: REMOTE_MCP_URL
+    approval: always
+expose:
+  openai: true
+`)
+	cfg, err := NewFromBytes(in)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	verr := cfg.Validate()
+	if verr == nil {
+		t.Fatal("expected unsupported capability errors, got nil")
+	}
+	msg := verr.Error()
+	for _, want := range []string{runtimes.CapabilityModelWorkloadIdentityAuth, runtimes.CapabilityToolApproval} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("expected %s in validation error, got: %v", want, verr)
+		}
+	}
+}
+
+func TestValidateMAFSupportsSearchAndMemoryContextProviders(t *testing.T) {
+	in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: context-agent
+runtime: microsoft-agent-framework
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: hi
+context:
+  providers:
+    - name: knowledge
+      type: search
+      endpointEnv: SEARCH_ENDPOINT
+      indexEnv: SEARCH_INDEX
+      auth:
+        type: workload-identity-token
+        audience: https://search.azure.com/.default
+    - name: memory
+      type: memory
+      endpointEnv: MEMORY_ENDPOINT
+      storeNameEnv: MEMORY_STORE_NAME
+      auth:
+        type: workload-identity-token
+        audience: https://ai.azure.com/.default
+expose:
+  openai: true
+`)
+	cfg, err := NewFromBytes(in)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if verr := cfg.Validate(); verr != nil {
+		t.Fatalf("MAF search+memory context providers should validate: %v", verr)
+	}
+}
+
+func TestValidateRejectsInvalidMCPSkillsToolRefs(t *testing.T) {
+	cases := map[string]string{
+		"unknown": `tools:
+  - name: toolbox
+    type: mcp
+    transport: streamable-http
+    urlEnv: TOOLBOX_ENDPOINT
+context:
+  providers:
+    - type: skills
+      source: mcp
+      toolRef: missing
+`,
+		"stdio": `tools:
+  - name: local
+    command: ["uvx", "mcp-server-fetch"]
+context:
+  providers:
+    - type: skills
+      source: mcp
+      toolRef: local
+`,
+	}
+	for name, yaml := range cases {
+		t.Run(name, func(t *testing.T) {
+			in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: skills-agent
+runtime: microsoft-agent-framework
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: hi
+` + yaml + `expose:
+  openai: true
+`)
+			cfg, err := NewFromBytes(in)
+			if err != nil {
+				t.Fatalf("parse error: %v", err)
+			}
+			if verr := cfg.Validate(); verr == nil {
+				t.Fatal("expected invalid MCP skills toolRef validation error, got nil")
+			}
+		})
+	}
+}
+
+func TestValidateAllowsMCPSkillsWithoutIndexWhenToolRefIsRemoteMCP(t *testing.T) {
+	in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: skills-agent
+runtime: microsoft-agent-framework
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: hi
+tools:
+  - name: toolbox
+    type: mcp
+    transport: streamable-http
+    urlEnv: TOOLBOX_ENDPOINT
+context:
+  providers:
+    - type: skills
+      source: mcp
+      toolRef: toolbox
+expose:
+  openai: true
+`)
+	cfg, err := NewFromBytes(in)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if verr := cfg.Validate(); verr != nil {
+		t.Fatalf("valid MCP skills toolRef should pass without index: %v", verr)
+	}
+}
+
+func TestValidateRejectsBearerAuthForContextProviders(t *testing.T) {
+	in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: context-agent
+runtime: microsoft-agent-framework
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: hi
+context:
+  providers:
+    - name: knowledge
+      type: search
+      endpointEnv: SEARCH_ENDPOINT
+      indexEnv: SEARCH_INDEX
+      auth:
+        type: bearer
+        tokenEnv: SEARCH_TOKEN
+expose:
+  openai: true
+`)
+	cfg, err := NewFromBytes(in)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	verr := cfg.Validate()
+	if verr == nil {
+		t.Fatal("expected bearer context auth validation error, got nil")
+	}
+	if !strings.Contains(verr.Error(), "not supported for context providers") {
+		t.Fatalf("expected context auth error, got: %v", verr)
+	}
+}
+
+func TestValidateRejectsRelativeFilesystemSkillsPath(t *testing.T) {
+	in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: skills-agent
+runtime: microsoft-agent-framework
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: hi
+context:
+  providers:
+    - type: skills
+      source: filesystem
+      path: ./skills
+expose:
+  openai: true
+`)
+	cfg, err := NewFromBytes(in)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	verr := cfg.Validate()
+	if verr == nil {
+		t.Fatal("expected relative filesystem skills path validation error, got nil")
+	}
+	if !strings.Contains(verr.Error(), "/agent/skills") {
+		t.Fatalf("expected /agent/skills guidance, got: %v", verr)
+	}
+}
+
+func TestValidateRejectsBearerAuthForSkillsContextProvider(t *testing.T) {
+	in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: skills-agent
+runtime: microsoft-agent-framework
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: hi
+context:
+  providers:
+    - type: skills
+      source: filesystem
+      path: /agent/skills
+      auth:
+        type: bearer
+        tokenEnv: SKILLS_TOKEN
+expose:
+  openai: true
+`)
+	cfg, err := NewFromBytes(in)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	verr := cfg.Validate()
+	if verr == nil {
+		t.Fatal("expected bearer auth validation error for skills context provider, got nil")
+	}
+	if !strings.Contains(verr.Error(), "must not be set for skills context providers") {
+		t.Fatalf("expected context auth error, got: %v", verr)
+	}
+}
+
+func TestFilesystemSkillsPathUsesPOSIXSemantics(t *testing.T) {
+	in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: skills-agent
+runtime: microsoft-agent-framework
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: hi
+context:
+  providers:
+    - type: skills
+      source: filesystem
+      path: /agent/skills/support-style
+expose:
+  openai: true
+`)
+	cfg, err := NewFromBytes(in)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if verr := cfg.Validate(); verr != nil {
+		t.Fatalf("POSIX /agent/skills subpath should validate: %v", verr)
+	}
+}
+
+func TestValidateRejectsAuthForSkillsContextProvider(t *testing.T) {
+	in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: skills-agent
+runtime: microsoft-agent-framework
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: hi
+context:
+  providers:
+    - type: skills
+      source: filesystem
+      path: /agent/skills
+      auth:
+        type: workload-identity-token
+        audience: https://ai.azure.com/.default
+expose:
+  openai: true
+`)
+	cfg, err := NewFromBytes(in)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	verr := cfg.Validate()
+	if verr == nil {
+		t.Fatal("expected skills auth validation error, got nil")
+	}
+	if !strings.Contains(verr.Error(), "auth must not be set for skills context providers") {
+		t.Fatalf("expected skills auth error, got: %v", verr)
+	}
+}
+
+func TestValidateRejectsUnsupportedLogObservability(t *testing.T) {
+	in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: logs-agent
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: hi
+observability:
+  logs:
+    levelEnv: LOG_LEVEL
+expose:
+  openai: true
+`)
+	cfg, err := NewFromBytes(in)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	verr := cfg.Validate()
+	if verr == nil {
+		t.Fatal("expected unsupported log observability validation error, got nil")
+	}
+	if !strings.Contains(verr.Error(), "observability.logs.levelEnv is not supported") {
+		t.Fatalf("expected logs support error, got: %v", verr)
 	}
 }

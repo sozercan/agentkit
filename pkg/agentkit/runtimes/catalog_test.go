@@ -2,6 +2,7 @@ package runtimes
 
 import (
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -96,5 +97,41 @@ func TestRuntimesDeclarationInvariants(t *testing.T) {
 	// An unknown name resolves verbatim and is not found.
 	if _, ok := RuntimeByName(nonexistentRuntime); ok {
 		t.Errorf("RuntimeByName(%q) should not be found", nonexistentRuntime)
+	}
+}
+
+func TestRuntimeCapabilities(t *testing.T) {
+	for _, rt := range Runtimes {
+		seen := map[string]bool{}
+		for _, cap := range rt.Capabilities {
+			if cap == "" {
+				t.Errorf("runtime %q has an empty capability", rt.Name)
+			}
+			if seen[cap] {
+				t.Errorf("runtime %q has duplicate capability %q", rt.Name, cap)
+			}
+			seen[cap] = true
+			if strings.Contains(cap, "foundry-") && cap != CapabilityFoundryInvocationsProtocol && cap != CapabilityFoundryResponsesProtocol {
+				t.Errorf("runtime %q has provider-specific capability %q", rt.Name, cap)
+			}
+		}
+		if len(rt.Capabilities) == 0 {
+			t.Errorf("runtime %q should declare at least its current core capabilities", rt.Name)
+		}
+		if !rt.HasCapability(CapabilityStdioMCP) {
+			t.Errorf("runtime %q should support current v0 stdio MCP tools", rt.Name)
+		}
+		for _, required := range []string{CapabilityStdioMCP, CapabilityStreamableHTTPMCP} {
+			if !rt.HasCapability(required) {
+				t.Errorf("runtime %q should support %s", rt.Name, required)
+			}
+		}
+		if rt.Name == MAF && !rt.HasCapability(CapabilityWorkloadIdentityTokenAuth) {
+			t.Errorf("runtime %q should support %s", rt.Name, CapabilityWorkloadIdentityTokenAuth)
+		}
+		missing := rt.MissingCapabilities([]string{CapabilityStdioMCP, CapabilityToolApproval})
+		if len(missing) != 1 || missing[0] != CapabilityToolApproval {
+			t.Errorf("runtime %q MissingCapabilities = %v, want [%s]", rt.Name, missing, CapabilityToolApproval)
+		}
 	}
 }

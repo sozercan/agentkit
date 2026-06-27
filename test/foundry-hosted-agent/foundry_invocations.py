@@ -1,15 +1,14 @@
-"""Foundry Hosted Agent invocations smoke wrapper for AgentKit.
+"""Foundry Hosted Agent protocol smoke wrapper for AgentKit.
 
-The wrapper exposes the Foundry Hosted Agents invocations protocol on port 8088,
-then routes each JSON ``{"message": ...}`` request into the baked AgentKit
-runtime. A deterministic in-process OpenAI-compatible mock model keeps the smoke
+The wrapper exposes the Foundry Hosted Agents readiness, invocations, and minimal
+non-streaming responses protocols on port 8088, then routes requests into the baked
+AgentKit runtime. A deterministic in-process OpenAI-compatible mock model keeps the smoke
 test independent of external model credentials while still exercising AgentKit's
 OpenAI-compatible model client path.
 """
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
 import json
 import logging
 import os
@@ -17,13 +16,11 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from azure.ai.agentserver.invocations import InvocationAgentServerHost
-from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+import uvicorn
 
-from agentkit_serve.agent_factory import build_runtime
-from agentkit_serve_common.config import load
-from agentkit_serve_common.conversation import RunRequest
+from agentkit_serve import agent_factory
+from agentkit_serve_common.config import load, validate_required_env
+from agentkit_serve_common.foundry import create_foundry_app
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agentkit-foundry-wrapper")
@@ -113,46 +110,9 @@ os.environ.setdefault("MODEL_API_KEY", "not-needed")
 _start_mock_openai()
 
 spec = load("/agent/agent.yaml")
-runtime = build_runtime(spec)
-app = InvocationAgentServerHost()
-_original_lifespan = app.router.lifespan_context
-
-
-@asynccontextmanager
-async def _lifespan_with_agent(starlette_app):
-    # Match agentkit_serve_common.server.create_app: enter the runtime session
-    # once for the server lifetime so MCP tool subprocesses are started and kept
-    # warm before any invocation is handled.
-    async with _original_lifespan(starlette_app):
-        async with runtime:
-            starlette_app.state.runtime = runtime
-            yield
-
-
-app.router.lifespan_context = _lifespan_with_agent
-
-
-@app.invoke_handler
-async def handle_invoke(request: Request):
-    try:
-        data = await request.json()
-    except json.JSONDecodeError:
-        return Response("Request body must be JSON", status_code=400)
-
-    message = data.get("message")
-    if message is None:
-        return Response("Missing 'message' in request", status_code=400)
-    if not isinstance(message, str):
-        message = json.dumps(message, separators=(",", ":"), sort_keys=True)
-
-    try:
-        result = await request.app.state.runtime.run(RunRequest(prompt=message))
-    except Exception as exc:  # noqa: BLE001 - expose smoke-test failure clearly.
-        logger.exception("AgentKit run failed")
-        return JSONResponse({"error": str(exc)}, status_code=502)
-
-    return JSONResponse({"response": result.text, "usage": result.usage})
+validate_required_env(spec)
+app = create_foundry_app(spec, agent_factory)
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8088")))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8088")))

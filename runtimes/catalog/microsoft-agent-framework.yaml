@@ -12,4 +12,14 @@ apiVersion: v1alpha1
 runtime: microsoft-agent-framework
 aliases:
   - maf
+capabilities:
+  - stdio-mcp
+  - streamable-http-mcp
+  - workload-identity-token-auth
+  - mcp-skills
+  - filesystem-skills
+  - context-provider-skills
+  - context-provider-search
+  - context-provider-memory
+  - model-workload-identity-auth
 adapter: ghcr.io/sozercan/agentkit/serve-maf:latest
