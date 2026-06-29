@@ -106,12 +106,17 @@ The CI Docker job builds:
 
 1. the frontend image,
 2. all three adapter images,
-3. a fixture agent image for each runtime, and
-4. each generated agent enough to pass `/healthz`.
+3. a fixture agent image for each runtime,
+4. each generated agent enough to pass `/healthz`, and
+5. one generated agent in `AGENTKIT_PROTOCOL=orka` mode far enough to prove the
+   native harness health/capabilities, bearer auth, turn acceptance, and SSE
+   terminal-frame shape.
 
 The smoke containers bind `0.0.0.0` inside the container and set
-`AGENTKIT_AUTH_TOKEN`, proving the startup auth gate is satisfied while `/healthz`
-remains probeable.
+`AGENTKIT_AUTH_TOKEN`, proving the startup auth gate is satisfied while probe
+endpoints remain unauthenticated. The Orka smoke uses an already-expired turn
+`deadline` so it can verify native Orka failure frames offline without calling a
+live model provider.
 
 ## Live Copilot/Vekil E2E
 

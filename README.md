@@ -119,6 +119,10 @@ fields (`runtimeSessionID`, `turnID`, `correlationID`), `createdAt`,
 `contentText` for runtime output, and `completed` / `failed` terminal payloads.
 See [`docs/orka.md`](docs/orka.md) for complete request/response examples.
 
+CI also runs an offline Orka container smoke that starts a built AgentKit image in
+`AGENTKIT_PROTOCOL=orka`, verifies native health/capabilities, bearer auth, turn
+acceptance, and SSE terminal-frame shape without calling a live model provider.
+
 ## Use any OpenAI-compatible model endpoint
 
 AgentKit is model-endpoint agnostic. `model.baseURL` can point at any

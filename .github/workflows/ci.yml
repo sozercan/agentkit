@@ -253,7 +253,11 @@ jobs:
           set -euo pipefail
 
           cleanup() {
-            docker rm -f agentkit-smoke-pydantic agentkit-smoke-maf agentkit-smoke-langgraph >/dev/null 2>&1 || true
+            docker rm -f \
+              agentkit-smoke-pydantic \
+              agentkit-smoke-maf \
+              agentkit-smoke-langgraph \
+              agentkit-smoke-orka >/dev/null 2>&1 || true
           }
           trap cleanup EXIT
 
@@ -283,9 +287,118 @@ jobs:
             return 1
           }
 
+          orka_smoke() {
+            local name="$1"
+            local image="$2"
+            local port="$3"
+
+            docker rm -f "$name" >/dev/null 2>&1 || true
+            docker run -d --name "$name" \
+              --platform linux/amd64 \
+              -p "127.0.0.1:${port}:8080" \
+              -e AGENTKIT_PROTOCOL=orka \
+              -e AGENTKIT_BIND=0.0.0.0 \
+              -e AGENTKIT_AUTH_TOKEN=ci-smoke-token \
+              "$image"
+
+            for _ in $(seq 1 60); do
+              if curl -fsS "http://127.0.0.1:${port}/v1/health" >/tmp/orka-health.json; then
+                break
+              fi
+              sleep 1
+            done
+
+            curl -fsS "http://127.0.0.1:${port}/v1/capabilities" >/tmp/orka-capabilities.json
+            python3 - <<'PY'
+          import json
+
+          health = json.load(open('/tmp/orka-health.json'))
+          assert health['version'] == 'orka.harness.v1'
+          assert health['status'] == 'ok'
+          assert health['ready'] is True
+          assert 'checkedAt' in health
+
+          capabilities = json.load(open('/tmp/orka-capabilities.json'))
+          assert capabilities['protocolVersion'] == 'orka.harness.v1'
+          assert capabilities['transport'] == 'http+sse'
+          assert capabilities['runtimeName'] == 'agentkit-serve'
+          assert capabilities['providerKind'] == 'kubernetes-service'
+          assert capabilities['toolExecutionModes'] == ['observed']
+          assert capabilities['maxConcurrentTurns'] == 1
+          PY
+
+            local unauth_status
+            unauth_status=$(curl -sS -o /tmp/orka-unauth.json -w '%{http_code}' \
+              -H 'content-type: application/json' \
+              -d '{}' \
+              "http://127.0.0.1:${port}/v1/turns")
+            test "$unauth_status" = "401"
+
+            cat >/tmp/orka-start-turn.json <<'JSON'
+          {
+            "version": "orka.harness.v1",
+            "namespace": "ci",
+            "taskName": "offline-smoke",
+            "sessionName": "offline-smoke-session",
+            "runtimeSessionID": "offline-smoke-runtime-session",
+            "turnID": "offline-smoke-turn",
+            "correlationID": "offline-smoke-correlation",
+            "deadline": "2000-01-01T00:00:00Z",
+            "authIdentity": {"subject": "system:ci"},
+            "input": {"prompt": "offline smoke", "contextRefs": [], "env": []},
+            "toolExecutionMode": "observed",
+            "metadata": {"ci": "true"}
+          }
+          JSON
+            curl -fsS \
+              -H 'authorization: Bearer ci-smoke-token' \
+              -H 'content-type: application/json' \
+              -d @/tmp/orka-start-turn.json \
+              "http://127.0.0.1:${port}/v1/turns" >/tmp/orka-start-response.json
+            curl -fsS \
+              -H 'authorization: Bearer ci-smoke-token' \
+              "http://127.0.0.1:${port}/v1/turns/offline-smoke-turn/events" >/tmp/orka-events.sse
+            python3 - <<'PY'
+          import json
+
+          start = json.load(open('/tmp/orka-start-response.json'))
+          assert start == {
+              'version': 'orka.harness.v1',
+              'accepted': True,
+              'runtimeSessionID': 'offline-smoke-runtime-session',
+              'turnID': 'offline-smoke-turn',
+              'correlationID': 'offline-smoke-correlation',
+              'eventStreamPath': '/v1/turns/offline-smoke-turn/events',
+          }
+
+          frames = []
+          for block in open('/tmp/orka-events.sse').read().strip().split('\n\n'):
+              if not block:
+                  continue
+              data = [line.removeprefix('data: ') for line in block.splitlines() if line.startswith('data: ')]
+              assert len(data) == 1, block
+              frames.append(json.loads(data[0]))
+
+          assert [frame['type'] for frame in frames] == ['TurnStarted', 'TurnFailed']
+          terminal = frames[-1]
+          assert terminal['version'] == 'orka.harness.v1'
+          assert terminal['runtimeSessionID'] == 'offline-smoke-runtime-session'
+          assert terminal['turnID'] == 'offline-smoke-turn'
+          assert terminal['correlationID'] == 'offline-smoke-correlation'
+          assert terminal['seq'] == 2
+          assert 'createdAt' in terminal
+          assert 'payload' not in terminal
+          assert terminal['failed']['reason'] == 'DeadlineExceeded'
+          assert terminal['error']['code'] == 'DeadlineExceeded'
+          PY
+
+            docker logs "$name"
+          }
+
           smoke agentkit-smoke-pydantic hello-agent:ci 18080
           smoke agentkit-smoke-maf maf-agent:ci 18081
           smoke agentkit-smoke-langgraph langgraph-agent:ci 18082
+          orka_smoke agentkit-smoke-orka hello-agent:ci 18083
 
   live-copilot-e2e:
     name: Live Vekil/Copilot E2E
