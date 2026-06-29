@@ -739,7 +739,7 @@ def create_orka_app(
 
         turn_id = _turn_id_from_payload(data)
         if turn_id in turns:
-            raise HTTPException(status_code=409, detail=f"turn {turn_id!r} already exists")
+            raise HTTPException(status_code=409, detail="turn already exists")
         if any(state.terminal_event is None for state in turns.values()):
             raise HTTPException(status_code=429, detail="maxConcurrentTurns limit reached")
 

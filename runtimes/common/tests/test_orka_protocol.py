@@ -227,6 +227,19 @@ def test_orka_events_support_after_seq_replay():
     assert [frame["type"] for frame in _frames(replay.text)] == ["RuntimeOutput", "TurnCompleted"]
 
 
+def test_orka_duplicate_turn_rejection_matches_orka_conformance_contract():
+    app = create_orka_app(_spec(), EchoFactory(delay=60), auth_token="test-token")
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(client, turnID="turn-duplicate", input={"prompt": "slow", "contextRefs": [], "env": []})
+        duplicate = client.post("/v1/turns", json=_start_payload(turnID=turn_id, input={"prompt": "slow", "contextRefs": [], "env": []}), headers=AUTH)
+        cancel = client.post(f"/v1/turns/{turn_id}/cancel", json=_cancel_payload(turnID=turn_id), headers=AUTH)
+
+    assert duplicate.status_code == 409
+    assert duplicate.json() == {"detail": "turn already exists"}
+    assert cancel.status_code == 202
+
+
 def test_orka_turn_forwards_per_turn_metadata_env_and_session_fields():
     factory = EchoFactory()
     app = create_orka_app(_spec(), factory, auth_token="test-token")
