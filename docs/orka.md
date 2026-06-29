@@ -167,6 +167,29 @@ AgentKit responds with Orka `CancelTurnResponse`:
 }
 ```
 
+## Offline smoke coverage
+
+The GitHub Actions container smoke starts one built test-agent image with:
+
+```sh
+AGENTKIT_PROTOCOL=orka
+AGENTKIT_BIND=0.0.0.0
+AGENTKIT_AUTH_TOKEN=ci-smoke-token
+```
+
+It verifies native Orka health/capabilities, confirms unauthenticated turn start
+is rejected, starts an authenticated turn with an already-expired deadline, and
+checks the SSE stream returns a `TurnStarted` frame followed by a terminal
+`TurnFailed` frame with Orka identity fields and no legacy `payload` field. The
+expired deadline keeps this smoke offline: it proves the harness protocol without
+calling OpenAI or another model endpoint.
+
+For deeper local validation, run the common Python Orka protocol tests:
+
+```sh
+uv run --directory runtimes/common --extra dev pytest -q tests/test_orka_protocol.py
+```
+
 ## Render an AgentRuntime manifest
 
 The current Orka `AgentRuntime` CRD supports external endpoints first. Deploy the
