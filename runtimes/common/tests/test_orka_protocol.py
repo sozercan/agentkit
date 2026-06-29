@@ -611,3 +611,34 @@ def test_orka_required_env_rejects_empty_turn_override_even_when_process_has_val
     assert empty_override.status_code == 400
     assert "MODEL_TOKEN" in empty_override.text
     assert process_fallback.status_code == 202
+
+
+def test_orka_runtime_session_rebuilds_when_turn_env_changes(monkeypatch):
+    monkeypatch.delenv("MODEL_TOKEN", raising=False)
+    factory = EnvFactory()
+    app = create_orka_app(_spec(), factory, auth_token="test-token", max_runtime_sessions=2)
+
+    with TestClient(app) as client:
+        first_id = _create_turn(
+            client,
+            turnID="turn-rotated-env-1",
+            runtimeSessionID="runtime-session-rotating",
+            correlationID="corr-rotating-1",
+            input={"prompt": "one", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "one-token"}]},
+        )
+        first_frames = _frames(client.get(f"/v1/turns/{first_id}/events", headers=AUTH).text)
+        assert first_frames[-1]["completed"]["result"] == "token=one-token;run=one-token"
+
+        second_id = _create_turn(
+            client,
+            turnID="turn-rotated-env-2",
+            runtimeSessionID="runtime-session-rotating",
+            correlationID="corr-rotating-2",
+            input={"prompt": "two", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "two-token"}]},
+        )
+        second_frames = _frames(client.get(f"/v1/turns/{second_id}/events", headers=AUTH).text)
+        assert second_frames[-1]["completed"]["result"] == "token=two-token;run=two-token"
+
+    assert len(factory.runtimes) == 2
+    assert factory.runtimes[0].exited == 1
+    assert factory.runtimes[1].exited == 1

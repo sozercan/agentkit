@@ -43,6 +43,7 @@ _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 class ActiveRuntime:
     context: Any
     session: Any
+    env: dict[str, str]
 
 
 @contextmanager
@@ -672,17 +673,22 @@ def create_orka_app(
         runtime_session_id = run_request.session_id or ""
         active = active_runtimes.get(runtime_session_id)
         if active is not None:
+            if active.env == dict(run_request.env):
+                if runtime_session_id in runtime_order:
+                    runtime_order.remove(runtime_session_id)
+                runtime_order.append(runtime_session_id)
+                return active.session
+            active_runtimes.pop(runtime_session_id, None)
             if runtime_session_id in runtime_order:
                 runtime_order.remove(runtime_session_id)
-            runtime_order.append(runtime_session_id)
-            return active.session
+            await asyncio.shield(active.context.__aexit__(None, None, None))
         # Runtime factories read the process environment today. Keep this scoped
         # section on the event loop thread so cancellation cannot leave a worker
         # thread running with turn credentials in process-global os.environ.
         with _scoped_process_env(run_request.env):
             context = factory.build_runtime(spec)
             session = await context.__aenter__()
-        active_runtimes[runtime_session_id] = ActiveRuntime(context=context, session=session)
+        active_runtimes[runtime_session_id] = ActiveRuntime(context=context, session=session, env=dict(run_request.env))
         runtime_order.append(runtime_session_id)
         while len(runtime_order) > runtime_session_limit:
             evict_id = runtime_order.pop(0)
