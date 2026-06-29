@@ -7,11 +7,16 @@ import (
 	"github.com/moby/buildkit/util/appcontext"
 	"github.com/moby/buildkit/util/bklog"
 	"github.com/sirupsen/logrus"
+	"github.com/sozercan/agentkit/pkg/agentkit/render"
 	"github.com/sozercan/agentkit/pkg/build"
 	"google.golang.org/grpc/grpclog"
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "render" {
+		os.Exit(render.RunCLI(os.Args[2:], os.Stdout, os.Stderr))
+	}
+
 	bklog.L.Logger.SetOutput(os.Stderr)
 	grpclog.SetLoggerV2(grpclog.NewLoggerV2WithVerbosity(bklog.L.WriterLevel(logrus.InfoLevel), bklog.L.WriterLevel(logrus.WarnLevel), bklog.L.WriterLevel(logrus.ErrorLevel), 1))
 

@@ -126,7 +126,8 @@ job while normal offline checks still run.
 
 ## Foundry Hosted Agents fixture
 
-`test/foundry-hosted-agent/` wraps a normal AgentKit image with Microsoft Foundry
-Hosted Agents' invocations protocol. It is a protocol compatibility smoke test:
-AgentKit still owns `/agent/agent.yaml` and the runtime lifecycle; the wrapper
-translates `/invocations` and `/readiness` around that native runtime session.
+`AGENTKIT_PROTOCOL=foundry` now exposes Foundry Hosted Agents' `/readiness`,
+`/invocations`, and minimal `/responses` surfaces directly from every adapter
+image. `test/foundry-hosted-agent/` remains as a compatibility smoke fixture for
+older wrapping flows; AgentKit still owns `/agent/agent.yaml` and the runtime
+lifecycle in both modes.

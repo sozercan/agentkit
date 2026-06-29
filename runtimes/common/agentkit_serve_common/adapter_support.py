@@ -14,6 +14,7 @@ import os
 import re
 import shlex
 import subprocess
+from typing import Mapping
 
 from .config import AgentSpec, ToolSpec
 from .conversation import FORWARDED_ROLES
@@ -35,7 +36,14 @@ class AgentBuildError(Exception):
     """Raised when an adapter cannot construct its concrete agent."""
 
 
-def resolve_api_key(spec: AgentSpec) -> str:
+def _env_get(name: str, env: Mapping[str, str] | None = None) -> str | None:
+    """Resolve one env var with per-run values taking precedence over process env."""
+    if env is not None and name in env:
+        return env[name]
+    return os.environ.get(name)
+
+
+def resolve_api_key(spec: AgentSpec, env: Mapping[str, str] | None = None) -> str:
     """Resolve the model API key from the env var NAMED in the spec.
 
     Per the ABI, ``model.apiKeyEnv`` is the NAME of an env var; the value is
@@ -46,7 +54,7 @@ def resolve_api_key(spec: AgentSpec) -> str:
     if not name:
         # No auth declared — e.g. a co-located local model over baseURL.
         return NO_AUTH_API_KEY
-    value = os.environ.get(name)
+    value = _env_get(name, env)
     if value is None or value == "":
         raise AgentBuildError(
             f"model.apiKeyEnv {name!r} is declared in agent.yaml but env var "
@@ -56,7 +64,7 @@ def resolve_api_key(spec: AgentSpec) -> str:
     return value
 
 
-def declared_tool_env(tool: ToolSpec) -> dict[str, str]:
+def declared_tool_env(tool: ToolSpec, env: Mapping[str, str] | None = None) -> dict[str, str]:
     """Select ONLY the env vars NAMED in ``tool.env``.
 
     The MCP subprocess must never inherit the full container environment — that
@@ -70,7 +78,7 @@ def declared_tool_env(tool: ToolSpec) -> dict[str, str]:
     in the tool's own ``env`` allowlist.
     """
     allowed = set(tool.env)
-    out = {name: os.environ[name] for name in tool.env if name in os.environ}
+    out = {name: value for name in tool.env if (value := _env_get(name, env)) is not None}
     for name, value in out.items():
         undeclared = sorted(ref for ref in _BRACED_ENV_REF_RE.findall(value) if ref not in allowed)
         if undeclared:
@@ -82,12 +90,12 @@ def declared_tool_env(tool: ToolSpec) -> dict[str, str]:
     return out
 
 
-def resolve_tool_url(tool: ToolSpec) -> str:
+def resolve_tool_url(tool: ToolSpec, env: Mapping[str, str] | None = None) -> str:
     """Resolve a remote MCP URL from the env var named by ``tool.urlEnv``."""
     name = tool.url_env
     if not name:
         raise AgentBuildError(f"tool {tool.name!r} has no urlEnv")
-    value = os.environ.get(name)
+    value = _env_get(name, env)
     if value is None or value == "":
         raise AgentBuildError(
             f"tool {tool.name!r} urlEnv {name!r} is declared in agent.yaml but env var "
@@ -96,7 +104,12 @@ def resolve_tool_url(tool: ToolSpec) -> str:
     return value
 
 
-def resolve_tool_headers(tool: ToolSpec, *, include_workload_identity: bool = True) -> dict[str, str]:
+def resolve_tool_headers(
+    tool: ToolSpec,
+    *,
+    include_workload_identity: bool = True,
+    env: Mapping[str, str] | None = None,
+) -> dict[str, str]:
     """Resolve static/env/auth headers for a remote MCP tool without logging values."""
     headers: dict[str, str] = {}
     for header in tool.headers:
@@ -106,7 +119,7 @@ def resolve_tool_headers(tool: ToolSpec, *, include_workload_identity: bool = Tr
         name = header.value_env
         if not name:
             raise AgentBuildError(f"tool {tool.name!r} header {header.name!r} has no value")
-        value = os.environ.get(name)
+        value = _env_get(name, env)
         if value is None or value == "":
             raise AgentBuildError(
                 f"tool {tool.name!r} header {header.name!r} uses valueEnv {name!r} but "
@@ -124,7 +137,7 @@ def resolve_tool_headers(tool: ToolSpec, *, include_workload_identity: bool = Tr
 
     if tool.auth.type == "bearer":
         token_env = tool.auth.token_env
-        token = os.environ.get(token_env or "")
+        token = _env_get(token_env or "", env)
         if not token_env or token is None or token == "":
             raise AgentBuildError(
                 f"tool {tool.name!r} bearer auth tokenEnv {token_env!r} is declared in "
@@ -136,14 +149,14 @@ def resolve_tool_headers(tool: ToolSpec, *, include_workload_identity: bool = Tr
     if tool.auth.type == "workload-identity-token":
         if not include_workload_identity:
             return headers
-        token = resolve_workload_identity_token(tool.auth.audience or "")
+        token = resolve_workload_identity_token(tool.auth.audience or "", env=env)
         headers["Authorization"] = f"Bearer {token}"
         return headers
 
     raise AgentBuildError(f"tool {tool.name!r} auth type {tool.auth.type!r} is not supported")
 
 
-def resolve_workload_identity_token(audience: str) -> str:
+def resolve_workload_identity_token(audience: str, env: Mapping[str, str] | None = None) -> str:
     """Resolve a workload identity token through a provider-neutral runtime hook.
 
     Deployment profiles may either inject ``AGENTKIT_WORKLOAD_IDENTITY_TOKEN`` for
@@ -156,11 +169,11 @@ def resolve_workload_identity_token(audience: str) -> str:
     if not audience:
         raise AgentBuildError("workload identity auth requires a non-empty audience")
 
-    token = os.environ.get(WORKLOAD_TOKEN_ENV)
+    token = _env_get(WORKLOAD_TOKEN_ENV, env)
     if token:
         return token
 
-    command = os.environ.get(WORKLOAD_TOKEN_COMMAND_ENV)
+    command = _env_get(WORKLOAD_TOKEN_COMMAND_ENV, env)
     if command:
         argv = shlex.split(command) + [audience]
         try:
@@ -242,9 +255,9 @@ def split_tool_command(tool: ToolSpec, *, example: str) -> tuple[str, list[str]]
     return tool.command[0], list(tool.command[1:])
 
 
-def positive_float_env(name: str = MCP_TIMEOUT_ENV, *, default: float) -> float:
+def positive_float_env(name: str = MCP_TIMEOUT_ENV, *, default: float, env: Mapping[str, str] | None = None) -> float:
     """Read a positive float env var, falling back to ``default``."""
-    raw = os.environ.get(name)
+    raw = _env_get(name, env)
     if not raw:
         return default
     try:
@@ -254,9 +267,9 @@ def positive_float_env(name: str = MCP_TIMEOUT_ENV, *, default: float) -> float:
     return val if val > 0 else default
 
 
-def positive_int_env(name: str = MCP_TIMEOUT_ENV, *, default: int | None) -> int | None:
+def positive_int_env(name: str = MCP_TIMEOUT_ENV, *, default: int | None, env: Mapping[str, str] | None = None) -> int | None:
     """Read a positive integer env var, accepting float strings, else ``default``."""
-    raw = os.environ.get(name)
+    raw = _env_get(name, env)
     if not raw:
         return default
     try:

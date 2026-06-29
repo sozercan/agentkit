@@ -15,11 +15,15 @@ aliases:
 capabilities:
   - stdio-mcp
   - streamable-http-mcp
+  - foundry-invocations-protocol
+  - foundry-responses-minimal
+  - orka-harness-v1
+  - orka-observed-tools
   - workload-identity-token-auth
-  - mcp-skills
-  - filesystem-skills
+  - model-workload-identity-auth
   - context-provider-skills
+  - filesystem-skills
+  - mcp-skills
   - context-provider-search
   - context-provider-memory
-  - model-workload-identity-auth
 adapter: ghcr.io/sozercan/agentkit/serve-maf:latest

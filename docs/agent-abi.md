@@ -184,11 +184,20 @@ The native runtime serves:
   `chat.completion` object. Optional `X-AgentKit-Session-Id` is forwarded to
   runtime adapters for provider-neutral session/memory correlation.
 
+Runtime protocol selection happens outside the ABI with `agentkit-serve
+--protocol` or `AGENTKIT_PROTOCOL`; the same `/agent/agent.yaml` file is reused by
+every protocol skin.
+
 The reusable Foundry wrapper in `agentkit_serve_common.foundry` reuses the same
 `RuntimeFactory` / `RuntimeSession` seam and exposes `/readiness`, `/invocations`,
 and a minimal non-streaming `/responses` endpoint. It forwards Foundry session
 IDs from query/header data to the runtime and tolerates client-supplied
 `stream: true` by returning a normal completed non-streaming response.
+
+The reusable Orka wrapper in `agentkit_serve_common.orka` exposes observed-mode
+`orka.harness.v1` over `/v1/health`, `/v1/capabilities`, `/v1/turns`, SSE events,
+and cancel. Orka turn metadata is carried in optional `RunRequest` fields and
+does not change the ABI file shape.
 
 `POST /v1/chat/completions` rejects:
 

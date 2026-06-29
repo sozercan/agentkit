@@ -35,9 +35,18 @@ const (
 	// CapabilityFoundryInvocationsProtocol means a runtime/protocol adapter can
 	// expose Foundry's /readiness + /invocations contract.
 	CapabilityFoundryInvocationsProtocol = "foundry-invocations-protocol"
-	// CapabilityFoundryResponsesProtocol means a runtime/protocol adapter can
-	// expose Foundry's /readiness + /responses contract.
-	CapabilityFoundryResponsesProtocol  = "foundry-responses-protocol"
+	// CapabilityFoundryResponsesMinimal means a runtime/protocol adapter can
+	// expose the current non-streaming, minimal Foundry /responses contract.
+	CapabilityFoundryResponsesMinimal = "foundry-responses-minimal"
+	// CapabilityOrkaHarnessV1 means a runtime/protocol adapter can expose
+	// the observed-mode orka.harness.v1 HTTP+SSE contract.
+	CapabilityOrkaHarnessV1 = "orka-harness-v1"
+	// CapabilityOrkaObservedTools means AgentKit-owned tools/MCP execute inside
+	// the runtime and Orka observes lifecycle/output frames only.
+	CapabilityOrkaObservedTools = "orka-observed-tools"
+	// CapabilityOrkaBrokeredTools is reserved for a future Orka-brokered tool
+	// execution mode and is intentionally not advertised by default.
+	CapabilityOrkaBrokeredTools         = "orka-brokered-tools"
 	CapabilityFilesystemSkills          = "filesystem-skills"
 	CapabilityMCPSkills                 = "mcp-skills"
 	CapabilityContextProviderSearch     = "context-provider-search"
@@ -91,19 +100,47 @@ func (rt RuntimeSpec) MissingCapabilities(requested []string) []string {
 // validator and router consult the helpers below. Runtime #3 = one entry here.
 var Runtimes = []RuntimeSpec{
 	{
-		Name:              PydanticAI,
-		Capabilities:      []string{CapabilityStdioMCP, CapabilityStreamableHTTPMCP},
+		Name: PydanticAI,
+		Capabilities: []string{
+			CapabilityStdioMCP,
+			CapabilityStreamableHTTPMCP,
+			CapabilityFoundryInvocationsProtocol,
+			CapabilityFoundryResponsesMinimal,
+			CapabilityOrkaHarnessV1,
+			CapabilityOrkaObservedTools,
+		},
 		DefaultAdapterRef: "ghcr.io/sozercan/agentkit/serve-pydantic-ai:latest",
 	},
 	{
-		Name:              MAF,
-		Aliases:           []string{MAFAlias}, // "maf" → "microsoft-agent-framework"
-		Capabilities:      []string{CapabilityStdioMCP, CapabilityStreamableHTTPMCP, CapabilityWorkloadIdentityTokenAuth, CapabilityModelWorkloadIdentityAuth, CapabilityContextProviderSkills, CapabilityFilesystemSkills, CapabilityMCPSkills, CapabilityContextProviderSearch, CapabilityContextProviderMemory},
+		Name:    MAF,
+		Aliases: []string{MAFAlias}, // "maf" → "microsoft-agent-framework"
+		Capabilities: []string{
+			CapabilityStdioMCP,
+			CapabilityStreamableHTTPMCP,
+			CapabilityFoundryInvocationsProtocol,
+			CapabilityFoundryResponsesMinimal,
+			CapabilityOrkaHarnessV1,
+			CapabilityOrkaObservedTools,
+			CapabilityWorkloadIdentityTokenAuth,
+			CapabilityModelWorkloadIdentityAuth,
+			CapabilityContextProviderSkills,
+			CapabilityFilesystemSkills,
+			CapabilityMCPSkills,
+			CapabilityContextProviderSearch,
+			CapabilityContextProviderMemory,
+		},
 		DefaultAdapterRef: "ghcr.io/sozercan/agentkit/serve-maf:latest",
 	},
 	{
-		Name:              LangGraph,
-		Capabilities:      []string{CapabilityStdioMCP, CapabilityStreamableHTTPMCP},
+		Name: LangGraph,
+		Capabilities: []string{
+			CapabilityStdioMCP,
+			CapabilityStreamableHTTPMCP,
+			CapabilityFoundryInvocationsProtocol,
+			CapabilityFoundryResponsesMinimal,
+			CapabilityOrkaHarnessV1,
+			CapabilityOrkaObservedTools,
+		},
 		DefaultAdapterRef: "ghcr.io/sozercan/agentkit/serve-langgraph:latest",
 	},
 }

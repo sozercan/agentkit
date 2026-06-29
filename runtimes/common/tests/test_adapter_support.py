@@ -236,3 +236,46 @@ def test_resolve_tool_headers_can_defer_workload_identity_token():
     with mock.patch.dict(os.environ, {"AGENTKIT_WORKLOAD_IDENTITY_TOKEN": "workload-token"}, clear=True):
         assert support.resolve_tool_headers(tool, include_workload_identity=False) == {}
         assert support.resolve_tool_headers(tool)["Authorization"] == "Bearer workload-token"
+
+
+def _api_key_spec() -> AgentSpec:
+    return AgentSpec.model_validate(
+        {
+            "abiVersion": "v0",
+            "metadata": {"name": "env-test"},
+            "model": {
+                "provider": "openai-compatible",
+                "baseURL": "https://api.openai.com/v1",
+                "name": "gpt-4o-mini",
+                "apiKeyEnv": "MODEL_TOKEN",
+            },
+            "instructions": "Be helpful.",
+            "tools": [],
+            "expose": {"openai": True, "port": 8080},
+        }
+    )
+
+
+def test_resolve_api_key_prefers_per_run_env_without_mutating_process_env():
+    with mock.patch.dict(os.environ, {"MODEL_TOKEN": "process-token"}, clear=True):
+        assert support.resolve_api_key(_api_key_spec(), env={"MODEL_TOKEN": "turn-token"}) == "turn-token"
+        assert os.environ["MODEL_TOKEN"] == "process-token"
+
+
+def test_resolve_tool_headers_prefers_per_run_env_and_keeps_errors_secret_free():
+    tool = _remote_tool(
+        headers=[{"name": "X-Trace", "valueEnv": "TRACE_HEADER"}],
+        auth={"type": "bearer", "tokenEnv": "TOOLBOX_TOKEN"},
+    )
+    with mock.patch.dict(os.environ, {"TRACE_HEADER": "process", "TOOLBOX_TOKEN": "process-secret"}, clear=True):
+        headers = support.resolve_tool_headers(
+            tool,
+            env={"TRACE_HEADER": "turn-trace", "TOOLBOX_TOKEN": "turn-secret"},
+        )
+        assert headers == {"X-Trace": "turn-trace", "Authorization": "Bearer turn-secret"}
+    with mock.patch.dict(os.environ, {"OTHER_SECRET": "do-not-mention"}, clear=True):
+        with pytest.raises(support.AgentBuildError) as exc:
+            support.resolve_tool_headers(tool, env={"TRACE_HEADER": "visible"})
+    msg = str(exc.value)
+    assert "TOOLBOX_TOKEN" in msg
+    assert "do-not-mention" not in msg

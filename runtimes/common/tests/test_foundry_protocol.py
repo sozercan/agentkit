@@ -159,6 +159,22 @@ def test_foundry_responses_rejects_request_supplied_tools():
     assert choice.json()["error"]["code"] == "tool_choice_unsupported"
 
 
+def test_foundry_protocols_require_auth_when_token_configured_but_readiness_stays_open():
+    app = create_foundry_app(_spec(), EchoFactory(), auth_token="foundry-token")
+    with TestClient(app) as client:
+        readiness = client.get("/readiness")
+        unauth_inv = client.post("/invocations", json={"message": "hello"})
+        auth_inv = client.post(
+            "/invocations",
+            json={"message": "hello"},
+            headers={"authorization": "Bearer foundry-token"},
+        )
+
+    assert readiness.status_code == 200
+    assert unauth_inv.status_code == 401
+    assert auth_inv.status_code == 200
+
+
 def test_foundry_protocol_uses_platform_session_env_fallback(monkeypatch):
     factory = EchoFactory()
     app = create_foundry_app(_spec(), factory)

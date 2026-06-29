@@ -15,12 +15,13 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
 from .config import AgentSpec
 from .conversation import FORWARDED_ROLES, ConversationTurn, RunRequest
 from .runtime import AgentRunError, RuntimeFactory, RunResult
+from .server import make_auth_dependency
 
 
 def _usage(result: RunResult) -> dict[str, int]:
@@ -158,7 +159,11 @@ def _responses_payload(spec: AgentSpec, result: RunResult) -> dict[str, Any]:
     }
 
 
-def create_foundry_app(spec: AgentSpec, factory: RuntimeFactory) -> FastAPI:
+def create_foundry_app(
+    spec: AgentSpec,
+    factory: RuntimeFactory,
+    auth_token: str | None = None,
+) -> FastAPI:
     """Create a Foundry-compatible wrapper app for one AgentKit runtime."""
     runtime = factory.build_runtime(spec)
 
@@ -169,12 +174,13 @@ def create_foundry_app(spec: AgentSpec, factory: RuntimeFactory) -> FastAPI:
             yield
 
     app = FastAPI(lifespan=lifespan)
+    auth = Depends(make_auth_dependency(auth_token))
 
     @app.get("/readiness")
     async def readiness():
         return {"ready": True}
 
-    @app.post("/invocations")
+    @app.post("/invocations", dependencies=[auth])
     async def invocations(request: Request):
         try:
             data = await request.json()
@@ -198,7 +204,7 @@ def create_foundry_app(spec: AgentSpec, factory: RuntimeFactory) -> FastAPI:
 
         return JSONResponse({"response": result.text, "usage": _usage(result)})
 
-    @app.post("/responses")
+    @app.post("/responses", dependencies=[auth])
     async def responses(request: Request):
         try:
             data = await request.json()

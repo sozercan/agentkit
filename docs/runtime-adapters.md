@@ -12,26 +12,38 @@ must be identical across adapters:
 | Module | Responsibility |
 |---|---|
 | `config.py` | Strict `/agent/agent.yaml` reader and ABI version check. |
-| `cli.py` | `agentkit-serve --config ...`, bind/port handling, auth startup gate. |
+| `cli.py` | `agentkit-serve --config ... --protocol openai\|foundry\|orka`, bind/port handling, auth startup gates. |
 | `server.py` | FastAPI app and OpenAI-compatible response/error envelopes. |
-| `conversation.py` | OpenAI message normalization into `RunRequest`. |
+| `foundry.py` | Foundry `/readiness`, `/invocations`, and minimal `/responses` skin. |
+| `orka.py` | Observed-mode `orka.harness.v1` HTTP+SSE skin. |
+| `conversation.py` | Protocol request normalization into `RunRequest`. |
 | `runtime.py` | `RuntimeFactory`, `RuntimeSession`, `RunResult`, `AgentRunError`. |
 | `adapter_support.py` | API-key lookup, tool env projection, timeout parsing, error normalization. |
 | `conformance.py` | Shared HTTP behavior tests adapter packages import. |
 
-`server.create_app(spec, factory, auth_token)` receives an adapter module that
-satisfies `RuntimeFactory`. The server calls only `factory.build_runtime(spec)`
-and `RuntimeSession.run(request)`, so it never imports pydantic-ai, Microsoft
-Agent Framework, LangChain, OpenAI SDK types, Azure, or Foundry packages.
+The protocol app factories receive an adapter module that satisfies
+`RuntimeFactory`. The shared core calls only `factory.build_runtime(spec)` and
+`RuntimeSession.run(request)`, so it never imports pydantic-ai, Microsoft Agent
+Framework, LangChain, OpenAI SDK types, Azure, Foundry SDKs, or Orka controllers.
 
 ## HTTP surface
 
-All adapters serve the same endpoints:
+All adapters can serve the same selected protocol surface. `openai` is the
+default. `foundry` and `orka` are selected with `--protocol` or
+`AGENTKIT_PROTOCOL`.
+
+OpenAI mode exposes:
 
 - `GET /healthz` returns `{"status":"ok"}` and is always open.
 - `GET /v1/models` returns the one configured model name.
 - `POST /v1/chat/completions` runs the agent once and returns one
   `chat.completion` object with a single assistant message.
+
+Foundry mode exposes `/readiness`, `/invocations`, and synchronous
+`/responses`. It defaults to port `8088` when the ABI kept the generic default
+port; generated images expose both `8080` and `8088` in OCI metadata for that
+case. Orka mode exposes `orka.harness.v1` health, capabilities, turn
+acceptance, SSE replay, and cancel endpoints.
 
 Request behavior is intentionally narrow:
 
@@ -44,7 +56,8 @@ Request behavior is intentionally narrow:
 - prior `tool` and unknown roles are ignored because the built agent owns its
   tools.
 - `X-AgentKit-Session-Id`, when present, is forwarded through the neutral
-  `RunRequest` for runtime/session correlation.
+  `RunRequest` for runtime/session correlation. Orka mode additionally forwards
+  `turn_id`, `correlation_id`, `deadline`, `metadata`, and per-run `env` fields.
 
 Framework/model failures are normalized to an OpenAI-shaped error envelope with
 `type: agent_error`. The adapters preserve upstream HTTP status codes when the
@@ -65,12 +78,14 @@ configured `baseURL` at runtime.
 
 The generated image defaults to `AGENTKIT_BIND=127.0.0.1`. At runtime:
 
-- loopback binds need no token,
+- loopback binds need no token except in Orka mode,
 - non-loopback binds such as `0.0.0.0` require `AGENTKIT_AUTH_TOKEN`, and
-- when a token is set, `/v1/*` requires `Authorization: Bearer <token>`.
+- when a token is set, protected endpoints require
+  `Authorization: Bearer <token>`.
 
-`/healthz` is intentionally unauthenticated so container platforms can probe the
-service.
+OpenAI `/healthz` and Orka `/v1/health` and `/v1/capabilities` are intentionally
+unauthenticated so container platforms and orchestrators can probe/discover the
+service. Orka turn, event, cancel, and output endpoints always require a token.
 
 ## Tool lifecycle and env projection
 
@@ -81,6 +96,11 @@ factories are responsible for turning each tool spec into their framework's MCP
 integration.
 
 Shared invariants:
+
+Per-run env supplied by Orka is forwarded in `RunRequest.env` and helper functions
+can resolve credentials from that mapping before falling back to process env.
+Startup-scoped model clients and long-lived MCP sessions still resolve their own
+startup credentials at runtime initialization; they are not rebuilt for every turn.
 
 - a missing or empty command fails before serving,
 - `AGENTKIT_MCP_TIMEOUT` controls MCP initialization timeout,

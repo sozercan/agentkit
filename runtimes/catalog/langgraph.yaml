@@ -13,4 +13,8 @@ runtime: langgraph
 capabilities:
   - stdio-mcp
   - streamable-http-mcp
+  - foundry-invocations-protocol
+  - foundry-responses-minimal
+  - orka-harness-v1
+  - orka-observed-tools
 adapter: ghcr.io/sozercan/agentkit/serve-langgraph:latest

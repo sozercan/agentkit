@@ -1,16 +1,24 @@
 """Shared CLI / network-posture core for AgentKit runtime adapters.
 
-Loads ``/agent/agent.yaml``, applies the network posture (plan §10), and runs
-uvicorn. Each adapter's console script calls :func:`run` with its own
-framework-specific ``agent_factory`` module — the only per-adapter input.
+Loads ``/agent/agent.yaml``, selects one protocol skin, applies the network
+posture, and runs uvicorn. Each adapter's console script calls :func:`run` with
+its own framework-specific ``agent_factory`` module — the only per-adapter input.
+
+Protocol modes:
+
+* ``openai`` (default): ``/healthz``, ``/v1/models``, ``/v1/chat/completions``.
+* ``foundry``: ``/readiness``, ``/invocations``, minimal non-streaming
+  ``/responses``.
+* ``orka``: observed-mode ``orka.harness.v1`` over HTTP+SSE.
 
 Network posture:
 
 * Bind ``127.0.0.1`` by default (``AGENTKIT_BIND`` overrides).
-* A NON-loopback bind (e.g. ``0.0.0.0``) REQUIRES ``AGENTKIT_AUTH_TOKEN`` — we
-  refuse to start an unauthenticated agent on a routable interface.
-* When a token is set, ``/v1/*`` requires ``Authorization: Bearer <token>``;
-  ``/healthz`` stays open.
+* A NON-loopback bind (e.g. ``0.0.0.0``) REQUIRES ``AGENTKIT_AUTH_TOKEN``.
+* ``orka`` protocol always requires ``AGENTKIT_AUTH_TOKEN`` because its turn,
+  event-stream, cancel, and output endpoints are bearer-authenticated.
+* In ``openai`` mode, ``/v1/*`` requires ``Authorization: Bearer <token>`` when a
+  token is set; ``/healthz`` stays open.
 """
 
 from __future__ import annotations
@@ -22,15 +30,19 @@ from typing import NoReturn
 
 import uvicorn
 
-from .config import load_or_exit
+from .config import ConfigError, load, load_or_exit
+from .foundry import create_foundry_app
+from .orka import create_orka_app
 from .runtime import RuntimeFactory
 from .server import create_app
 
 # Hosts that mean "loopback only" — a bind to any of these needs no auth token.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"})
+_PROTOCOLS = frozenset({"openai", "foundry", "orka"})
 
 DEFAULT_CONFIG_PATH = "/agent/agent.yaml"
 DEFAULT_PORT = 8080
+DEFAULT_FOUNDRY_PORT = 8088
 
 
 def _is_loopback(bind: str) -> bool:
@@ -45,38 +57,94 @@ def _fail(message: str) -> NoReturn:
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="agentkit-serve",
-        description="Serve an AgentKit agent (OpenAI Chat-Completions facade).",
+        description="Serve an AgentKit agent over the selected protocol skin.",
     )
     parser.add_argument(
         "--config",
         default=DEFAULT_CONFIG_PATH,
         help=f"path to agent.yaml (default: {DEFAULT_CONFIG_PATH})",
     )
+    parser.add_argument(
+        "--protocol",
+        choices=sorted(_PROTOCOLS),
+        default=None,
+        help="protocol skin to expose (default: AGENTKIT_PROTOCOL or openai)",
+    )
     return parser.parse_args(argv)
+
+
+def _resolve_protocol(cli_protocol: str | None) -> str:
+    protocol = (cli_protocol or os.environ.get("AGENTKIT_PROTOCOL") or "openai").strip().lower()
+    if protocol not in _PROTOCOLS:
+        _fail(
+            f"unsupported protocol {protocol!r}; expected one of "
+            + ", ".join(sorted(_PROTOCOLS))
+        )
+    return protocol
+
+
+def _resolve_port(protocol: str, spec_port: int | None) -> int:
+    raw = os.environ.get("AGENTKIT_PORT")
+    if raw:
+        try:
+            port = int(raw)
+        except ValueError:
+            _fail(f"AGENTKIT_PORT must be an integer, got {raw!r}")
+        if port < 1 or port > 65535:
+            _fail(f"AGENTKIT_PORT {port} is out of range")
+        return port
+
+    if protocol == "foundry" and (spec_port in (None, 0, DEFAULT_PORT)):
+        return DEFAULT_FOUNDRY_PORT
+    return spec_port or DEFAULT_PORT
+
+
+
+def _load_spec_or_exit(path: str, protocol: str):  # noqa: ANN001
+    if protocol != "orka":
+        return load_or_exit(path)
+    try:
+        return load(path)
+    except ConfigError as exc:
+        print(f"agentkit-serve: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+
+
+def _create_protocol_app(protocol: str, spec, factory: RuntimeFactory, auth_token: str | None):  # noqa: ANN001
+    if protocol == "openai":
+        return create_app(spec, factory, auth_token=auth_token)
+    if protocol == "foundry":
+        return create_foundry_app(spec, factory, auth_token=auth_token)
+    if protocol == "orka":
+        return create_orka_app(spec, factory, auth_token=auth_token)
+    raise AssertionError(f"unknown protocol: {protocol}")
 
 
 def run(factory: RuntimeFactory, argv: list[str] | None = None) -> None:
     """Entry point: serve an agent built by ``factory`` (the adapter's module)."""
     args = _parse_args(argv)
 
-    spec = load_or_exit(args.config)
+    protocol = _resolve_protocol(args.protocol)
+    spec = _load_spec_or_exit(args.config, protocol)
 
     # --- resolve bind/port ------------------------------------------------
     bind = os.environ.get("AGENTKIT_BIND", "127.0.0.1").strip()
     if not bind:
         bind = "127.0.0.1"
-    port = spec.expose.port or DEFAULT_PORT
+    port = _resolve_port(protocol, spec.expose.port)
 
-    # --- network posture gate (plan §10) ----------------------------------
+    # --- network posture gate --------------------------------------------
     auth_token = os.environ.get("AGENTKIT_AUTH_TOKEN") or None
+    if protocol == "orka" and not auth_token:
+        _fail("AGENTKIT_PROTOCOL=orka requires AGENTKIT_AUTH_TOKEN for turn/event/cancel endpoints")
     if not _is_loopback(bind) and not auth_token:
         _fail(
             f"refusing to bind {bind!r} without authentication: set "
             f"AGENTKIT_AUTH_TOKEN to require `Authorization: Bearer <token>` on "
-            f"/v1/*, or bind 127.0.0.1 (the default) for loopback-only access"
+            f"protected endpoints, or bind 127.0.0.1 (the default) for loopback-only access"
         )
 
-    app = create_app(spec, factory, auth_token=auth_token)
+    app = _create_protocol_app(protocol, spec, factory, auth_token)
 
     # uvicorn's default access log can echo paths/headers; keep it but never log
     # bodies. The app itself never logs secrets.

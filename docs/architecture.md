@@ -112,7 +112,7 @@ instructions, tool commands/env allowlists, and expose information. `abi.Path` i
 - entrypoint `/opt/agentkit/bin/agentkit-serve`,
 - command `--config /agent/agent.yaml`,
 - `PATH`, `AGENTKIT_BIND=127.0.0.1`, and `PYTHONUNBUFFERED=1`,
-- exposed serve port,
+- exposed serve port plus the Foundry default `8088` when the ABI uses the generic default port,
 - AgentKit and OCI labels.
 
 No tool root filesystem or secret value is merged into the image.
@@ -120,26 +120,57 @@ No tool root filesystem or secret value is merged into the image.
 ## Runtime flow
 
 ```text
-agentkit-serve --config /agent/agent.yaml
+agentkit-serve --config /agent/agent.yaml --protocol openai|foundry|orka
   -> runtimes/common.config.load
   -> runtimes/common.cli.run
-  -> runtimes/common.server.create_app
+  -> selected protocol skin
+       openai  -> server.create_app
+       foundry -> foundry.create_foundry_app
+       orka    -> orka.create_orka_app
   -> adapter agent_factory.build_runtime
   -> RuntimeSession.run(RunRequest)
-  -> OpenAI-compatible response
+  -> protocol-shaped response or SSE frame
 ```
+
+### Protocol skins over one runtime seam
+
+AgentKit owns protocol portability by keeping `/agent/agent.yaml` and
+`RuntimeSession.run(RunRequest)` as the single runtime seam, then layering thin
+HTTP protocol skins over that seam. The same image can be started with
+`AGENTKIT_PROTOCOL=openai` (default), `AGENTKIT_PROTOCOL=foundry`, or
+`AGENTKIT_PROTOCOL=orka` without rebuilding the agent.
+
+- `openai` exposes the standalone OpenAI-compatible `/v1` surface:
+  `/healthz`, `/v1/models`, and non-streaming `/v1/chat/completions`.
+- `foundry` exposes `/readiness`, `/invocations`, and the current
+  non-streaming, synchronous `/responses` compatibility surface. Its capability
+  is named `foundry-responses-minimal` until full Responses lifecycle parity is
+  implemented or delegated to official protocol libraries.
+- `orka` exposes observed-mode `orka.harness.v1`: `/v1/health`,
+  `/v1/capabilities`, `/v1/turns`, `/v1/turns/{turnID}/events` over SSE, and
+  `/v1/turns/{turnID}/cancel`. One Orka turn maps to one runtime `RunRequest`.
+
+AgentKit does not implement Orka governance. It reports capabilities, lifecycle
+frames, result text, image labels, and renderable registration manifests. Orka
+remains responsible for trust tiers, approval decisions, Tool CRD enforcement,
+idempotency, and side-effect policy.
 
 ### `runtimes/common`
 
 `agentkit_serve_common` is framework-neutral:
 
 - `config.py` strictly loads the baked ABI and checks the ABI version.
-- `cli.py` loads config, chooses bind/port, and refuses non-loopback binds unless
-  `AGENTKIT_AUTH_TOKEN` is set.
-- `server.py` serves `/healthz`, `/v1/models`, and `/v1/chat/completions`.
-- `conversation.py` converts OpenAI messages into a `RunRequest` whose final
-  prompt is the last user message and whose history contains prior system, user,
-  and assistant turns.
+- `cli.py` loads config, chooses protocol/bind/port, and refuses non-loopback
+  binds unless `AGENTKIT_AUTH_TOKEN` is set. Orka mode also requires the token
+  for turn/event/cancel endpoints.
+- `server.py` serves the OpenAI-compatible `/healthz`, `/v1/models`, and
+  `/v1/chat/completions` protocol skin.
+- `foundry.py` serves the Foundry `/readiness`, `/invocations`, and minimal
+  `/responses` protocol skin.
+- `orka.py` serves the observed-mode `orka.harness.v1` HTTP+SSE protocol skin.
+- `conversation.py` converts protocol request bodies into a `RunRequest` whose
+  prompt/history are provider-neutral and whose optional Orka fields carry
+  `turn_id`, `correlation_id`, deadline, metadata, and per-run env.
 - `runtime.py` defines `RunRequest` consumers: `RuntimeFactory`,
   `RuntimeSession`, `RunResult`, and `AgentRunError`.
 - `adapter_support.py` provides shared helpers for API-key resolution, tool env
@@ -172,8 +203,10 @@ framework-specific dependencies.
 - Agent images run as non-root (`1000:1000`).
 - The default bind is loopback (`127.0.0.1`).
 - Setting `AGENTKIT_BIND` to a non-loopback host requires
-  `AGENTKIT_AUTH_TOKEN`; `/v1/*` then requires `Authorization: Bearer <token>`.
-- `/healthz` remains unauthenticated for liveness checks.
+  `AGENTKIT_AUTH_TOKEN`; protected endpoints then require
+  `Authorization: Bearer <token>`.
+- OpenAI `/healthz` and Orka `/v1/health` and `/v1/capabilities` remain
+  unauthenticated for liveness/discovery checks.
 - `model.apiKeyEnv` and tool `env` values are names, not secret values.
 - Tool subprocesses receive only their declared env names and never inherit the
   full container environment.

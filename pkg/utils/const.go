@@ -25,8 +25,12 @@ const (
 	// ServeBinary is the agentkit-serve entrypoint inside the adapter payload.
 	ServeBinary = AgentKitRoot + "/bin/agentkit-serve"
 
-	// DefaultPort is the default serve port.
+	// DefaultPort is the default standalone/OpenAI serve port.
 	DefaultPort = 8080
+
+	// DefaultFoundryPort is the default Foundry protocol serve port when the
+	// agent ABI kept the generic default port.
+	DefaultFoundryPort = 8088
 
 	// LabelPrefix namespaces all AgentKit OCI labels (ai.<ns>.agentkit.*).
 	LabelPrefix = "ai.sozercan.agentkit"
