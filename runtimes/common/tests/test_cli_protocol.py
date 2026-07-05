@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from types import TracebackType
 
 import pytest
@@ -129,4 +130,4 @@ def test_cli_protocol_flag_sets_agentkit_protocol_for_adapter_runtime(monkeypatc
     cli.run(Factory(), ["--config", "agent.yaml", "--protocol", "orka"])
 
     assert captured["port"] == 8080
-    assert __import__("os").environ["AGENTKIT_PROTOCOL"] == "orka"
+    assert os.environ["AGENTKIT_PROTOCOL"] == "orka"
