@@ -12,7 +12,15 @@ from fastapi.testclient import TestClient
 from agentkit_serve_common.config import AgentSpec
 from agentkit_serve_common.conversation import RunRequest
 from agentkit_serve_common.orka import ORKA_HARNESS_VERSION, create_orka_app
-from agentkit_serve_common.runtime import RunResult, RuntimeSession
+from agentkit_serve_common.runtime import (
+    BrokeredToolCall,
+    BrokeredToolDefinition,
+    BrokeredToolResult,
+    OfflineEchoRuntimeFactory,
+    RunResult,
+    RuntimeSession,
+    ToolBroker,
+)
 
 AUTH = {"authorization": "Bearer test-token"}
 TERMINAL_TYPES = {"TurnCompleted", "TurnFailed", "TurnCancelled"}
@@ -107,6 +115,88 @@ def _cancel_payload(**overrides: Any) -> dict[str, Any]:
     }
     payload.update(overrides)
     return payload
+
+
+def _continue_payload(**overrides: Any) -> dict[str, Any]:
+    payload = {
+        "version": ORKA_HARNESS_VERSION,
+        "namespace": "default",
+        "taskName": "task-1",
+        "sessionName": "session-1",
+        "runtimeSessionID": "runtime-session-1",
+        "turnID": "turn-1",
+        "correlationID": "corr-1",
+        "toolResults": [
+            {
+                "version": ORKA_HARNESS_VERSION,
+                "runtimeSessionID": "runtime-session-1",
+                "turnID": "turn-1",
+                "toolCallID": "tool-call-1",
+                "idempotencyKey": "runtime-session-1:turn-1:tool-call-1",
+                "approved": True,
+                "output": {"success": True, "data": {"answer": "ok"}},
+            }
+        ],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _brokered_input(**overrides: Any) -> dict[str, Any]:
+    value = {
+        "prompt": "hello",
+        "contextRefs": [],
+        "env": [],
+        "tools": [
+            {
+                "name": "conformance_read",
+                "description": "Synthetic conformance read tool",
+                "brokeredClass": "read",
+                "parameters": {"type": "object"},
+            }
+        ],
+    }
+    value.update(overrides)
+    return value
+
+
+def _brokered_write_input(**overrides: Any) -> dict[str, Any]:
+    return _brokered_input(
+        tools=[
+            {
+                "name": "conformance_write",
+                "description": "Synthetic conformance write tool",
+                "brokeredClass": "write",
+                "parameters": {"type": "object"},
+            }
+        ],
+        **overrides,
+    )
+
+
+def _brokered_coordination_input(**overrides: Any) -> dict[str, Any]:
+    return _brokered_input(
+        tools=[
+            {
+                "name": "conformance_coordination",
+                "description": "Synthetic conformance coordination tool",
+                "brokeredClass": "coordination",
+                "parameters": {"type": "object"},
+            }
+        ],
+        **overrides,
+    )
+
+
+def _wait_for_event_type(client: TestClient, turn_id: str, event_type: str) -> dict[str, Any]:
+    for _ in range(100):
+        events = client.app.state.turns[turn_id].events
+        for event in events:
+            frame = event.as_frame()
+            if frame["type"] == event_type:
+                return frame
+        time.sleep(0.01)
+    raise AssertionError(f"timed out waiting for {event_type}")
 
 
 def _frames(resp_text: str) -> list[dict[str, Any]]:
@@ -655,3 +745,368 @@ def test_orka_runtime_session_rebuilds_when_turn_env_changes(monkeypatch):
     assert len(factory.runtimes) == 2
     assert factory.runtimes[0].exited == 1
     assert factory.runtimes[1].exited == 1
+
+
+
+
+def test_orka_continue_is_unavailable_when_brokered_is_not_enabled():
+    app = create_orka_app(_spec(), EchoFactory(), AUTH["authorization"].removeprefix("Bearer "))
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(client, turnID="turn-observed-no-continue")
+        cont = client.post(f"/v1/turns/{turn_id}/continue", json=_continue_payload(turnID=turn_id), headers=AUTH)
+        frames = _frames(client.get(f"/v1/turns/{turn_id}/events", headers=AUTH).text)
+
+    assert cont.status_code == 404
+    assert "continuation is not enabled" in cont.text
+    assert frames[-1]["type"] == "TurnCompleted"
+
+
+def test_orka_brokered_read_capability_is_feature_gated():
+    default_app = create_orka_app(_spec(), EchoFactory(), AUTH["authorization"].removeprefix("Bearer "))
+    enabled_app = create_orka_app(_spec(), OfflineEchoRuntimeFactory(), "test-token", enable_brokered_read=True)
+    write_app = create_orka_app(
+        _spec(),
+        OfflineEchoRuntimeFactory(),
+        "test-token",
+        enable_brokered_read=True,
+        enable_brokered_write=True,
+        enable_brokered_coordination=True,
+    )
+
+    with TestClient(default_app) as client:
+        default_caps = client.get("/v1/capabilities").json()
+    with TestClient(enabled_app) as client:
+        enabled_caps = client.get("/v1/capabilities").json()
+    with TestClient(write_app) as client:
+        write_caps = client.get("/v1/capabilities").json()
+
+    assert default_caps["toolExecutionModes"] == ["observed"]
+    assert "brokeredToolClasses" not in default_caps
+    assert "supportsContinuation" not in default_caps
+    assert enabled_caps["toolExecutionModes"] == ["observed", "brokered"]
+    assert enabled_caps["brokeredToolClasses"] == ["read"]
+    assert enabled_caps["supportsContinuation"] is True
+    assert write_caps["brokeredToolClasses"] == ["read", "write", "coordination"]
+
+
+def test_orka_brokered_read_round_trip_emits_tool_frames_and_completes():
+    app = create_orka_app(_spec(), OfflineEchoRuntimeFactory(), "test-token", enable_brokered_read=True)
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(client, toolExecutionMode="brokered", input=_brokered_input())
+        tool_frame = _wait_for_event_type(client, turn_id, "ToolCallRequested")
+        assert tool_frame["toolName"] == "conformance_read"
+        assert tool_frame["toolCallID"] == "tool-call-1"
+        assert tool_frame["content"] == {"prompt": "hello"}
+
+        cont = client.post(f"/v1/turns/{turn_id}/continue", json=_continue_payload(turnID=turn_id), headers=AUTH)
+        duplicate = client.post(f"/v1/turns/{turn_id}/continue", json=_continue_payload(turnID=turn_id), headers=AUTH)
+        conflicting_payload = _continue_payload(turnID=turn_id)
+        conflicting_payload["toolResults"][0]["output"] = {"success": True, "data": {"answer": "different"}}
+        conflicting = client.post(f"/v1/turns/{turn_id}/continue", json=conflicting_payload, headers=AUTH)
+        frames = _frames(client.get(f"/v1/turns/{turn_id}/events", headers=AUTH).text)
+
+    assert cont.status_code == 202, cont.text
+    assert duplicate.status_code == 202, duplicate.text
+    assert conflicting.status_code == 409, conflicting.text
+    assert [frame["type"] for frame in frames] == ["TurnStarted", "ToolCallRequested", "ToolResultReceived", "RuntimeOutput", "TurnCompleted"]
+    assert frames[2]["toolName"] == "conformance_read"
+    assert frames[2]["toolCallID"] == "tool-call-1"
+    assert frames[2]["content"] == {"success": True, "data": {"answer": "ok"}}
+    assert "offline brokered echo" in frames[-1]["completed"]["result"]
+
+
+
+
+def test_orka_brokered_write_round_trip_emits_tool_frames_and_completes():
+    app = create_orka_app(_spec(), OfflineEchoRuntimeFactory(), "test-token", enable_brokered_write=True)
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(client, toolExecutionMode="brokered", input=_brokered_write_input())
+        tool_frame = _wait_for_event_type(client, turn_id, "ToolCallRequested")
+        assert tool_frame["toolName"] == "conformance_write"
+        assert tool_frame["toolCallID"] == "tool-call-1"
+
+        cont = client.post(f"/v1/turns/{turn_id}/continue", json=_continue_payload(turnID=turn_id), headers=AUTH)
+        frames = _frames(client.get(f"/v1/turns/{turn_id}/events", headers=AUTH).text)
+
+    assert cont.status_code == 202, cont.text
+    assert [frame["type"] for frame in frames] == ["TurnStarted", "ToolCallRequested", "ToolResultReceived", "RuntimeOutput", "TurnCompleted"]
+    assert frames[1]["toolName"] == "conformance_write"
+    assert frames[2]["toolName"] == "conformance_write"
+    assert "offline brokered echo" in frames[-1]["completed"]["result"]
+
+
+def test_orka_brokered_coordination_round_trip_emits_tool_frames_and_completes():
+    app = create_orka_app(_spec(), OfflineEchoRuntimeFactory(), "test-token", enable_brokered_coordination=True)
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(client, toolExecutionMode="brokered", input=_brokered_coordination_input())
+        tool_frame = _wait_for_event_type(client, turn_id, "ToolCallRequested")
+        assert tool_frame["toolName"] == "conformance_coordination"
+        assert tool_frame["toolCallID"] == "tool-call-1"
+
+        cont = client.post(f"/v1/turns/{turn_id}/continue", json=_continue_payload(turnID=turn_id), headers=AUTH)
+        frames = _frames(client.get(f"/v1/turns/{turn_id}/events", headers=AUTH).text)
+
+    assert cont.status_code == 202, cont.text
+    assert [frame["type"] for frame in frames] == ["TurnStarted", "ToolCallRequested", "ToolResultReceived", "RuntimeOutput", "TurnCompleted"]
+    assert frames[1]["toolName"] == "conformance_coordination"
+    assert frames[2]["toolName"] == "conformance_coordination"
+    assert "offline brokered echo" in frames[-1]["completed"]["result"]
+
+
+def test_orka_brokered_continue_accepts_declined_result_without_output_or_error():
+    app = create_orka_app(_spec(), OfflineEchoRuntimeFactory(), "test-token", enable_brokered_read=True)
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(client, toolExecutionMode="brokered", input=_brokered_input())
+        _wait_for_event_type(client, turn_id, "ToolCallRequested")
+        declined = _continue_payload(turnID=turn_id)
+        declined["toolResults"][0].pop("output")
+        declined["toolResults"][0]["approved"] = False
+        cont = client.post(f"/v1/turns/{turn_id}/continue", json=declined, headers=AUTH)
+        frames = _frames(client.get(f"/v1/turns/{turn_id}/events", headers=AUTH).text)
+
+    assert cont.status_code == 202, cont.text
+    assert frames[2]["type"] == "ToolResultReceived"
+    assert frames[2]["error"] == {"code": "ToolCallDenied", "message": "tool call was not approved", "retryable": False}
+    assert frames[-1]["type"] == "TurnCompleted"
+    assert "tool error" in frames[-1]["completed"]["result"]
+
+
+def test_orka_brokered_continue_rejects_wrong_identity_or_unknown_tool_call():
+    app = create_orka_app(_spec(), OfflineEchoRuntimeFactory(), "test-token", enable_brokered_read=True)
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(client, toolExecutionMode="brokered", input=_brokered_input())
+        _wait_for_event_type(client, turn_id, "ToolCallRequested")
+        wrong_correlation = client.post(
+            f"/v1/turns/{turn_id}/continue",
+            json=_continue_payload(turnID=turn_id, correlationID="other-corr"),
+            headers=AUTH,
+        )
+        unknown_tool = _continue_payload(turnID=turn_id)
+        unknown_tool["toolResults"][0]["toolCallID"] = "other-tool"
+        unknown_tool["toolResults"][0]["idempotencyKey"] = f"runtime-session-1:{turn_id}:other-tool"
+        unknown = client.post(f"/v1/turns/{turn_id}/continue", json=unknown_tool, headers=AUTH)
+        mixed_batch = _continue_payload(turnID=turn_id)
+        mixed_batch["toolResults"].append(unknown_tool["toolResults"][0])
+        mixed = client.post(f"/v1/turns/{turn_id}/continue", json=mixed_batch, headers=AUTH)
+        denied_with_output = _continue_payload(turnID=turn_id)
+        denied_with_output["toolResults"][0]["approved"] = False
+        denied_output = client.post(f"/v1/turns/{turn_id}/continue", json=denied_with_output, headers=AUTH)
+        assert all(event.type != "ToolResultReceived" for event in client.app.state.turns[turn_id].events)
+        cancel = client.post(f"/v1/turns/{turn_id}/cancel", json=_cancel_payload(turnID=turn_id), headers=AUTH)
+
+    assert wrong_correlation.status_code == 400
+    assert "correlationID" in wrong_correlation.text
+    assert unknown.status_code == 400
+    assert "unknown toolCallID" in unknown.text
+    assert mixed.status_code == 400
+    assert "unknown toolCallID" in mixed.text
+    assert denied_output.status_code == 400
+    assert "approved is false" in denied_output.text
+    assert cancel.status_code == 202
+
+
+def test_orka_brokered_start_validates_safe_read_tool_schemas():
+    app = create_orka_app(_spec(), OfflineEchoRuntimeFactory(), "test-token", enable_brokered_read=True)
+
+    with TestClient(app) as client:
+        unsupported_class = client.post(
+            "/v1/turns",
+            json=_start_payload(
+                turnID="turn-brokered-write",
+                toolExecutionMode="brokered",
+                input=_brokered_input(tools=[{"name": "write_tool", "brokeredClass": "write", "parameters": {"type": "object"}}]),
+            ),
+            headers=AUTH,
+        )
+        bad_parameters = client.post(
+            "/v1/turns",
+            json=_start_payload(
+                turnID="turn-brokered-bad-schema",
+                toolExecutionMode="brokered",
+                input=_brokered_input(tools=[{"name": "read_tool", "brokeredClass": "read", "parameters": []}]),
+            ),
+            headers=AUTH,
+        )
+
+    assert unsupported_class.status_code == 400
+    assert "brokered write tools are not enabled" in unsupported_class.text
+    assert bad_parameters.status_code == 400
+    assert "parameters" in bad_parameters.text
+
+
+class CapturingBrokeredRuntime:
+    def __init__(self) -> None:
+        self.tools: list[BrokeredToolDefinition] = []
+
+    async def __aenter__(self) -> RuntimeSession:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool | None:
+        return None
+
+    async def run(self, request: RunRequest) -> RunResult:
+        raise AssertionError("brokered mode must not call direct run()")
+
+    async def run_brokered(self, request: RunRequest, tools: list[BrokeredToolDefinition], broker: ToolBroker) -> RunResult:
+        self.tools = list(tools)
+        result = await broker.request_tool(
+            BrokeredToolCall(
+                tool_call_id="tool-call-1",
+                name=tools[0].name,
+                arguments={"incident": "INC-1"},
+                brokered_class="read",
+            )
+        )
+        return RunResult(text=f"captured {result.output}")
+
+
+class CapturingBrokeredFactory:
+    def __init__(self) -> None:
+        self.runtime = CapturingBrokeredRuntime()
+
+    def supports_brokered_read(self) -> bool:
+        return True
+
+    def build_runtime(self, spec: AgentSpec) -> RuntimeSession:
+        return self.runtime
+
+
+def test_orka_brokered_runtime_receives_only_safe_tool_definition_fields():
+    factory = CapturingBrokeredFactory()
+    app = create_orka_app(_spec(), factory, "test-token", enable_brokered_read=True)
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(
+            client,
+            toolExecutionMode="brokered",
+            input=_brokered_input(
+                tools=[
+                    {
+                        "name": "safe_lookup",
+                        "description": "safe schema",
+                        "brokeredClass": "read",
+                        "parameters": {"type": "object", "properties": {"incident": {"type": "string"}}},
+                        "url": "http://tool.default.svc.cluster.local",
+                        "secretRef": {"name": "should-not-cross"},
+                        "headers": {"Authorization": "should-not-cross"},
+                    }
+                ]
+            ),
+        )
+        _wait_for_event_type(client, turn_id, "ToolCallRequested")
+        client.post(f"/v1/turns/{turn_id}/continue", json=_continue_payload(turnID=turn_id), headers=AUTH)
+        frames = _frames(client.get(f"/v1/turns/{turn_id}/events", headers=AUTH).text)
+
+    assert frames[-1]["type"] == "TurnCompleted"
+    assert factory.runtime.tools == [
+        BrokeredToolDefinition(
+            name="safe_lookup",
+            description="safe schema",
+            brokered_class="read",
+            parameters={"properties": {"incident": {"type": "string"}}, "type": "object"},
+        )
+    ]
+    assert not hasattr(factory.runtime.tools[0], "url")
+    assert not hasattr(factory.runtime.tools[0], "secretRef")
+    assert not hasattr(factory.runtime.tools[0], "headers")
+
+
+class BadBrokeredRuntime(CapturingBrokeredRuntime):
+    def __init__(self, call: BrokeredToolCall) -> None:
+        super().__init__()
+        self.call = call
+
+    async def run_brokered(self, request: RunRequest, tools: list[BrokeredToolDefinition], broker: ToolBroker) -> RunResult:
+        await broker.request_tool(self.call)
+        return RunResult(text="should not complete")
+
+
+class BadBrokeredFactory:
+    def __init__(self, call: BrokeredToolCall) -> None:
+        self.runtime = BadBrokeredRuntime(call)
+
+    def supports_brokered_read(self) -> bool:
+        return True
+
+    def build_runtime(self, spec: AgentSpec) -> RuntimeSession:
+        return self.runtime
+
+
+def test_orka_brokered_unknown_tool_and_invalid_arguments_fail_safely():
+    cases = [
+        BrokeredToolCall(tool_call_id="tool-call-1", name="unknown", arguments={}, brokered_class="read"),
+        BrokeredToolCall(tool_call_id="tool-call-1", name="conformance_read", arguments="bad", brokered_class="read"),  # type: ignore[arg-type]
+    ]
+    for idx, call in enumerate(cases):
+        app = create_orka_app(_spec(), BadBrokeredFactory(call), "test-token", enable_brokered_read=True)
+        with TestClient(app) as client:
+            turn_id = _create_turn(
+                client,
+                turnID=f"turn-bad-brokered-{idx}",
+                toolExecutionMode="brokered",
+                input=_brokered_input(),
+            )
+            frames = _frames(client.get(f"/v1/turns/{turn_id}/events", headers=AUTH).text)
+        assert [frame["type"] for frame in frames] == ["TurnStarted", "TurnFailed"]
+        assert frames[-1]["failed"]["reason"] in {"UnknownBrokeredTool", "InvalidToolArguments"}
+
+
+
+
+
+
+def test_orka_brokered_pending_tool_wait_is_bounded_by_deadline():
+    app = create_orka_app(_spec(), OfflineEchoRuntimeFactory(), "test-token", enable_brokered_write=True)
+    deadline = (datetime.now(UTC) + timedelta(milliseconds=150)).isoformat().replace("+00:00", "Z")
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(
+            client,
+            turnID="turn-brokered-deadline",
+            toolExecutionMode="brokered",
+            input=_brokered_write_input(),
+            deadline=deadline,
+        )
+        _wait_for_event_type(client, turn_id, "ToolCallRequested")
+        frames = _frames(client.get(f"/v1/turns/{turn_id}/events", headers=AUTH).text)
+        accepted_after_terminal = client.post(
+            "/v1/turns",
+            json=_start_payload(turnID="turn-after-brokered-deadline", input={"prompt": "after", "contextRefs": [], "env": []}),
+            headers=AUTH,
+        )
+
+    assert frames[-1]["type"] == "TurnFailed"
+    assert frames[-1]["failed"]["reason"] == "DeadlineExceeded"
+    assert accepted_after_terminal.status_code == 202
+
+
+def test_orka_brokered_late_continue_after_cancel_is_rejected():
+    app = create_orka_app(_spec(), OfflineEchoRuntimeFactory(), "test-token", enable_brokered_write=True)
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(client, toolExecutionMode="brokered", input=_brokered_write_input())
+        _wait_for_event_type(client, turn_id, "ToolCallRequested")
+        cancel = client.post(f"/v1/turns/{turn_id}/cancel", json=_cancel_payload(turnID=turn_id), headers=AUTH)
+        frames = _frames(client.get(f"/v1/turns/{turn_id}/events", headers=AUTH).text)
+        late = client.post(f"/v1/turns/{turn_id}/continue", json=_continue_payload(turnID=turn_id), headers=AUTH)
+
+    assert cancel.status_code == 202
+    assert frames[-1]["type"] == "TurnCancelled"
+    assert late.status_code == 409
+    assert "already terminal" in late.text
+
+
+def test_orka_brokered_mode_does_not_advertise_or_fall_back_to_direct_runtime_run():
+    with pytest.raises(ValueError, match="requires a runtime factory that supports brokered tools"):
+        create_orka_app(_spec(), EchoFactory(), "test-token", enable_brokered_read=True)

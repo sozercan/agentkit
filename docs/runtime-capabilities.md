@@ -52,3 +52,31 @@ Context-provider schemas are capability-gated per runtime; the MAF adapter
 currently declares skills, search, and memory support. OTel export, local tool
 approval enforcement, log-level observability, and Orka brokered-tool mode remain
 gated until a runtime and protocol contract declare support.
+
+The shared runtime package now defines the neutral brokered-tool Interface types
+(`BrokeredToolDefinition`, `BrokeredToolCall`, `BrokeredToolResult`,
+`ToolBroker`, and `BrokeredRuntimeSession`) so framework adapters have a deep
+seam to implement brokered tools. The Orka HTTP skin wires brokered
+read/write/coordination and `/continue` behind
+`AGENTKIT_ORKA_ENABLE_BROKERED_READ=1`,
+`AGENTKIT_ORKA_ENABLE_BROKERED_WRITE=1`, and
+`AGENTKIT_ORKA_ENABLE_BROKERED_COORDINATION=1`; default capabilities still
+advertise observed mode only. Orka remains responsible for coordination policy,
+quotas, child-task lineage, and namespace/agent authorization. Native framework
+adapter brokered hooks are still intentionally gated: today the brokered profiles
+are validated through the offline echo/conformance runtime, while real model
+adapters should only enable those gates after their native pause/resume/tool-output
+hooks have matching conformance coverage.
+
+## Brokered runtime feasibility decisions
+
+| Runtime adapter | Brokered status | Feasibility decision |
+|---|---|---|
+| `pydantic-ai` | Conformance/demo only | The current gate swaps to `OfflineEchoRuntime` for Orka brokered conformance. Native pydantic-ai brokered support should only be advertised after a real function-tool pause/resume path can submit Orka `ToolCallResult` values back into the running agent without direct-tool bypass. |
+| `microsoft-agent-framework` / `maf` | Conformance/demo only | The current gate swaps to `OfflineEchoRuntime`. Native MAF brokered support needs a framework hook for externally brokered tool calls and long approval waits before production advertisement. |
+| `langgraph` | Conformance/demo only | The current gate swaps to `OfflineEchoRuntime`. Native LangGraph brokered support is feasible only with explicit graph/tool-output resume state and direct-tool bypass controls. |
+
+These decisions keep checked-in/runtime-rendered Orka facades truthful: observed mode
+is the default, while brokered read/write/coordination are conformance-gated and
+must not be enabled for real model adapters until the corresponding native hooks
+and Orka conformance evidence exist.

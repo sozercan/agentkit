@@ -86,7 +86,7 @@ Protocol endpoints:
 |---|---|---|
 | `openai` | `/healthz`, `/v1/models`, `/v1/chat/completions` | Default, non-streaming Chat Completions. |
 | `foundry` | `/readiness`, `/invocations`, `/responses` | `/responses` is `foundry-responses-minimal`: synchronous/non-streaming only. |
-| `orka` | `/v1/health`, `/v1/capabilities`, `/v1/turns`, `/v1/turns/{turnID}/events`, `/v1/turns/{turnID}/cancel` | Observed-mode `orka.harness.v1` over HTTP+SSE. AgentKit reports frames; Orka enforces policy. |
+| `orka` | `/v1/health`, `/v1/capabilities`, `/v1/turns`, `/v1/turns/{turnID}/events`, `/v1/turns/{turnID}/continue`, `/v1/turns/{turnID}/cancel` | Observed-mode `orka.harness.v1` over HTTP+SSE by default. AgentKit reports frames; Orka enforces policy. Brokered read/write/coordination are feature-gated for conformance. |
 
 After deploying the image with `AGENTKIT_PROTOCOL=orka` and an
 `AGENTKIT_AUTH_TOKEN` sourced from the Orka client-auth Secret, render an Orka
@@ -119,9 +119,14 @@ fields (`runtimeSessionID`, `turnID`, `correlationID`), `createdAt`,
 `contentText` for runtime output, and `completed` / `failed` terminal payloads.
 See [`docs/orka.md`](docs/orka.md) for complete request/response examples.
 
+Note: this repository's `agentkit-serve` runtime is distinct from OpenAI's public
+AgentKit/Agents SDK product surface unless a future adapter explicitly targets it.
+
 CI also runs an offline Orka container smoke that starts a built AgentKit image in
 `AGENTKIT_PROTOCOL=orka`, verifies native health/capabilities, bearer auth, turn
 acceptance, and SSE terminal-frame shape without calling a live model provider.
+For local Orka/kind conformance demos that need a successful no-provider turn,
+set `AGENTKIT_ORKA_OFFLINE_ECHO=1`; this fixture mode is not for production.
 
 ## Use any OpenAI-compatible model endpoint
 

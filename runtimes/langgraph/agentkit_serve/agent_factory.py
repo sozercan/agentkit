@@ -51,7 +51,13 @@ from agentkit_serve_common.adapter_support import (
 )
 from agentkit_serve_common.config import AgentSpec, ToolSpec
 from agentkit_serve_common.conversation import RunRequest
-from agentkit_serve_common.runtime import AgentRunError, RunResult, RuntimeSession
+from agentkit_serve_common.runtime import (
+    AgentRunError,
+    OfflineEchoRuntimeFactory,
+    RunResult,
+    RuntimeSession,
+    offline_orka_echo_enabled,
+)
 
 # Seconds to wait for a stdio MCP server's initialize handshake. A cold `uvx` or
 # `npx` tool may download/install before speaking MCP, so match pydantic-ai's
@@ -180,8 +186,22 @@ def validate_supported_spec(spec: AgentSpec) -> None:
         raise AgentBuildError("langgraph runtime does not support context providers")
 
 
-def build_runtime(spec: AgentSpec) -> LangGraphRuntime:
+def supports_brokered_read() -> bool:
+    return offline_orka_echo_enabled()
+
+
+def supports_brokered_write() -> bool:
+    return offline_orka_echo_enabled()
+
+
+def supports_brokered_coordination() -> bool:
+    return offline_orka_echo_enabled()
+
+
+def build_runtime(spec: AgentSpec) -> RuntimeSession:
     """Build the runtime session consumed by the shared server."""
+    if offline_orka_echo_enabled():
+        return OfflineEchoRuntimeFactory().build_runtime(spec)
     validate_supported_spec(spec)
     return LangGraphRuntime(spec)
 
