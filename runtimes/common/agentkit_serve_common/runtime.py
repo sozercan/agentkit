@@ -34,10 +34,10 @@ def _offline_wait_task_name(prompt: str) -> str:
     marker = "wait_for_tasks:"
     if marker not in prompt:
         return ""
-    tokens = prompt.split(marker, 1)[1].strip().split()
-    if not tokens:
+    parts = prompt.split(marker, 1)[1].strip().split()
+    if not parts:
         return ""
-    return tokens[0].strip("`'\"")
+    return parts[0].strip("`'\"")
 
 
 class AgentRunError(Exception):
