@@ -169,3 +169,29 @@ def test_offline_echo_runtime_can_wait_for_existing_task_from_prompt() -> None:
 
     broker = asyncio.run(exercise())
     assert broker.calls[0].arguments == {"tasks": ["child-123"], "timeout": "30s"}
+
+
+def test_offline_wait_task_name_empty_marker_falls_back_to_echo_tool() -> None:
+    from agentkit_serve_common.runtime import OfflineEchoRuntime
+
+    class SingleToolBroker:
+        def __init__(self) -> None:
+            self.calls: list[BrokeredToolCall] = []
+
+        async def request_tool(self, call: BrokeredToolCall) -> BrokeredToolResult:
+            self.calls.append(call)
+            return BrokeredToolResult(tool_call_id=call.tool_call_id, approved=True, output={"ok": True})
+
+    async def exercise() -> SingleToolBroker:
+        broker = SingleToolBroker()
+        runtime = OfflineEchoRuntime()
+        result = await runtime.run_brokered(
+            RunRequest(prompt="please wait_for_tasks:"),
+            [BrokeredToolDefinition(name="wait_for_tasks", description="wait", brokered_class="coordination", parameters={})],
+            broker,
+        )
+        assert "offline brokered echo" in result.text
+        return broker
+
+    broker = asyncio.run(exercise())
+    assert broker.calls[0].arguments == {"prompt": "please wait_for_tasks:"}
