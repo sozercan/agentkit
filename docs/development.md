@@ -126,8 +126,23 @@ secrets. It uses the pinned `ghcr.io/sozercan/vekil` image to provide an
 OpenAI-compatible endpoint and validates a real built AgentKit container through
 `/v1/chat/completions`.
 
-Fork PRs, Dependabot runs without secrets, and repos without the token skip this
-job while normal offline checks still run.
+For local workstation validation, the same script can also use an existing Vekil
+auth cache instead of a token. Leave `COPILOT_GITHUB_TOKEN` unset and set
+`VEKIL_CACHE_DIR` if your cache is not in `~/.config/vekil`:
+
+```sh
+VEKIL_HOST_PORT=31339 \
+AGENTKIT_LIVE_HOST_PORT=18086 \
+TAG=e2e-script \
+scripts/live-copilot-agent-e2e.sh
+```
+
+When `PLATFORM` is unset, the script picks `linux/arm64` on arm64 Docker hosts
+and `linux/amd64` on amd64 hosts so locally built adapter images match the live
+agent image.
+
+Fork PRs, Dependabot runs without secrets, and repos without the token/cache skip
+or fail before live provider calls while normal offline checks still run.
 
 ## Foundry Hosted Agents fixture
 

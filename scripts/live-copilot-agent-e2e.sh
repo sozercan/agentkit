@@ -19,6 +19,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 work_dir="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/agentkit-live-copilot.XXXXXX")"
 
 copilot_token="${COPILOT_GITHUB_TOKEN:-}"
+vekil_cache_dir="${VEKIL_CACHE_DIR:-${HOME:-}/.config/vekil}"
 vekil_image="${VEKIL_IMAGE:-ghcr.io/sozercan/vekil@sha256:d13edeedf7bec319da8eb3ea4949a4d0802e244c14765a347e62e1b8b7be8e3d}"
 vekil_container_name="${VEKIL_CONTAINER_NAME:-agentkit-vekil}"
 vekil_host_port="${VEKIL_HOST_PORT:-1337}"
@@ -28,8 +29,19 @@ network_name="${AGENTKIT_LIVE_NETWORK:-agentkit-live-copilot}"
 agent_host_port="${AGENTKIT_LIVE_HOST_PORT:-18080}"
 agent_auth_token="${AGENTKIT_AUTH_TOKEN:-agentkit-live-ci-token}"
 tag="${TAG:-ci-live}"
-platform="${PLATFORM:-linux/amd64}"
+platform="${PLATFORM:-}"
 builder="${BUILDER:-}"
+
+
+default_platform() {
+  local arch
+  arch="$(docker info --format '{{.Architecture}}' 2>/dev/null || uname -m)"
+  case "${arch}" in
+    aarch64|arm64) printf 'linux/arm64' ;;
+    x86_64|amd64) printf 'linux/amd64' ;;
+    *) printf 'linux/amd64' ;;
+  esac
+}
 
 redact() {
   local text
@@ -104,9 +116,9 @@ wait_for_vekil_ready() {
     # optional live job; real build, networking, and agent failures still fail.
     if ! docker inspect -f '{{.State.Running}}' "${vekil_container_name}" 2>/dev/null | grep -qx true; then
       logs="$(docker logs "${vekil_container_name}" 2>&1 || true)"
-      if printf '%s' "${logs}" | grep -Eq 'copilot token request failed with status 403|authentication failed:.*status 403'; then
-        log "Skipping live Vekil/Copilot E2E: COPILOT_GITHUB_TOKEN was rejected by Vekil's Copilot token exchange (HTTP 403)."
-        log "Update the repository secret to a token for a Copilot-enabled user with the Copilot Requests permission to run this live check."
+      if printf '%s' "${logs}" | grep -Eq 'copilot token request failed with status (403|404)|authentication failed:.*status (403|404)'; then
+        log "Skipping live Vekil/Copilot E2E: COPILOT_GITHUB_TOKEN was rejected by Vekil's Copilot token exchange."
+        log "Use a token for a Copilot-enabled user with the Copilot Requests permission, or unset COPILOT_GITHUB_TOKEN and provide VEKIL_CACHE_DIR with a valid Vekil auth cache."
         return 2
       fi
     fi
@@ -124,7 +136,12 @@ main() {
   require_cmd jq
   require_cmd make
 
-  [[ -n "${copilot_token}" ]] || die "COPILOT_GITHUB_TOKEN is required"
+  if [[ -z "${platform}" ]]; then
+    platform="$(default_platform)"
+  fi
+  if [[ -z "${copilot_token}" && ! -d "${vekil_cache_dir}" ]]; then
+    die "COPILOT_GITHUB_TOKEN or VEKIL_CACHE_DIR with cached Vekil auth is required"
+  fi
 
   trap 'on_exit $?' EXIT
 
@@ -136,14 +153,20 @@ main() {
 
   log "Starting Vekil (${vekil_image})"
   docker rm -f "${vekil_container_name}" >/dev/null 2>&1 || true
-  docker run -d --name "${vekil_container_name}" \
-    --network "${network_name}" \
-    --network-alias host.docker.internal \
-    -p "127.0.0.1:${vekil_host_port}:${vekil_container_port}" \
-    -e COPILOT_GITHUB_TOKEN="${copilot_token}" \
-    -e PORT="${vekil_container_port}" \
-    -e TOKEN_DIR=/home/nonroot/.config/vekil \
-    "${vekil_image}" >/dev/null
+  vekil_args=(
+    -d --name "${vekil_container_name}"
+    --network "${network_name}"
+    --network-alias host.docker.internal
+    -p "127.0.0.1:${vekil_host_port}:${vekil_container_port}"
+    -e PORT="${vekil_container_port}"
+    -e TOKEN_DIR=/home/nonroot/.config/vekil
+  )
+  if [[ -n "${copilot_token}" ]]; then
+    vekil_args+=(-e COPILOT_GITHUB_TOKEN="${copilot_token}")
+  elif [[ -d "${vekil_cache_dir}" ]]; then
+    vekil_args+=(-v "${vekil_cache_dir}:/home/nonroot/.config/vekil")
+  fi
+  docker run "${vekil_args[@]}" "${vekil_image}" >/dev/null
 
   log "Waiting for Vekil /readyz"
   if ! wait_for_vekil_ready; then
@@ -155,6 +178,8 @@ main() {
   jq -e '.data | length > 0' "${work_dir}/models.json" >/dev/null
   jq -r '.data[].id' "${work_dir}/models.json" | sed 's/^/model: /' | redact >&2
   jq -e '.data[] | select(.id == "claude-haiku-4.5")' "${work_dir}/models.json" >/dev/null
+
+  log "Using build platform ${platform}"
 
   log "Building AgentKit frontend and MAF adapter"
   buildx_args=()
@@ -168,7 +193,7 @@ main() {
   make build-serve-maf TAG="${tag}"
 
   log "Building live MAF agent image"
-  docker buildx build "${buildx_args[@]}" . -f test/agentkitfile-maf-live.yaml \
+  docker buildx build ${buildx_args[@]+"${buildx_args[@]}"} . -f test/agentkitfile-maf-live.yaml \
     --build-arg BUILDKIT_SYNTAX="agentkit:${tag}" \
     --build-arg adapter="agentkit-serve-maf:${tag}" \
     --platform "${platform}" \
