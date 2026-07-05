@@ -125,6 +125,11 @@ def run(factory: RuntimeFactory, argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
 
     protocol = _resolve_protocol(args.protocol)
+    # Keep the resolved protocol visible to adapter factories for the full server
+    # lifetime. Some runtime gates, such as Orka's offline conformance runtime,
+    # are intentionally adapter-owned and read AGENTKIT_PROTOCOL when a turn later
+    # builds a runtime session.
+    os.environ["AGENTKIT_PROTOCOL"] = protocol
     spec = _load_spec_or_exit(args.config, protocol)
 
     # --- resolve bind/port ------------------------------------------------

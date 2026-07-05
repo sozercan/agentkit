@@ -117,3 +117,16 @@ def test_cli_orka_skips_startup_required_env_validation_for_turn_env(monkeypatch
 
     assert captured["port"] == 8080
     assert any(getattr(route, "path", None) == "/v1/turns" for route in captured["app"].routes)
+
+
+def test_cli_protocol_flag_sets_agentkit_protocol_for_adapter_runtime(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(cli, "load", lambda path: _spec())
+    monkeypatch.setattr(cli.uvicorn, "run", lambda app, **kwargs: captured.update({"app": app, **kwargs}))
+    monkeypatch.setenv("AGENTKIT_AUTH_TOKEN", "token")
+    monkeypatch.delenv("AGENTKIT_PROTOCOL", raising=False)
+
+    cli.run(Factory(), ["--config", "agent.yaml", "--protocol", "orka"])
+
+    assert captured["port"] == 8080
+    assert __import__("os").environ["AGENTKIT_PROTOCOL"] == "orka"
