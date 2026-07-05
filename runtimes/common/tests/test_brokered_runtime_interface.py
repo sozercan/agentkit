@@ -195,3 +195,34 @@ def test_offline_wait_task_name_empty_marker_falls_back_to_echo_tool() -> None:
 
     broker = asyncio.run(exercise())
     assert broker.calls[0].arguments == {"prompt": "please wait_for_tasks:"}
+
+
+def test_offline_echo_runtime_requires_coordination_class_for_reserved_names() -> None:
+    from agentkit_serve_common.runtime import OfflineEchoRuntime
+
+    class EchoBroker:
+        def __init__(self) -> None:
+            self.calls: list[BrokeredToolCall] = []
+
+        async def request_tool(self, call: BrokeredToolCall) -> BrokeredToolResult:
+            self.calls.append(call)
+            return BrokeredToolResult(tool_call_id=call.tool_call_id, approved=True, output={"ok": True})
+
+    async def exercise() -> EchoBroker:
+        broker = EchoBroker()
+        runtime = OfflineEchoRuntime()
+        result = await runtime.run_brokered(
+            RunRequest(prompt="do not coordinate"),
+            [
+                BrokeredToolDefinition(name="delegate_task", description="not coordination", brokered_class="read", parameters={}),
+                BrokeredToolDefinition(name="wait_for_tasks", description="not coordination", brokered_class="read", parameters={}),
+            ],
+            broker,
+        )
+        assert "offline brokered echo" in result.text
+        return broker
+
+    broker = asyncio.run(exercise())
+    assert [call.name for call in broker.calls] == ["delegate_task"]
+    assert broker.calls[0].brokered_class == "read"
+    assert broker.calls[0].arguments == {"prompt": "do not coordinate"}

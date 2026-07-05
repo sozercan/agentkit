@@ -179,14 +179,15 @@ class OfflineEchoRuntime:
         if not tools:
             raise AgentRunError("brokered run requires at least one Orka tool schema", status=400, code="NoBrokeredTools")
         by_name = {tool.name: tool for tool in tools}
-        if "delegate_task" in by_name and "wait_for_tasks" in by_name:
+        coordination_tool_names = {name for name, tool in by_name.items() if tool.brokered_class == "coordination"}
+        if {"delegate_task", "wait_for_tasks"}.issubset(coordination_tool_names):
             return await self._run_offline_coordinator(request, by_name, broker)
-        if "delegate_task" in by_name:
+        if "delegate_task" in coordination_tool_names:
             delegate_result = await self._request_offline_delegate(request, by_name["delegate_task"], broker)
             if delegate_result.error is not None:
                 return RunResult(text=f"offline coordinator delegate error: {delegate_result.error}")
             return RunResult(text=f"offline coordinator delegate result: {delegate_result.output}")
-        if "wait_for_tasks" in by_name:
+        if "wait_for_tasks" in coordination_tool_names:
             task_name = _offline_wait_task_name(request.prompt)
             if task_name:
                 wait_result = await broker.request_tool(
