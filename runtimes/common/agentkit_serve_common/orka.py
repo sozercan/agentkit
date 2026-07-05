@@ -55,6 +55,18 @@ _MAX_TERMINAL_TURNS_ENV = "AGENTKIT_ORKA_MAX_TERMINAL_TURNS"
 _MAX_RUNTIME_SESSIONS_ENV = "AGENTKIT_ORKA_MAX_RUNTIME_SESSIONS"
 _TURN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_ORKA_RUNTIME_ENV_NAMES = frozenset({
+    "ORKA_CONTROLLER_URL",
+    "ORKA_RESULT_ENDPOINT",
+    "ORKA_PRIOR_TASK",
+    "ORKA_PRIOR_TASK_NAMESPACE",
+    "ORKA_PARENT_TASK",
+    "ORKA_TRACEPARENT",
+    "ORKA_TRACESTATE",
+    "ORKA_BAGGAGE",
+    "ORKA_AGENT_READ_ONLY",
+    "ORKA_RESULT_STDOUT",
+})
 
 
 @dataclass
@@ -468,7 +480,7 @@ def _env_from_input(input_value: Mapping[str, Any], *, allowed_names: set[str]) 
             raise HTTPException(status_code=400, detail=f"input.env[{idx}].name is invalid")
         if name.startswith("AGENTKIT_"):
             raise HTTPException(status_code=400, detail=f"input.env[{idx}].name {name!r} is reserved")
-        if name not in allowed_names:
+        if name not in allowed_names and name not in _ORKA_RUNTIME_ENV_NAMES:
             raise HTTPException(status_code=400, detail=f"input.env[{idx}].name {name!r} is not declared by this agent")
         value = item.get("value", "")
         if not isinstance(value, str):

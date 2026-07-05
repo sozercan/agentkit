@@ -367,6 +367,11 @@ def test_orka_start_turn_requires_contract_fields():
         env_resp = client.post("/v1/turns", json=bad_env, headers=AUTH)
         undeclared_env = _start_payload(input={"prompt": "hi", "env": [{"name": "OTHER_TOKEN", "value": "x"}]})
         undeclared_env_resp = client.post("/v1/turns", json=undeclared_env, headers=AUTH)
+        orka_env = _start_payload(
+            turnID="turn-orka-env",
+            input={"prompt": "hi", "env": [{"name": "ORKA_CONTROLLER_URL", "value": "http://orka-api.default.svc:8080"}]},
+        )
+        orka_env_resp = client.post("/v1/turns", json=orka_env, headers=AUTH)
         reserved_env = _start_payload(input={"prompt": "hi", "env": [{"name": "AGENTKIT_WORKLOAD_IDENTITY_TOKEN_COMMAND", "value": "echo nope"}]})
         reserved_env_resp = client.post("/v1/turns", json=reserved_env, headers=AUTH)
         bad_context_refs = _start_payload(input={"prompt": "hi", "contextRefs": [{"kind": "artifact"}], "env": []})
@@ -382,6 +387,7 @@ def test_orka_start_turn_requires_contract_fields():
     assert "input.env" in env_resp.text
     assert undeclared_env_resp.status_code == 400
     assert "not declared" in undeclared_env_resp.text
+    assert orka_env_resp.status_code == 202
     assert reserved_env_resp.status_code == 400
     assert "reserved" in reserved_env_resp.text
     assert context_resp.status_code == 400
