@@ -55,18 +55,6 @@ _MAX_TERMINAL_TURNS_ENV = "AGENTKIT_ORKA_MAX_TERMINAL_TURNS"
 _MAX_RUNTIME_SESSIONS_ENV = "AGENTKIT_ORKA_MAX_RUNTIME_SESSIONS"
 _TURN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_ORKA_RUNTIME_ENV_NAMES = frozenset({
-    "ORKA_CONTROLLER_URL",
-    "ORKA_RESULT_ENDPOINT",
-    "ORKA_PRIOR_TASK",
-    "ORKA_PRIOR_TASK_NAMESPACE",
-    "ORKA_PARENT_TASK",
-    "ORKA_TRACEPARENT",
-    "ORKA_TRACESTATE",
-    "ORKA_BAGGAGE",
-    "ORKA_AGENT_READ_ONLY",
-    "ORKA_RESULT_STDOUT",
-})
 
 
 @dataclass
@@ -480,7 +468,7 @@ def _env_from_input(input_value: Mapping[str, Any], *, allowed_names: set[str]) 
             raise HTTPException(status_code=400, detail=f"input.env[{idx}].name is invalid")
         if name.startswith("AGENTKIT_"):
             raise HTTPException(status_code=400, detail=f"input.env[{idx}].name {name!r} is reserved")
-        if name not in allowed_names and name not in _ORKA_RUNTIME_ENV_NAMES:
+        if name not in allowed_names:
             raise HTTPException(status_code=400, detail=f"input.env[{idx}].name {name!r} is not declared by this agent")
         value = item.get("value", "")
         if not isinstance(value, str):
@@ -728,6 +716,11 @@ class OrkaToolBroker:
             raise AgentRunError(f"brokered class mismatch for tool {call.name!r}", status=400, code="BrokeredClassMismatch")
         if not isinstance(call.arguments, Mapping):
             raise AgentRunError("brokered tool arguments must be an object", status=400, code="InvalidToolArguments")
+        try:
+            encoded_arguments = json.dumps(dict(call.arguments), separators=(",", ":"), sort_keys=True)
+        except (TypeError, ValueError) as exc:
+            raise AgentRunError("brokered tool arguments must be JSON serializable", status=400, code="InvalidToolArguments") from exc
+        arguments = json.loads(encoded_arguments)
         async with self.state.condition:
             if self.state.terminal_event is not None:
                 raise AgentRunError("turn is already terminal", status=409, code="TurnTerminal")
@@ -738,7 +731,7 @@ class OrkaToolBroker:
         await self.state.append(
             "ToolCallRequested",
             summary="brokered tool requested",
-            content=dict(call.arguments),
+            content=arguments,
             tool_name=call.name,
             tool_call_id=call.tool_call_id,
         )

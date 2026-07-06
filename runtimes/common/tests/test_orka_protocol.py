@@ -354,6 +354,19 @@ def test_orka_turn_forwards_per_turn_metadata_env_and_session_fields():
     assert request.metadata == {"tenant": "acme"}
 
 
+def test_orka_rejects_undeclared_orka_controller_env():
+    app = create_orka_app(_spec(), EchoFactory(), AUTH["authorization"].removeprefix("Bearer "))
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/v1/turns",
+            json=_start_payload(input={"prompt": "hi", "contextRefs": [], "env": [{"name": "ORKA_CONTROLLER_URL", "value": "http://orka-api"}]}),
+            headers=AUTH,
+        )
+
+    assert resp.status_code == 400
+    assert "not declared" in resp.text
+
 def test_orka_start_turn_requires_contract_fields():
     app = create_orka_app(_spec(), EchoFactory(), auth_token="test-token")
 
@@ -367,11 +380,6 @@ def test_orka_start_turn_requires_contract_fields():
         env_resp = client.post("/v1/turns", json=bad_env, headers=AUTH)
         undeclared_env = _start_payload(input={"prompt": "hi", "env": [{"name": "OTHER_TOKEN", "value": "x"}]})
         undeclared_env_resp = client.post("/v1/turns", json=undeclared_env, headers=AUTH)
-        orka_env = _start_payload(
-            turnID="turn-orka-env",
-            input={"prompt": "hi", "env": [{"name": "ORKA_CONTROLLER_URL", "value": "http://orka-api.default.svc:8080"}]},
-        )
-        orka_env_resp = client.post("/v1/turns", json=orka_env, headers=AUTH)
         reserved_env = _start_payload(input={"prompt": "hi", "env": [{"name": "AGENTKIT_WORKLOAD_IDENTITY_TOKEN_COMMAND", "value": "echo nope"}]})
         reserved_env_resp = client.post("/v1/turns", json=reserved_env, headers=AUTH)
         bad_context_refs = _start_payload(input={"prompt": "hi", "contextRefs": [{"kind": "artifact"}], "env": []})
@@ -387,14 +395,12 @@ def test_orka_start_turn_requires_contract_fields():
     assert "input.env" in env_resp.text
     assert undeclared_env_resp.status_code == 400
     assert "not declared" in undeclared_env_resp.text
-    assert orka_env_resp.status_code == 202
     assert reserved_env_resp.status_code == 400
     assert "reserved" in reserved_env_resp.text
     assert context_resp.status_code == 400
     assert "contextRefs" in context_resp.text
     assert brokered_resp.status_code == 400
     assert "toolExecutionMode" in brokered_resp.text
-
 
 
 def test_orka_context_refs_are_validated_and_forwarded_as_safe_references():
@@ -1047,6 +1053,27 @@ class BadBrokeredFactory:
 
     def build_runtime(self, spec: AgentSpec) -> RuntimeSession:
         return self.runtime
+
+
+def test_orka_brokered_non_json_arguments_fail_safely():
+    import datetime as dt
+
+    app = create_orka_app(
+        _spec(),
+        BadBrokeredFactory(BrokeredToolCall(tool_call_id="tool-call-1", name="conformance_read", arguments={"when": dt.datetime.now()}, brokered_class="read")),
+        "test-token",
+        enable_brokered_read=True,
+    )
+    with TestClient(app) as client:
+        turn_id = _create_turn(
+            client,
+            turnID="turn-non-json-arguments",
+            toolExecutionMode="brokered",
+            input=_brokered_input(),
+        )
+        frames = _frames(client.get(f"/v1/turns/{turn_id}/events", headers=AUTH).text)
+    assert [frame["type"] for frame in frames] == ["TurnStarted", "TurnFailed"]
+    assert frames[-1]["failed"]["reason"] == "InvalidToolArguments"
 
 
 def test_orka_brokered_empty_tool_call_id_fails_immediately():
