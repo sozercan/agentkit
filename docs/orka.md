@@ -56,6 +56,21 @@ capability response. This is useful for kind demos that need
 `AgentRuntime` readiness to pass without live model credentials; do not use it
 for production agent deployments.
 
+AgentKit still enforces its per-turn environment allowlist in Orka mode. When an
+AgentKit image is used behind Orka `Agent.spec.runtime.runtimeRef`, declare any
+Orka-injected env names that the controller may send in the AgentKitfile ABI. For
+the offline/kind demos this typically includes:
+
+```yaml
+env:
+  - name: ORKA_CONTROLLER_URL
+  - name: ORKA_RESULT_ENDPOINT
+  - name: ORKA_PARENT_TASK
+  - name: ORKA_PRIOR_TASK
+  - name: ORKA_PRIOR_TASK_NAMESPACE
+  - name: ORKA_COORDINATION_DEPTH
+```
+
 For brokered read/write/coordination conformance, also set the matching
 `AGENTKIT_ORKA_ENABLE_BROKERED_*` gate. Those gated modes advertise
 `toolExecutionModes: [observed, brokered]`, the enabled `brokeredToolClasses`,
