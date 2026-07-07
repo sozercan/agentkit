@@ -42,7 +42,12 @@ from agentkit_serve_common.adapter_support import (
 )
 from agentkit_serve_common.config import AgentSpec, ContextProviderSpec, ToolSpec
 from agentkit_serve_common.conversation import RunRequest
-from agentkit_serve_common.runtime import RunResult, RuntimeSession
+from agentkit_serve_common.runtime import (
+    OfflineEchoRuntimeFactory,
+    RunResult,
+    RuntimeSession,
+    offline_orka_echo_enabled,
+)
 
 _AUTH_WORKLOAD_IDENTITY = "workload-identity-token"
 _CONTEXT_TYPE_SEARCH = "search"
@@ -435,8 +440,22 @@ class MAFRuntime:
         return SkillsProvider(MCPSkillsSource(client=session))
 
 
-def build_runtime(spec: AgentSpec) -> MAFRuntime:
+def supports_brokered_read() -> bool:
+    return offline_orka_echo_enabled()
+
+
+def supports_brokered_write() -> bool:
+    return offline_orka_echo_enabled()
+
+
+def supports_brokered_coordination() -> bool:
+    return offline_orka_echo_enabled()
+
+
+def build_runtime(spec: AgentSpec) -> RuntimeSession:
     """Build the runtime session consumed by the shared server."""
+    if offline_orka_echo_enabled():
+        return OfflineEchoRuntimeFactory().build_runtime(spec)
     return MAFRuntime(spec)
 
 

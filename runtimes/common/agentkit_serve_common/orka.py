@@ -23,13 +23,31 @@ from fastapi.responses import StreamingResponse
 
 from .config import AgentSpec
 from .conversation import RunRequest
-from .runtime import AgentRunError, RunResult, RuntimeFactory
+from .runtime import (
+    AgentRunError,
+    BrokeredRuntimeSession,
+    BrokeredToolCall,
+    BrokeredToolDefinition,
+    BrokeredToolResult,
+    OfflineEchoRuntimeFactory,
+    RunResult,
+    RuntimeFactory,
+    ToolBroker,
+)
 from .server import make_auth_dependency
 
 ORKA_HARNESS_VERSION = "orka.harness.v1"
 HTTP_TRANSPORT = "http+sse"
 PROVIDER_KIND_KUBERNETES_SERVICE = "kubernetes-service"
 TOOL_MODE_OBSERVED = "observed"
+TOOL_MODE_BROKERED = "brokered"
+BROKERED_CLASS_READ = "read"
+BROKERED_CLASS_WRITE = "write"
+BROKERED_CLASS_COORDINATION = "coordination"
+_ENABLE_BROKERED_READ_ENV = "AGENTKIT_ORKA_ENABLE_BROKERED_READ"
+_ENABLE_BROKERED_WRITE_ENV = "AGENTKIT_ORKA_ENABLE_BROKERED_WRITE"
+_ENABLE_BROKERED_COORDINATION_ENV = "AGENTKIT_ORKA_ENABLE_BROKERED_COORDINATION"
+_MAX_TOOL_SCHEMA_BYTES = 65536
 _TERMINAL_TYPES = frozenset({"TurnCompleted", "TurnFailed", "TurnCancelled"})
 _DEFAULT_MAX_TERMINAL_TURNS = 256
 _DEFAULT_MAX_RUNTIME_SESSIONS = 64
@@ -82,6 +100,9 @@ class TurnEvent:
     completed: Mapping[str, Any] | None = None
     failed: Mapping[str, Any] | None = None
     error: Mapping[str, Any] | None = None
+    tool_name: str = ""
+    tool_call_id: str = ""
+    approval_id: str = ""
     metadata: Mapping[str, str] = field(default_factory=dict)
 
     @property
@@ -101,11 +122,21 @@ class TurnEvent:
             "summary": self.summary,
             "content": dict(self.content or {}),
             "contentText": self.content_text,
+            "toolName": self.tool_name,
+            "toolCallID": self.tool_call_id,
+            "approvalID": self.approval_id,
             "completed": dict(self.completed) if self.completed is not None else None,
             "failed": dict(self.failed) if self.failed is not None else None,
             "error": dict(self.error) if self.error is not None else None,
             "metadata": dict(self.metadata),
         }
+
+
+@dataclass
+class PendingBrokeredTool:
+    call: BrokeredToolCall
+    future: asyncio.Future[BrokeredToolResult]
+    accepted_result: BrokeredToolResult | None = None
 
 
 class TurnState:
@@ -117,17 +148,26 @@ class TurnState:
         runtime_session_id: str,
         turn_id: str,
         correlation_id: str,
+        namespace: str = "",
+        task_name: str = "",
+        session_name: str = "",
+        deadline: datetime | None = None,
         metadata: Mapping[str, str] | None = None,
         task: asyncio.Task[None] | None = None,
     ) -> None:
         self.runtime_session_id = runtime_session_id
         self.turn_id = turn_id
         self.correlation_id = correlation_id
+        self.namespace = namespace
+        self.task_name = task_name
+        self.session_name = session_name
+        self.deadline = deadline
         self.metadata = dict(metadata or {})
         self.task = task
         self.events: list[TurnEvent] = []
         self.condition = asyncio.Condition()
         self.terminal_event: TurnEvent | None = None
+        self.pending_tools: dict[str, PendingBrokeredTool] = {}
 
     async def append(
         self,
@@ -140,6 +180,9 @@ class TurnState:
         completed: Mapping[str, Any] | None = None,
         failed: Mapping[str, Any] | None = None,
         error: Mapping[str, Any] | None = None,
+        tool_name: str = "",
+        tool_call_id: str = "",
+        approval_id: str = "",
         metadata: Mapping[str, str] | None = None,
     ) -> tuple[TurnEvent, bool]:
         async with self.condition:
@@ -162,6 +205,9 @@ class TurnState:
                 completed=completed,
                 failed=failed,
                 error=error,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                approval_id=approval_id,
                 metadata=metadata or self.metadata,
             )
             self.events.append(event)
@@ -210,6 +256,31 @@ def _max_runtime_sessions(value: int | None = None) -> int:
         default=_DEFAULT_MAX_RUNTIME_SESSIONS,
         field_name="max_runtime_sessions",
     )
+
+
+def _truthy_env(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _brokered_read_enabled(value: bool | None = None) -> bool:
+    return bool(value) if value is not None else _truthy_env(_ENABLE_BROKERED_READ_ENV)
+
+
+def _brokered_write_enabled(value: bool | None = None) -> bool:
+    return bool(value) if value is not None else _truthy_env(_ENABLE_BROKERED_WRITE_ENV)
+
+
+def _brokered_coordination_enabled(value: bool | None = None) -> bool:
+    return bool(value) if value is not None else _truthy_env(_ENABLE_BROKERED_COORDINATION_ENV)
+
+
+def _factory_supports_brokered_class(factory: RuntimeFactory, brokered_class: str) -> bool:
+    if isinstance(factory, OfflineEchoRuntimeFactory):
+        return True
+    supports = getattr(factory, f"supports_brokered_{brokered_class}", None)
+    if callable(supports):
+        return bool(supports())
+    return False
 
 
 def _record_terminal_turn(
@@ -432,6 +503,53 @@ def _context_refs_from_input(input_value: Mapping[str, Any]) -> list[dict[str, A
     return out
 
 
+def _brokered_tools_from_input(input_value: Mapping[str, Any], *, allowed_brokered_classes: set[str]) -> list[BrokeredToolDefinition]:
+    raw_tools = input_value.get("tools", [])
+    if raw_tools in (None, ""):
+        return []
+    if not isinstance(raw_tools, list):
+        raise HTTPException(status_code=400, detail="input.tools must be an array")
+    tools: list[BrokeredToolDefinition] = []
+    seen: set[str] = set()
+    for idx, item in enumerate(raw_tools):
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=400, detail=f"input.tools[{idx}] must be an object")
+        name = _clean(item.get("name"))
+        if name is None:
+            raise HTTPException(status_code=400, detail=f"input.tools[{idx}].name is required")
+        if name in seen:
+            raise HTTPException(status_code=400, detail=f"input.tools[{idx}].name {name!r} is duplicated")
+        seen.add(name)
+        description = item.get("description", "")
+        if not isinstance(description, str):
+            raise HTTPException(status_code=400, detail=f"input.tools[{idx}].description must be a string")
+        brokered_class = _clean(item.get("brokeredClass")) or BROKERED_CLASS_READ
+        if brokered_class not in {BROKERED_CLASS_READ, BROKERED_CLASS_WRITE, BROKERED_CLASS_COORDINATION}:
+            raise HTTPException(status_code=400, detail=f"unsupported brokered tool class {brokered_class!r}")
+        if brokered_class not in allowed_brokered_classes:
+            raise HTTPException(status_code=400, detail=f"brokered {brokered_class} tools are not enabled")
+        parameters = item.get("parameters", {})
+        if parameters is None:
+            parameters = {}
+        if not isinstance(parameters, dict):
+            raise HTTPException(status_code=400, detail=f"input.tools[{idx}].parameters must be an object")
+        try:
+            encoded = json.dumps(parameters, separators=(",", ":"), sort_keys=True)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=f"input.tools[{idx}].parameters must be JSON serializable") from exc
+        if len(encoded.encode("utf-8")) > _MAX_TOOL_SCHEMA_BYTES:
+            raise HTTPException(status_code=400, detail=f"input.tools[{idx}].parameters is too large")
+        tools.append(
+            BrokeredToolDefinition(
+                name=name,
+                description=description,
+                brokered_class=brokered_class,
+                parameters=json.loads(encoded),
+            )
+        )
+    return tools
+
+
 def _validate_auth_identity(data: Mapping[str, Any]) -> None:
     raw = data.get("authIdentity")
     if not isinstance(raw, dict):
@@ -440,7 +558,7 @@ def _validate_auth_identity(data: Mapping[str, Any]) -> None:
         raise HTTPException(status_code=400, detail="authIdentity.subject or authIdentity.username is required")
 
 
-def _request_to_run_request(data: dict[str, Any], *, turn_id: str, spec: AgentSpec) -> RunRequest:
+def _request_to_run_request(data: dict[str, Any], *, turn_id: str, spec: AgentSpec, allow_brokered: bool = False) -> RunRequest:
     version = data.get("version")
     if version != ORKA_HARNESS_VERSION:
         raise HTTPException(status_code=400, detail=f"version must be {ORKA_HARNESS_VERSION!r}")
@@ -452,7 +570,10 @@ def _request_to_run_request(data: dict[str, Any], *, turn_id: str, spec: AgentSp
     deadline = _parse_deadline(data.get("deadline"))
     _validate_auth_identity(data)
     tool_mode = _clean(data.get("toolExecutionMode"))
-    if tool_mode not in (None, "", TOOL_MODE_OBSERVED):
+    allowed_modes = {None, "", TOOL_MODE_OBSERVED}
+    if allow_brokered:
+        allowed_modes.add(TOOL_MODE_BROKERED)
+    if tool_mode not in allowed_modes:
         raise HTTPException(status_code=400, detail=f"unsupported toolExecutionMode {tool_mode!r}")
     if data.get("eventCursor", 0) not in (None, ""):
         event_cursor = data.get("eventCursor", 0)
@@ -515,8 +636,8 @@ def health_response(spec: AgentSpec) -> dict[str, Any]:
     }
 
 
-def capabilities_response(spec: AgentSpec) -> dict[str, Any]:
-    return {
+def capabilities_response(spec: AgentSpec, *, brokered_classes: set[str] | None = None) -> dict[str, Any]:
+    response = {
         "version": ORKA_HARNESS_VERSION,
         "protocolVersion": ORKA_HARNESS_VERSION,
         "transport": HTTP_TRANSPORT,
@@ -535,6 +656,16 @@ def capabilities_response(spec: AgentSpec) -> dict[str, Any]:
             "agentkitProvider": spec.model.provider,
         },
     }
+    brokered_classes = brokered_classes or set()
+    if brokered_classes:
+        response["toolExecutionModes"] = [TOOL_MODE_OBSERVED, TOOL_MODE_BROKERED]
+        response["brokeredToolClasses"] = [
+            klass
+            for klass in (BROKERED_CLASS_READ, BROKERED_CLASS_WRITE, BROKERED_CLASS_COORDINATION)
+            if klass in brokered_classes
+        ]
+        response["supportsContinuation"] = True
+    return response
 
 
 def start_turn_response(turn: TurnState) -> dict[str, Any]:
@@ -559,6 +690,71 @@ def cancel_turn_response(turn: TurnState, request_data: Mapping[str, Any]) -> di
     }
 
 
+def continue_turn_response(turn: TurnState) -> dict[str, Any]:
+    return {
+        "version": ORKA_HARNESS_VERSION,
+        "accepted": True,
+        "runtimeSessionID": turn.runtime_session_id,
+        "turnID": turn.turn_id,
+        "correlationID": turn.correlation_id,
+        "message": "continue accepted",
+    }
+
+
+class OrkaToolBroker:
+    def __init__(self, state: TurnState, tools: list[BrokeredToolDefinition]) -> None:
+        self.state = state
+        self.tools = {tool.name: tool for tool in tools}
+
+    async def request_tool(self, call: BrokeredToolCall) -> BrokeredToolResult:
+        if not call.tool_call_id.strip():
+            raise AgentRunError("brokered tool call id is required", status=400, code="InvalidToolCallID")
+        if call.tool_call_id != call.tool_call_id.strip():
+            raise AgentRunError("brokered tool call id must not contain leading or trailing whitespace", status=400, code="InvalidToolCallID")
+        tool = self.tools.get(call.name)
+        if tool is None:
+            raise AgentRunError(f"unknown brokered tool {call.name!r}", status=400, code="UnknownBrokeredTool")
+        if tool.brokered_class != call.brokered_class:
+            raise AgentRunError(f"brokered class mismatch for tool {call.name!r}", status=400, code="BrokeredClassMismatch")
+        if not isinstance(call.arguments, Mapping):
+            raise AgentRunError("brokered tool arguments must be an object", status=400, code="InvalidToolArguments")
+        try:
+            encoded_arguments = json.dumps(dict(call.arguments), separators=(",", ":"), sort_keys=True)
+        except (TypeError, ValueError) as exc:
+            raise AgentRunError("brokered tool arguments must be JSON serializable", status=400, code="InvalidToolArguments") from exc
+        arguments = json.loads(encoded_arguments)
+        async with self.state.condition:
+            if self.state.terminal_event is not None:
+                raise AgentRunError("turn is already terminal", status=409, code="TurnTerminal")
+            if call.tool_call_id in self.state.pending_tools:
+                raise AgentRunError(f"duplicate brokered tool call id {call.tool_call_id!r}", status=400, code="DuplicateToolCallID")
+            future: asyncio.Future[BrokeredToolResult] = asyncio.get_running_loop().create_future()
+            self.state.pending_tools[call.tool_call_id] = PendingBrokeredTool(call=call, future=future)
+        await self.state.append(
+            "ToolCallRequested",
+            summary="brokered tool requested",
+            content=arguments,
+            tool_name=call.name,
+            tool_call_id=call.tool_call_id,
+        )
+        if self.state.deadline is None:
+            result = await future
+        else:
+            seconds = (self.state.deadline - datetime.now(UTC)).total_seconds()
+            if seconds <= 0:
+                raise TimeoutError("turn deadline exceeded while waiting for brokered tool result")
+            async with asyncio.timeout(seconds):
+                result = await future
+        await self.state.append(
+            "ToolResultReceived",
+            summary="tool result received",
+            content=dict(result.output or {}),
+            error=dict(result.error) if result.error is not None else None,
+            tool_name=call.name,
+            tool_call_id=call.tool_call_id,
+        )
+        return result
+
 
 async def _run_turn(
     get_runtime: Callable[[RunRequest], Awaitable[Any]],
@@ -568,10 +764,15 @@ async def _run_turn(
     run_request: RunRequest,
     *,
     max_terminal_turns: int,
+    brokered_tools: list[BrokeredToolDefinition] | None = None,
 ) -> None:
     async def _run_with_runtime() -> RunResult:
         runtime = await get_runtime(run_request)
         with _scoped_process_env(run_request.env):
+            if brokered_tools is not None:
+                if not isinstance(runtime, BrokeredRuntimeSession):
+                    raise AgentRunError("runtime does not support brokered Orka tools", status=400, code="BrokeredUnsupported")
+                return await runtime.run_brokered(run_request, brokered_tools, OrkaToolBroker(state, brokered_tools))
             return await runtime.run(run_request)
 
     try:
@@ -657,12 +858,25 @@ def create_orka_app(
     *,
     max_terminal_turns: int | None = None,
     max_runtime_sessions: int | None = None,
+    enable_brokered_read: bool | None = None,
+    enable_brokered_write: bool | None = None,
+    enable_brokered_coordination: bool | None = None,
 ) -> FastAPI:
-    """Create an observed-mode Orka harness app for one AgentKit runtime."""
+    """Create an Orka harness app for one AgentKit runtime."""
     if not auth_token:
         raise ValueError("Orka mode requires a bearer auth token")
     retention_limit = _max_terminal_turns(max_terminal_turns)
     runtime_session_limit = _max_runtime_sessions(max_runtime_sessions)
+    brokered_classes: set[str] = set()
+    if _brokered_read_enabled(enable_brokered_read):
+        brokered_classes.add(BROKERED_CLASS_READ)
+    if _brokered_write_enabled(enable_brokered_write):
+        brokered_classes.add(BROKERED_CLASS_WRITE)
+    if _brokered_coordination_enabled(enable_brokered_coordination):
+        brokered_classes.add(BROKERED_CLASS_COORDINATION)
+    for brokered_class in brokered_classes:
+        if not _factory_supports_brokered_class(factory, brokered_class):
+            raise ValueError(f"Orka brokered {brokered_class} requires a runtime factory that supports brokered tools")
     turns: dict[str, TurnState] = {}
     terminal_order: list[str] = []
     active_runtimes: dict[str, ActiveRuntime] = {}
@@ -726,7 +940,7 @@ def create_orka_app(
 
     @app.get("/v1/capabilities")
     async def capabilities() -> dict[str, Any]:
-        return capabilities_response(spec)
+        return capabilities_response(spec, brokered_classes=brokered_classes)
 
     @app.post("/v1/turns", dependencies=[auth], status_code=202)
     async def create_turn(request: Request):
@@ -743,13 +957,24 @@ def create_orka_app(
         if any(state.terminal_event is None for state in turns.values()):
             raise HTTPException(status_code=429, detail="maxConcurrentTurns limit reached")
 
-        run_request = _request_to_run_request(data, turn_id=turn_id, spec=spec)
+        tool_mode = _clean(data.get("toolExecutionMode")) or TOOL_MODE_OBSERVED
+        run_request = _request_to_run_request(data, turn_id=turn_id, spec=spec, allow_brokered=bool(brokered_classes))
+        brokered_tools: list[BrokeredToolDefinition] | None = None
+        if tool_mode == TOOL_MODE_BROKERED:
+            input_value = data.get("input")
+            if not isinstance(input_value, dict):
+                raise HTTPException(status_code=400, detail="input must be an object")
+            brokered_tools = _brokered_tools_from_input(input_value, allowed_brokered_classes=brokered_classes)
         runtime_session_id = run_request.session_id or ""
         correlation_id = run_request.correlation_id or ""
         state = TurnState(
             runtime_session_id=runtime_session_id,
             turn_id=turn_id,
             correlation_id=correlation_id,
+            namespace=_required_string(data, "namespace"),
+            task_name=_required_string(data, "taskName"),
+            session_name=_required_string(data, "sessionName"),
+            deadline=run_request.deadline,
             metadata=run_request.metadata,
         )
         turns[turn_id] = state
@@ -762,6 +987,7 @@ def create_orka_app(
                 state,
                 run_request,
                 max_terminal_turns=retention_limit,
+                brokered_tools=brokered_tools,
             )
         )
         state.task.add_done_callback(
@@ -803,6 +1029,107 @@ def create_orka_app(
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
+
+    @app.post("/v1/turns/{turn_id}/continue", dependencies=[auth], status_code=202)
+    async def continue_turn(turn_id: str, request: Request):
+        if not brokered_classes:
+            raise HTTPException(status_code=404, detail="brokered continuation is not enabled")
+        try:
+            data = await request.json()
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail="Request body must be JSON") from exc
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+        if data.get("version") != ORKA_HARNESS_VERSION:
+            raise HTTPException(status_code=400, detail=f"version must be {ORKA_HARNESS_VERSION!r}")
+        body_turn_id = _turn_id_from_payload(data)
+        if body_turn_id != turn_id:
+            raise HTTPException(status_code=400, detail="continue turnID must match route turnID")
+        runtime_session_id = _required_string(data, "runtimeSessionID")
+        correlation_id = _required_string(data, "correlationID")
+        namespace = _required_string(data, "namespace")
+        task_name = _required_string(data, "taskName")
+        session_name = _required_string(data, "sessionName")
+        state = turns.get(turn_id)
+        if state is None:
+            raise HTTPException(status_code=404, detail="turn not found")
+        if runtime_session_id != state.runtime_session_id:
+            raise HTTPException(status_code=400, detail="continue runtimeSessionID must match turn runtimeSessionID")
+        if correlation_id != state.correlation_id:
+            raise HTTPException(status_code=400, detail="continue correlationID must match turn correlationID")
+        if namespace != state.namespace or task_name != state.task_name or session_name != state.session_name:
+            raise HTTPException(status_code=400, detail="continue namespace/taskName/sessionName must match turn")
+        raw_results = data.get("toolResults")
+        if not isinstance(raw_results, list) or not raw_results:
+            raise HTTPException(status_code=400, detail="toolResults must be a non-empty array")
+        results: list[BrokeredToolResult] = []
+        for idx, raw_result in enumerate(raw_results):
+            if not isinstance(raw_result, dict):
+                raise HTTPException(status_code=400, detail=f"toolResults[{idx}] must be an object")
+            if raw_result.get("version") != ORKA_HARNESS_VERSION:
+                raise HTTPException(status_code=400, detail=f"toolResults[{idx}].version must be {ORKA_HARNESS_VERSION!r}")
+            result_runtime_session_id = _required_string(raw_result, "runtimeSessionID")
+            result_turn_id = _required_string(raw_result, "turnID")
+            tool_call_id = _required_string(raw_result, "toolCallID")
+            idempotency_key = _required_string(raw_result, "idempotencyKey")
+            expected_idempotency_key = f"{runtime_session_id}:{turn_id}:{tool_call_id}"
+            if result_runtime_session_id != runtime_session_id or result_turn_id != turn_id:
+                raise HTTPException(status_code=400, detail=f"toolResults[{idx}] identity must match continue request")
+            if idempotency_key != expected_idempotency_key:
+                raise HTTPException(status_code=400, detail=f"toolResults[{idx}].idempotencyKey does not match tool call")
+            approved = raw_result.get("approved", False)
+            if not isinstance(approved, bool):
+                raise HTTPException(status_code=400, detail=f"toolResults[{idx}].approved must be a boolean")
+            output_value = raw_result.get("output")
+            error_value = raw_result.get("error")
+            if not approved and output_value is not None:
+                raise HTTPException(status_code=400, detail=f"toolResults[{idx}].output is not allowed when approved is false")
+            if output_value is None and error_value is None:
+                if approved:
+                    raise HTTPException(status_code=400, detail=f"toolResults[{idx}] output or error is required")
+                error_value = {"code": "ToolCallDenied", "message": "tool call was not approved", "retryable": False}
+            if output_value is not None and not isinstance(output_value, dict):
+                raise HTTPException(status_code=400, detail=f"toolResults[{idx}].output must be an object")
+            if error_value is not None and not isinstance(error_value, dict):
+                raise HTTPException(status_code=400, detail=f"toolResults[{idx}].error must be an object")
+            results.append(
+                BrokeredToolResult(
+                    tool_call_id=tool_call_id,
+                    approved=approved,
+                    output=dict(output_value) if output_value is not None else None,
+                    error=dict(error_value) if error_value is not None else None,
+                )
+            )
+        async with state.condition:
+            if state.terminal_event is not None:
+                known_done = all(
+                    result.tool_call_id in state.pending_tools
+                    and state.pending_tools[result.tool_call_id].accepted_result == result
+                    for result in results
+                )
+                if known_done:
+                    return continue_turn_response(state)
+                raise HTTPException(status_code=409, detail="turn is already terminal")
+            seen_results: set[str] = set()
+            pending_results: list[tuple[PendingBrokeredTool, BrokeredToolResult]] = []
+            for result in results:
+                if result.tool_call_id in seen_results:
+                    raise HTTPException(status_code=400, detail=f"duplicate toolCallID {result.tool_call_id!r}")
+                seen_results.add(result.tool_call_id)
+                pending = state.pending_tools.get(result.tool_call_id)
+                if pending is None:
+                    raise HTTPException(status_code=400, detail=f"unknown toolCallID {result.tool_call_id!r}")
+                if pending.accepted_result is not None and pending.accepted_result != result:
+                    raise HTTPException(status_code=409, detail=f"conflicting tool result for toolCallID {result.tool_call_id!r}")
+                pending_results.append((pending, result))
+            for pending, result in pending_results:
+                if pending.accepted_result is None:
+                    pending.accepted_result = result
+                if not pending.future.done():
+                    pending.future.set_result(result)
+            state.condition.notify_all()
+        return continue_turn_response(state)
+
 
     @app.post("/v1/turns/{turn_id}/cancel", dependencies=[auth], status_code=202)
     async def cancel_turn(turn_id: str, request: Request):

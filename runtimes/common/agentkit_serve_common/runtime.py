@@ -10,12 +10,34 @@ imported, which is what keeps the lock-in boundary (plan §12) per-adapter.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from types import TracebackType
-from typing import Protocol, runtime_checkable
+from typing import Any, Literal, Mapping, Protocol, Sequence, runtime_checkable
 
 from .config import AgentSpec
 from .conversation import RunRequest
+
+OFFLINE_ORKA_ECHO_ENV = "AGENTKIT_ORKA_OFFLINE_ECHO"
+OFFLINE_ORKA_DELEGATE_AGENT_ENV = "AGENTKIT_ORKA_OFFLINE_DELEGATE_AGENT"
+
+
+def offline_orka_echo_enabled() -> bool:
+    """Whether adapter factories should use the no-provider Orka echo runtime."""
+
+    return os.environ.get("AGENTKIT_PROTOCOL", "").strip().lower() == "orka" and (
+        os.environ.get(OFFLINE_ORKA_ECHO_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+    )
+
+
+def _offline_wait_task_name(prompt: str) -> str:
+    marker = "wait_for_tasks:"
+    if marker not in prompt:
+        return ""
+    parts = prompt.split(marker, 1)[1].strip().split()
+    if not parts:
+        return ""
+    return parts[0].strip("`'\"")
 
 
 class AgentRunError(Exception):
@@ -43,6 +65,49 @@ class RunResult:
     usage: dict[str, int] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class BrokeredToolDefinition:
+    """Safe tool schema a brokered runtime may request through Orka.
+
+    This is intentionally schema-only: execution URLs, auth headers, Kubernetes
+    Secret refs, bearer tokens, TxTokens, and other credential-bearing fields must
+    never cross this Interface. Orka remains the broker and policy authority.
+    """
+
+    name: str
+    description: str
+    brokered_class: Literal["read", "write", "coordination"]
+    parameters: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class BrokeredToolCall:
+    """One framework-neutral request to execute an Orka-brokered tool."""
+
+    tool_call_id: str
+    name: str
+    arguments: Mapping[str, Any]
+    brokered_class: Literal["read", "write", "coordination"]
+
+
+@dataclass(frozen=True)
+class BrokeredToolResult:
+    """Result returned by Orka after policy, approval, and tool execution."""
+
+    tool_call_id: str
+    approved: bool
+    output: Mapping[str, Any] | None = None
+    error: Mapping[str, Any] | None = None
+
+
+@runtime_checkable
+class ToolBroker(Protocol):
+    """Callback owned by the Orka HTTP skin for brokered tool execution."""
+
+    async def request_tool(self, call: BrokeredToolCall) -> BrokeredToolResult:
+        ...
+
+
 @runtime_checkable
 class RuntimeSession(Protocol):
     """A live runtime Adapter session owned by the adapter implementation.
@@ -65,6 +130,149 @@ class RuntimeSession(Protocol):
 
     async def run(self, request: RunRequest) -> RunResult:
         ...
+
+
+@runtime_checkable
+class BrokeredRuntimeSession(RuntimeSession, Protocol):
+    """Optional runtime capability for Orka-governed brokered tools.
+
+    Framework adapters must implement this before AgentKit advertises brokered
+    Orka support. Direct AgentKit-owned tools should be disabled or clearly
+    separated while a brokered run is active so Orka governance cannot be bypassed.
+    """
+
+    async def run_brokered(
+        self,
+        request: RunRequest,
+        tools: Sequence[BrokeredToolDefinition],
+        broker: ToolBroker,
+    ) -> RunResult:
+        ...
+
+
+class OfflineEchoRuntime:
+    """No-provider runtime used only for Orka conformance and offline demos."""
+
+    async def __aenter__(self) -> RuntimeSession:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool | None:
+        return None
+
+    async def run(self, request: RunRequest) -> RunResult:
+        return RunResult(
+            text=f"offline echo: {request.prompt}",
+            usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        )
+
+    async def run_brokered(
+        self,
+        request: RunRequest,
+        tools: Sequence[BrokeredToolDefinition],
+        broker: ToolBroker,
+    ) -> RunResult:
+        if not tools:
+            raise AgentRunError("brokered run requires at least one Orka tool schema", status=400, code="NoBrokeredTools")
+        by_name = {tool.name: tool for tool in tools}
+        coordination_tool_names = {name for name, tool in by_name.items() if tool.brokered_class == "coordination"}
+        if {"delegate_task", "wait_for_tasks"}.issubset(coordination_tool_names):
+            return await self._run_offline_coordinator(request, by_name, broker)
+        if "delegate_task" in coordination_tool_names:
+            delegate_result = await self._request_offline_delegate(request, by_name["delegate_task"], broker)
+            if delegate_result.error is not None:
+                return RunResult(text=f"offline coordinator delegate error: {delegate_result.error}")
+            return RunResult(text=f"offline coordinator delegate result: {delegate_result.output}")
+        if "wait_for_tasks" in coordination_tool_names:
+            task_name = _offline_wait_task_name(request.prompt)
+            if task_name:
+                wait_result = await broker.request_tool(
+                    BrokeredToolCall(
+                        tool_call_id="wait-call-1",
+                        name="wait_for_tasks",
+                        arguments={"tasks": [task_name], "timeout": "30s"},
+                        brokered_class=by_name["wait_for_tasks"].brokered_class,
+                    )
+                )
+                if wait_result.error is not None:
+                    return RunResult(text=f"offline coordinator wait error: {wait_result.error}")
+                return RunResult(text=f"offline coordinator waited for {task_name}; wait result: {wait_result.output}")
+        tool = tools[0]
+        result = await broker.request_tool(
+            BrokeredToolCall(
+                tool_call_id="tool-call-1",
+                name=tool.name,
+                arguments={"prompt": request.prompt},
+                brokered_class=tool.brokered_class,
+            )
+        )
+        if result.error is not None:
+            return RunResult(text=f"offline brokered echo tool error: {result.error}")
+        return RunResult(text=f"offline brokered echo: approved={result.approved}; output={result.output}")
+
+    async def _request_offline_delegate(
+        self,
+        request: RunRequest,
+        delegate_tool: BrokeredToolDefinition,
+        broker: ToolBroker,
+    ) -> BrokeredToolResult:
+        delegate_agent = os.environ.get(OFFLINE_ORKA_DELEGATE_AGENT_ENV, "fibey-agentkit-worker").strip() or "fibey-agentkit-worker"
+        return await broker.request_tool(
+            BrokeredToolCall(
+                tool_call_id="delegate-call-1",
+                name="delegate_task",
+                arguments={"agent": delegate_agent, "prompt": f"Offline child proof for: {request.prompt}"},
+                brokered_class=delegate_tool.brokered_class,
+            )
+        )
+
+    async def _run_offline_coordinator(
+        self,
+        request: RunRequest,
+        tools_by_name: Mapping[str, BrokeredToolDefinition],
+        broker: ToolBroker,
+    ) -> RunResult:
+        delegate_result = await self._request_offline_delegate(request, tools_by_name["delegate_task"], broker)
+        if delegate_result.error is not None:
+            return RunResult(text=f"offline coordinator delegate error: {delegate_result.error}")
+        task_name = ""
+        if delegate_result.output:
+            task_name = str(delegate_result.output.get("taskName") or delegate_result.output.get("task_name") or "")
+        if not task_name:
+            raise AgentRunError("delegate_task result did not include taskName", status=502, code="DelegateResultMissingTaskName")
+
+        wait_tool = tools_by_name["wait_for_tasks"]
+        wait_result = await broker.request_tool(
+            BrokeredToolCall(
+                tool_call_id="wait-call-1",
+                name="wait_for_tasks",
+                arguments={"tasks": [task_name], "timeout": "2m"},
+                brokered_class=wait_tool.brokered_class,
+            )
+        )
+        if wait_result.error is not None:
+            return RunResult(text=f"offline coordinator wait error: {wait_result.error}")
+        return RunResult(text=f"offline coordinator delegated {task_name}; wait result: {wait_result.output}")
+
+
+class OfflineEchoRuntimeFactory:
+    """RuntimeFactory that never imports or calls a model/framework provider."""
+
+    def supports_brokered_read(self) -> bool:
+        return True
+
+    def supports_brokered_write(self) -> bool:
+        return True
+
+    def supports_brokered_coordination(self) -> bool:
+        return True
+
+    def build_runtime(self, spec: AgentSpec) -> RuntimeSession:  # noqa: ARG002 - offline runtime is spec-independent.
+        return OfflineEchoRuntime()
 
 
 @runtime_checkable

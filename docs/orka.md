@@ -21,16 +21,66 @@ Bearer-authenticated endpoints:
 
 - `POST /v1/turns`
 - `GET /v1/turns/{turnID}/events?afterSeq=...`
+- `POST /v1/turns/{turnID}/continue` (brokered gates only)
 - `POST /v1/turns/{turnID}/cancel`
 - `GET /v1/turns/{turnID}/output?ref=...` (reserved; returns 404 unless a future
   adapter stores large outputs by reference)
 
-AgentKit maps one Orka turn to one `RuntimeSession.run(RunRequest)` call. It
+In observed mode, AgentKit maps one Orka turn to one `RuntimeSession.run(RunRequest)` call. It
 emits Orka-native `HarnessEventFrame` SSE frames and exactly one terminal frame
 (`TurnCompleted`, `TurnFailed`, or `TurnCancelled`). AgentKit-owned tools and MCP
 servers continue to execute inside the runtime; Orka observes the run and remains
 responsible for policy, approvals, trust tiers, Tool CRDs, idempotency, and
 side-effect governance.
+
+Current AgentKit Serve Orka support is **observed mode by default**. The default
+capability response intentionally omits `brokeredToolClasses` and
+`supportsContinuation`. Brokered read, write, and coordination are implemented
+behind `AGENTKIT_ORKA_ENABLE_BROKERED_READ=1`,
+`AGENTKIT_ORKA_ENABLE_BROKERED_WRITE=1`, and
+`AGENTKIT_ORKA_ENABLE_BROKERED_COORDINATION=1` conformance gates for runtimes that
+implement the internal brokered-tool Interface.
+
+This repository's `agentkit-serve` implementation is separate from OpenAI's
+public AgentKit/Agents SDK product surface. A future adapter may target that
+product explicitly, but this Orka mode documents only the local AgentKit Serve
+runtime described in this repo.
+
+## Offline Orka conformance/demo mode
+
+Set `AGENTKIT_ORKA_OFFLINE_ECHO=1` only for conformance tests or local demos
+that must not call a model provider. In Orka mode this replaces the adapter's
+framework runtime with a no-provider echo runtime while preserving the same
+`orka.harness.v1` HTTP skin, auth behavior, event stream, cancellation, and
+capability response. This is useful for kind demos that need
+`AgentRuntime` readiness to pass without live model credentials; do not use it
+for production agent deployments.
+
+AgentKit still enforces its per-turn environment allowlist in Orka mode. When an
+AgentKit image is used behind Orka `Agent.spec.runtime.runtimeRef`, declare any
+Orka-injected env names that the controller may send in the AgentKitfile ABI. For
+the offline/kind demos this typically includes:
+
+```yaml
+env:
+  - name: ORKA_CONTROLLER_URL
+  - name: ORKA_RESULT_ENDPOINT
+  - name: ORKA_PARENT_TASK
+  - name: ORKA_PRIOR_TASK
+  - name: ORKA_PRIOR_TASK_NAMESPACE
+  - name: ORKA_COORDINATION_DEPTH
+```
+
+For brokered read/write/coordination conformance, also set the matching
+`AGENTKIT_ORKA_ENABLE_BROKERED_*` gate. Those gated modes advertise
+`toolExecutionModes: [observed, brokered]`, the enabled `brokeredToolClasses`,
+and `supportsContinuation: true`, emit `ToolCallRequested`, accept
+`/v1/turns/{turnID}/continue`, emit `ToolResultReceived`, and then complete the
+turn. Coordination tool policy, quotas, child-task lineage, and agent/namespace
+rules remain Orka-owned; AgentKit receives only safe brokered tool schemas and
+results. The offline demo coordinator can target a worker Agent with
+`AGENTKIT_ORKA_OFFLINE_DELEGATE_AGENT`; production adapters should enable
+brokered gates only after their native tool pause/resume path passes conformance.
 
 ## Orka wire contract
 

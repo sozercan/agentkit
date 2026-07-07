@@ -341,3 +341,24 @@ def test_langgraph_rejects_context_providers():
 
     with pytest.raises(agent_factory.AgentBuildError, match="context providers"):
         agent_factory.build_runtime(spec)
+
+
+def test_langgraph_orka_offline_echo_bypasses_provider_runtime(monkeypatch):
+    from agentkit_serve_common.config import AgentSpec
+
+    spec = AgentSpec.model_validate(
+        {
+            "abiVersion": "v0",
+            "metadata": {"name": "x"},
+            "model": {"provider": "openai-compatible", "baseURL": "https://api.openai.com/v1", "name": "gpt-4o-mini"},
+            "instructions": "hi",
+            "tools": [],
+            "expose": {"openai": True, "port": 8080},
+        }
+    )
+    monkeypatch.setenv("AGENTKIT_PROTOCOL", "orka")
+    monkeypatch.setenv("AGENTKIT_ORKA_OFFLINE_ECHO", "1")
+
+    runtime = agent_factory.build_runtime(spec)
+
+    assert runtime.__class__.__name__ == "OfflineEchoRuntime"
