@@ -709,6 +709,8 @@ class OrkaToolBroker:
     async def request_tool(self, call: BrokeredToolCall) -> BrokeredToolResult:
         if not call.tool_call_id.strip():
             raise AgentRunError("brokered tool call id is required", status=400, code="InvalidToolCallID")
+        if call.tool_call_id != call.tool_call_id.strip():
+            raise AgentRunError("brokered tool call id must not contain leading or trailing whitespace", status=400, code="InvalidToolCallID")
         tool = self.tools.get(call.name)
         if tool is None:
             raise AgentRunError(f"unknown brokered tool {call.name!r}", status=400, code="UnknownBrokeredTool")

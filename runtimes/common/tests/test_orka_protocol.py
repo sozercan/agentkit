@@ -1076,6 +1076,25 @@ def test_orka_brokered_non_json_arguments_fail_safely():
     assert frames[-1]["failed"]["reason"] == "InvalidToolArguments"
 
 
+def test_orka_brokered_padded_tool_call_id_fails_immediately():
+    app = create_orka_app(
+        _spec(),
+        BadBrokeredFactory(BrokeredToolCall(tool_call_id=" tool-call-1 ", name="conformance_read", arguments={}, brokered_class="read")),
+        "test-token",
+        enable_brokered_read=True,
+    )
+    with TestClient(app) as client:
+        turn_id = _create_turn(
+            client,
+            turnID="turn-padded-tool-call-id",
+            toolExecutionMode="brokered",
+            input=_brokered_input(),
+        )
+        frames = _frames(client.get(f"/v1/turns/{turn_id}/events", headers=AUTH).text)
+    assert [frame["type"] for frame in frames] == ["TurnStarted", "TurnFailed"]
+    assert frames[-1]["failed"]["reason"] == "InvalidToolCallID"
+
+
 def test_orka_brokered_empty_tool_call_id_fails_immediately():
     app = create_orka_app(
         _spec(),
