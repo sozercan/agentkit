@@ -15,7 +15,6 @@ from agentkit_serve_common.orka import ORKA_HARNESS_VERSION, create_orka_app
 from agentkit_serve_common.runtime import (
     BrokeredToolCall,
     BrokeredToolDefinition,
-    BrokeredToolResult,
     OfflineEchoRuntimeFactory,
     RunResult,
     RuntimeSession,
