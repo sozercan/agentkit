@@ -47,8 +47,7 @@ if [[ "$mode" == "brokered-conformance" ]]; then
         az account set --subscription "$AZURE_SUBSCRIPTION_ID" >/dev/null 2>&1 || missing=1
       fi
       if ! az account show >/dev/null 2>&1; then
-        printf 'missing auth: set AGENT_RESPONSES_BEARER_TOKEN or run az login/select an account
-' >&2
+        printf 'missing auth: set AGENT_RESPONSES_BEARER_TOKEN or run az login/select an account\n' >&2
         missing=1
       fi
     fi
