@@ -24,6 +24,11 @@ from .conversation import RunRequest
 
 DEFAULT_CONFIG_PATH = "/agent/agent.yaml"
 DEFAULT_PORT = 8088
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"}
+
+
+def _is_loopback(host: str) -> bool:
+    return host.strip().lower() in _LOOPBACK_HOSTS
 
 
 class _NoDirectRuntime:
@@ -69,6 +74,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not spec.brokered_tools:
         raise SystemExit("agentkit-foundry-brokered: agent.yaml must declare at least one brokeredTools entry")
     auth_token = os.environ.get("AGENTKIT_AUTH_TOKEN") or None
+    if not args.dry_run and not _is_loopback(args.host) and not auth_token:
+        raise SystemExit(
+            f"agentkit-foundry-brokered: refusing to bind {args.host!r} without AGENTKIT_AUTH_TOKEN; "
+            "set a bearer token or bind 127.0.0.1 for local-only use"
+        )
     app = create_foundry_app(spec, _NoDirectFactory(), auth_token=auth_token)
     if args.dry_run:
         print(

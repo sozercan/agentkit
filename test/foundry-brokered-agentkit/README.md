@@ -19,6 +19,7 @@ docker build . -f test/foundry-brokered-agentkit/Dockerfile \
   -t agentkit-foundry-brokered:local
 
 docker run --rm \
+  -e AGENTKIT_AUTH_TOKEN=local-dummy-token \
   -e AGENTKIT_FOUNDRY_BROKERED_CONTINUATION_PROOF=local-dev-proof \
   -p 127.0.0.1:18092:8088 \
   agentkit-foundry-brokered:local

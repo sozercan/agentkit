@@ -3,8 +3,6 @@ from __future__ import annotations
 import json
 
 from fastapi.testclient import TestClient
-from azure.ai.agentserver.responses._id_generator import IdGenerator
-
 from agentkit_serve_common.foundry_conformance import create_foundry_conformance_app
 
 
@@ -62,7 +60,7 @@ def test_foundry_conformance_sdk_rejects_orphan_and_unknown_continuations():
 
     with TestClient(app) as client:
         missing_previous = client.post("/responses", json=_function_output(None))
-        unknown_previous = client.post("/responses", json=_function_output(IdGenerator.new_response_id()))
+        unknown_previous = client.post("/responses", json=_function_output("caresp_0123456789abcdef00ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef"))
         initial = client.post("/responses", json={"input": "hello"}).json()
         unknown_call = client.post("/responses", json=_function_output(initial["id"], call_id="call_other"))
 

@@ -409,7 +409,7 @@ class _FoundryResponseStateStore:
         if len(self._states) <= target:
             return
         completed = sorted(
-            (entry for entry in self._states.values() if entry.status != "pending"),
+            (entry for entry in self._states.values() if entry.status == "completed" and entry.final_payload is not None),
             key=lambda entry: entry.expires_at,
         )
         changed = False

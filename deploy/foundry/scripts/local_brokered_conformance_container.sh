@@ -103,6 +103,9 @@ run_args=()
 if [[ -n "$platform" ]]; then
   run_args+=(--platform "$platform")
 fi
+if [[ "$fixture" == "agentkit" ]]; then
+  run_args+=(-e "AGENTKIT_AUTH_TOKEN=local-dummy-token")
+fi
 if [[ -n "$continuation_proof" ]]; then
   run_args+=(-e "AGENTKIT_FOUNDRY_BROKERED_CONTINUATION_PROOF=${continuation_proof}")
 fi

@@ -9,13 +9,15 @@ with Orka's function_call_output to obtain the final assistant message.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 import httpx
 
-from .adapter_support import AgentBuildError, NO_AUTH_API_KEY, resolve_api_key
+from .adapter_support import AgentBuildError, NO_AUTH_API_KEY, resolve_api_key, resolve_workload_identity_token
 from .config import AgentSpec
 from .conversation import FORWARDED_ROLES, RunRequest
 from .runtime import AgentRunError, BrokeredToolDefinition
@@ -136,13 +138,20 @@ class BrokeredChatModelLoop:
         client = self.http_client
         close_client = False
         if client is None:
+            headers: dict[str, str] = {}
             try:
-                api_key = resolve_api_key(self.spec)
+                auth = self.spec.model.auth
+                if auth is not None and auth.type == "workload-identity-token":
+                    token = os.environ.get("AGENTKIT_MODEL_WORKLOAD_IDENTITY_TOKEN")
+                    if not token:
+                        token = await asyncio.to_thread(resolve_workload_identity_token, auth.audience or "")
+                    headers["Authorization"] = f"Bearer {token}"
+                else:
+                    api_key = resolve_api_key(self.spec)
+                    if api_key != NO_AUTH_API_KEY:
+                        headers["Authorization"] = f"Bearer {api_key}"
             except AgentBuildError as exc:
                 raise AgentRunError(str(exc), status=400, code="ModelAuthMissing") from exc
-            headers = {}
-            if api_key != NO_AUTH_API_KEY:
-                headers["Authorization"] = f"Bearer {api_key}"
             client = httpx.AsyncClient(headers=headers, timeout=60)
             close_client = True
         try:
