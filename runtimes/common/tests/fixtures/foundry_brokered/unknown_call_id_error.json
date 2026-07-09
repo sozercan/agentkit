@@ -1,0 +1,6 @@
+{
+  "error": {
+    "message": "unknown function_call_output call_id",
+    "code": "unknown_call_id"
+  }
+}

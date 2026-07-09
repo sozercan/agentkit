@@ -66,6 +66,34 @@ class RunResult:
 
 
 @dataclass(frozen=True)
+class RuntimeMessageCompleted:
+    """A Responses-compatible runtime result containing final assistant text."""
+
+    text: str
+    usage: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RuntimeToolCallRequested:
+    """A Responses-compatible runtime pause requesting brokered tool execution."""
+
+    tool_call_id: str
+    name: str
+    arguments: Mapping[str, Any]
+    brokered_class: Literal["read", "write", "coordination"]
+    usage: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RuntimeFailed:
+    """A deterministic runtime failure result for hosted protocol adapters."""
+
+    message: str
+    status: int = 502
+    code: str = "RuntimeFailed"
+
+
+@dataclass(frozen=True)
 class BrokeredToolDefinition:
     """Safe tool schema a brokered runtime may request through Orka.
 
@@ -78,6 +106,7 @@ class BrokeredToolDefinition:
     description: str
     brokered_class: Literal["read", "write", "coordination"]
     parameters: Mapping[str, Any] = field(default_factory=dict)
+    schema_digest: str | None = None
 
 
 @dataclass(frozen=True)

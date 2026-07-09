@@ -60,7 +60,53 @@ as a Foundry-hosted protocol image.
   the project/account role required for workload-identity model/tool calls (defaults to `Foundry User`).
 - `scripts/invoke_responses.sh` sends the minimal portable hosted Responses
   payload (`{"input":"..."}`), avoiding gateway-specific optional fields.
+- `scripts/foundry_brokered_conformance.sh` runs the Phase A0 brokered
+  Responses function-call/continuation loop against a deployed `/responses`
+  endpoint and writes a sanitized transcript directory for review evidence.
+- `scripts/local_brokered_conformance_container.sh` builds the conformance
+  container locally, runs it, and exercises the same transcript helper before an
+  image is pushed to Foundry.
 - `doctor.sh` checks the expected Foundry/project env and local CLI prerequisites.
+  Use `doctor.sh --brokered-conformance` before running the brokered transcript
+  helper to verify `AGENT_RESPONSES_ENDPOINT` and auth prerequisites.
 
 These scripts intentionally produce local `output.env` files that should not be
 committed with live subscription or endpoint values.
+
+
+## Brokered conformance smoke
+
+
+Before pushing the image, validate the packaged container locally:
+
+```sh
+deploy/foundry/scripts/local_brokered_conformance_container.sh \
+  --platform linux/amd64 \
+  --tag agentkit-foundry-brokered-conformance:amd64-test \
+  --port 18090 \
+  --transcript-dir ./foundry-brokered-local-transcript
+```
+
+After deploying an image that serves
+`agentkit_serve_common.foundry_conformance.create_foundry_conformance_app()`, run:
+
+```sh
+export AGENT_RESPONSES_ENDPOINT="https://<hosted-agent>/responses"
+# Optional: export AZURE_SUBSCRIPTION_ID="<subscription>" to select an account.
+deploy/foundry/doctor.sh --brokered-conformance
+deploy/foundry/scripts/foundry_brokered_conformance.sh conformance_read ./foundry-brokered-transcript
+```
+
+To validate the production AgentKit brokered path locally instead of the
+standalone SDK conformance app, see `test/foundry-brokered-agentkit/`. That
+fixture uses `agentkit-foundry-brokered` and expects generated call IDs, so run
+the transcript helper with `AGENTKIT_EXPECTED_CALL_ID=auto` and
+`AGENTKIT_EXPECTED_CALL_ID_PREFIX=call_`.
+
+Alternatively set `AGENT_RESPONSES_BEARER_TOKEN` to use a pre-acquired token
+instead of invoking `az account get-access-token`. If `AZURE_SUBSCRIPTION_ID` is
+omitted, the helper uses the current `az` account. The script stores request and
+response JSON files plus `summary.json`; do not include bearer tokens in the
+transcript. Re-run
+`python3 deploy/foundry/scripts/verify_brokered_transcript.py <transcript-dir>`
+to verify archived transcript evidence later.

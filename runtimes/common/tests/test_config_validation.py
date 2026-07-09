@@ -435,3 +435,512 @@ def test_load_rejects_unsupported_otel_observability(tmp_path):
         load(_write_spec(tmp_path, spec_dict))
 
     assert "observability.otel.endpointEnv is not supported" in str(exc.value)
+
+
+def test_load_accepts_static_brokered_tools_with_matching_digest(tmp_path):
+    from agentkit_serve_common.config import brokered_tool_schema_digest
+
+    parameters = {"type": "object", "properties": {"site": {"type": "string"}}, "required": ["site"]}
+    digest = brokered_tool_schema_digest(
+        name="check-network-telemetry",
+        description="Read sanitized optical telemetry.",
+        brokered_class="read",
+        parameters=parameters,
+    )
+    spec_dict = deepcopy(_BASE_SPEC)
+    spec_dict["tools"] = []
+    spec_dict["brokeredTools"] = [
+        {
+            "name": "check-network-telemetry",
+            "description": "Read sanitized optical telemetry.",
+            "brokeredClass": "read",
+            "parameters": parameters,
+            "schemaDigest": digest,
+        }
+    ]
+
+    spec = load(_write_spec(tmp_path, spec_dict))
+
+    assert spec.brokered_tools[0].name == "check-network-telemetry"
+    assert spec.brokered_tools[0].brokered_class == "read"
+    assert spec.brokered_tools[0].schema_digest == digest
+
+
+@pytest.mark.parametrize("description", ["contains sk-secret", "execution at https://tool.default", "Bearer token required"])
+def test_load_rejects_unsafe_brokered_tool_descriptions(tmp_path, description: str):
+    msg = _invalid_message(
+        tmp_path,
+        lambda spec: spec.update(
+            tools=[],
+            brokeredTools=[
+                {
+                    "name": "safe_lookup",
+                    "description": description,
+                    "brokeredClass": "read",
+                    "parameters": {"type": "object"},
+                }
+            ],
+        ),
+    )
+    assert "brokeredTools.0.description" in msg
+    assert "secret-like" in msg or "URLs" in msg
+
+
+@pytest.mark.parametrize("field", ["url", "headers", "secretRef", "auth", "token"])
+def test_load_rejects_unsafe_brokered_tool_fields(tmp_path, field: str):
+    def mutate(spec):
+        spec["tools"] = []
+        spec["brokeredTools"] = [
+            {
+                "name": "safe_lookup",
+                "description": "safe schema",
+                "brokeredClass": "read",
+                "parameters": {"type": "object"},
+                field: "should-not-cross",
+            }
+        ]
+
+    msg = _invalid_message(tmp_path, mutate)
+    assert "brokeredTools.0" in msg
+    assert "unsafe" in msg or "Extra inputs" in msg
+
+
+@pytest.mark.parametrize("unsafe_name", ["token", "authHeader", "authorizationHeader", "httpHeaders", "accessKey", "clientSecretValue", "tokenValue", "apiSecretKey", "cookie", "subscriptionKey", "xFunctionsKey"])
+def test_load_rejects_unsafe_brokered_parameter_names(tmp_path, unsafe_name: str):
+    msg = _invalid_message(
+        tmp_path,
+        lambda spec: spec.update(
+            tools=[],
+            brokeredTools=[
+                {
+                    "name": "safe_lookup",
+                    "description": "safe schema",
+                    "brokeredClass": "read",
+                    "parameters": {"type": "object", "properties": {unsafe_name: {"type": "string"}}},
+                }
+            ],
+        ),
+    )
+    assert "brokeredTools.0.parameters" in msg
+    assert "not safe" in msg
+
+
+@pytest.mark.parametrize("value", ["see https://internal-tool", "Bearer abc", "authorization header", "Cookie: session=abc", "x-api-key: abc", "api_key=abc", "x_api_key: abc", "format password", "enter passphrase"])
+def test_load_rejects_unsafe_brokered_schema_string_values(tmp_path, value: str):
+    msg = _invalid_message(
+        tmp_path,
+        lambda spec: spec.update(
+            tools=[],
+            brokeredTools=[
+                {
+                    "name": "safe_lookup",
+                    "description": "safe schema",
+                    "brokeredClass": "read",
+                    "parameters": {"type": "object", "properties": {"site": {"type": "string", "description": value}}},
+                }
+            ],
+        ),
+    )
+    assert "brokeredTools.0.parameters" in msg
+    assert "secret-like" in msg or "URL" in msg
+
+
+def test_load_rejects_private_key_brokered_parameter_names_and_strings(tmp_path):
+    name_msg = _invalid_message(
+        tmp_path,
+        lambda spec: spec.update(
+            tools=[],
+            brokeredTools=[
+                {
+                    "name": "safe_lookup",
+                    "description": "safe schema",
+                    "brokeredClass": "read",
+                    "parameters": {"type": "object", "properties": {"privateKey": {"type": "string"}}},
+                }
+            ],
+        ),
+    )
+    text_msg = _invalid_message(
+        tmp_path,
+        lambda spec: spec.update(
+            tools=[],
+            brokeredTools=[
+                {
+                    "name": "safe_lookup",
+                    "description": "safe schema",
+                    "brokeredClass": "read",
+                    "parameters": {"type": "object", "properties": {"site": {"type": "string", "default": "BEGIN PRIVATE KEY"}}},
+                }
+            ],
+        ),
+    )
+    assert "not safe" in name_msg
+    assert "secret-like" in text_msg or "URL" in text_msg
+
+
+@pytest.mark.parametrize("field", ["authentication", "authConfig", "clientSecret", "dbPassword", "passphrase", "pwd", "apiKey", "api-key", "baseUrl", "callbackURL", "apiEndpoint", "sessionCookie", "cookies"])
+def test_load_rejects_common_credential_brokered_parameter_names(tmp_path, field: str):
+    msg = _invalid_message(
+        tmp_path,
+        lambda spec: spec.update(
+            tools=[],
+            brokeredTools=[
+                {
+                    "name": "safe_lookup",
+                    "description": "safe schema",
+                    "brokeredClass": "read",
+                    "parameters": {"type": "object", "properties": {field: {"type": "string"}}},
+                }
+            ],
+        ),
+    )
+    assert "brokeredTools.0.parameters" in msg
+    assert "not safe" in msg
+
+
+@pytest.mark.parametrize("field", ["clientSecret", "dbPassword", "apiKey", "api-key"])
+def test_load_rejects_common_credential_brokered_required_names(tmp_path, field: str):
+    msg = _invalid_message(
+        tmp_path,
+        lambda spec: spec.update(
+            tools=[],
+            brokeredTools=[
+                {
+                    "name": "safe_lookup",
+                    "description": "safe schema",
+                    "brokeredClass": "read",
+                    "parameters": {"type": "object", "required": [field]},
+                }
+            ],
+        ),
+    )
+    assert "brokeredTools.0.parameters" in msg
+    assert "not safe" in msg
+
+
+def test_load_rejects_secret_literals_inside_brokered_schema_strings(tmp_path):
+    msg = _invalid_message(
+        tmp_path,
+        lambda spec: spec.update(
+            tools=[],
+            brokeredTools=[
+                {
+                    "name": "safe_lookup",
+                    "description": "safe schema",
+                    "brokeredClass": "read",
+                    "parameters": {"type": "object", "properties": {"site": {"type": "string", "default": "sk-not-a-real-secret"}}},
+                }
+            ],
+        ),
+    )
+    assert "secret-like material" in msg
+
+
+def test_load_rejects_unsafe_text_literals_inside_brokered_schema_strings(tmp_path):
+    for unsafe_value in ["Bearer abc", "Bearer: abc", "Bearer=abc", "https://internal.example", "http://tool.default.svc.cluster.local", "tool.default.svc.cluster.local", "example ghp_not_real", "AWS key AKIAEXAMPLE"]:
+        msg = _invalid_message(
+            tmp_path,
+            lambda spec, unsafe_value=unsafe_value: spec.update(
+                tools=[],
+                brokeredTools=[
+                    {
+                        "name": "safe_lookup",
+                        "description": "safe schema",
+                        "brokeredClass": "read",
+                        "parameters": {"type": "object", "properties": {"site": {"type": "string", "default": unsafe_value}}},
+                    }
+                ],
+            ),
+        )
+        assert "URL or secret-like material" in msg
+
+
+def test_load_rejects_brokered_enum_combined_with_constraints_for_deterministic_synthesis(tmp_path):
+    msg = _invalid_message(
+        tmp_path,
+        lambda spec: spec.update(
+            tools=[],
+            brokeredTools=[
+                {
+                    "name": "safe_lookup",
+                    "description": "safe schema",
+                    "brokeredClass": "read",
+                    "parameters": {"type": "object", "properties": {"n": {"type": "integer", "minimum": 2, "enum": [1, 2]}}},
+                }
+            ],
+        ),
+    )
+    assert "enum/const/default" in msg
+
+
+def test_load_rejects_brokered_tool_names_over_model_function_limit(tmp_path):
+    msg = _invalid_message(
+        tmp_path,
+        lambda spec: spec.update(
+            tools=[],
+            brokeredTools=[
+                {
+                    "name": "a" * 65,
+                    "description": "safe schema",
+                    "brokeredClass": "read",
+                    "parameters": {"type": "object"},
+                }
+            ],
+        ),
+    )
+    assert "[A-Za-z0-9_-]{1,64}" in msg
+
+
+def test_load_rejects_unsupported_brokered_json_schema_composition_keywords(tmp_path):
+    msg = _invalid_message(
+        tmp_path,
+        lambda spec: spec.update(
+            tools=[],
+            brokeredTools=[
+                {
+                    "name": "safe_lookup",
+                    "description": "safe schema",
+                    "brokeredClass": "read",
+                    "parameters": {"type": "object", "allOf": [{"required": ["site"]}]},
+                }
+            ],
+        ),
+    )
+    assert "allOf" in msg
+
+
+def test_load_rejects_unsupported_brokered_schema_pattern(tmp_path):
+    msg = _invalid_message(
+        tmp_path,
+        lambda spec: spec.update(
+            tools=[],
+            brokeredTools=[
+                {
+                    "name": "safe_lookup",
+                    "description": "safe schema",
+                    "brokeredClass": "read",
+                    "parameters": {"type": "object", "properties": {"site": {"type": "string", "pattern": "["}}},
+                }
+            ],
+        ),
+    )
+    assert "pattern" in msg
+
+
+@pytest.mark.parametrize("bad_parameters", [
+    {"type": "object", "properties": None},
+    {"type": "object", "properties": {"site": {"type": "string", "enum": None}}},
+    {"type": "object", "properties": {"site": {"type": "string", "pattern": None}}},
+])
+def test_load_rejects_explicit_null_brokered_json_schema_keywords(tmp_path, bad_parameters: dict):
+    msg = _invalid_message(
+        tmp_path,
+        lambda spec: spec.update(
+            tools=[],
+            brokeredTools=[
+                {
+                    "name": "safe_lookup",
+                    "description": "safe schema",
+                    "brokeredClass": "read",
+                    "parameters": bad_parameters,
+                }
+            ],
+        ),
+    )
+    assert "brokeredTools.0.parameters" in msg
+
+
+@pytest.mark.parametrize("bad_child", [{"type": 123}, {"type": "strnig"}, {"items": "bad"}, {"items": [{"type": "number"}]}, {"multipleOf": 2}, {"uniqueItems": True}, {"minLength": -1}])
+def test_load_rejects_malformed_nested_brokered_json_schema(tmp_path, bad_child: dict):
+    msg = _invalid_message(
+        tmp_path,
+        lambda spec: spec.update(
+            tools=[],
+            brokeredTools=[
+                {
+                    "name": "safe_lookup",
+                    "description": "safe schema",
+                    "brokeredClass": "read",
+                    "parameters": {"type": "object", "properties": {"site": bad_child}},
+                }
+            ],
+        ),
+    )
+    assert "brokeredTools.0.parameters" in msg
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"type": "object", "properties": {"site": {"type": None}}},
+        {"type": "object", "properties": {"n": {"type": "integer", "default": "1"}}},
+        {"type": "object", "properties": {"site": {"type": "string", "enum": [0, "ok"]}}},
+    ],
+)
+def test_load_rejects_invalid_brokered_schema_type_values_and_defaults(tmp_path, schema: dict):
+    msg = _invalid_message(
+        tmp_path,
+        lambda spec: spec.update(
+            tools=[],
+            brokeredTools=[
+                {
+                    "name": "safe_lookup",
+                    "description": "safe schema",
+                    "brokeredClass": "read",
+                    "parameters": schema,
+                }
+            ],
+        ),
+    )
+    assert "brokeredTools.0.parameters" in msg
+
+
+def test_load_rejects_unknown_brokered_class_and_malformed_schema(tmp_path):
+    unknown_class = _invalid_message(
+        tmp_path,
+        lambda spec: spec.update(
+            tools=[],
+            brokeredTools=[
+                {
+                    "name": "safe_lookup",
+                    "description": "safe schema",
+                    "brokeredClass": "admin",
+                    "parameters": {"type": "object"},
+                }
+            ],
+        ),
+    )
+    bad_schema = _invalid_message(
+        tmp_path,
+        lambda spec: spec.update(
+            tools=[],
+            brokeredTools=[
+                {
+                    "name": "safe_lookup",
+                    "description": "safe schema",
+                    "brokeredClass": "read",
+                    "parameters": {"type": "array"},
+                }
+            ],
+        ),
+    )
+
+    assert "brokeredTools.0.brokeredClass" in unknown_class
+    assert "brokeredTools.0.parameters" in bad_schema
+    assert "type: object" in bad_schema
+
+
+def test_load_rejects_brokered_schema_digest_mismatch(tmp_path):
+    msg = _invalid_message(
+        tmp_path,
+        lambda spec: spec.update(
+            tools=[],
+            brokeredTools=[
+                {
+                    "name": "safe_lookup",
+                    "description": "safe schema",
+                    "brokeredClass": "read",
+                    "parameters": {"type": "object"},
+                    "schemaDigest": "sha256:" + "0" * 64,
+                }
+            ],
+        ),
+    )
+    assert "brokeredTools.0" in msg
+    assert "schemaDigest does not match" in msg
+
+
+def test_load_rejects_owned_and_brokered_tool_name_overlap(tmp_path):
+    msg = _invalid_message(
+        tmp_path,
+        lambda spec: spec.update(
+            brokeredTools=[
+                {
+                    "name": "fetch",
+                    "description": "safe schema",
+                    "brokeredClass": "read",
+                    "parameters": {"type": "object"},
+                }
+            ]
+        ),
+    )
+    assert "tools and brokeredTools cannot be mixed" in msg
+
+
+def test_brokered_tool_schema_digest_uses_utf8_canonical_json():
+    from agentkit_serve_common.config import brokered_tool_schema_digest
+
+    parameters = {
+        "type": "object",
+        "properties": {"site": {"type": "string", "description": "São & R&D <safe>"}},
+        "required": ["site"],
+    }
+
+    assert brokered_tool_schema_digest(
+        name="check-network-telemetry",
+        description="São & R&D <safe>",
+        brokered_class="read",
+        parameters=parameters,
+    ) == "sha256:7066de4e62dd1a6550701772aad901e1efcf5eb81a4f639252f82e6c7be8d4c1"
+
+
+def test_brokered_tool_schema_digest_normalizes_integer_valued_floats():
+    from agentkit_serve_common.config import brokered_tool_schema_digest
+
+    parameters = {"type": "object", "properties": {"retries": {"type": "number", "minimum": 1.0}}}
+
+    assert brokered_tool_schema_digest(
+        name="numeric-tool",
+        description="Numeric constraints.",
+        brokered_class="read",
+        parameters=parameters,
+    ) == "sha256:7ad9d43791e157981bcd65fd8452c9e71a64064875cc1330ced42d4956bf7d75"
+
+
+def test_brokered_tool_schema_digest_canonicalizes_numeric_constraints_cross_language():
+    from agentkit_serve_common.config import brokered_tool_schema_digest
+
+    parameters = {
+        "type": "object",
+        "properties": {"n": {"type": "number", "minimum": 1e-6}},
+        "required": ["n"],
+    }
+
+    assert brokered_tool_schema_digest(
+        name="num-tool",
+        description="Numeric schema",
+        brokered_class="read",
+        parameters=parameters,
+    ) == "sha256:83bf12180154a21f8ba19049687e24acee9ef430966af67a83721a10bf7eee50"
+
+
+def test_brokered_tool_schema_digest_canonicalizes_positive_exponent_numbers():
+    from agentkit_serve_common.config import brokered_tool_schema_digest
+
+    parameters = {"type": "object", "properties": {"n": {"type": "number", "maximum": 1e20}}}
+
+    assert brokered_tool_schema_digest(
+        name="large-num-tool",
+        description="Large numeric schema",
+        brokered_class="read",
+        parameters=parameters,
+    ) == "sha256:51ebe9cdbb967453ba3ae9fb737566028814968d8121ba0d32825f7c8ffb5639"
+
+
+def test_brokered_tool_schema_digest_canonicalizes_exponent_number_spellings():
+    from agentkit_serve_common.config import brokered_tool_schema_digest
+
+    parameters = {
+        "type": "object",
+        "properties": {
+            "small": {"type": "number", "minimum": 1e-7},
+            "large": {"type": "number", "maximum": 1e21},
+        },
+    }
+
+    assert brokered_tool_schema_digest(
+        name="exponent-num-tool",
+        description="Exponent numeric schema",
+        brokered_class="read",
+        parameters=parameters,
+    ) == "sha256:bb4fac58c3f65a33ed3c4ebfa10e5da9c3dc5a9250a1316f64d25e40e0e645e0"

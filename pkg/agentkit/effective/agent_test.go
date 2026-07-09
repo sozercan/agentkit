@@ -72,7 +72,7 @@ func TestFromConfigCopiesMutableFields(t *testing.T) {
 	cfg := baseConfig()
 	agent := FromConfig(cfg, "prompt")
 
-	cfg.Metadata.Labels["team"] = "mutated"
+	cfg.Metadata.Labels["team"] = mutatedValue
 	cfg.Tools[0].Command[0] = "mutated"
 	cfg.Tools[0].Env[0] = mutatedValue
 	cfg.Tools[0].Headers[0].Name = mutatedValue
@@ -96,5 +96,98 @@ func TestFromConfigCopiesMutableFields(t *testing.T) {
 	}
 	if got := agent.Env[0].Name; got != "REQUIRED_FOO" {
 		t.Fatalf("agent env was not copied: %q", got)
+	}
+}
+
+const (
+	testSiteField        = "site"
+	testSchemaTypeKey    = "type"
+	testSchemaTypeString = "string"
+)
+
+func TestFromConfigCopiesBrokeredTools(t *testing.T) {
+	cfg := baseConfig()
+	cfg.BrokeredTools = []config.BrokeredTool{{
+		Name:          "check-network-telemetry",
+		Description:   "Read telemetry.",
+		BrokeredClass: config.BrokeredClassRead,
+		Parameters: map[string]any{
+			testSchemaTypeKey: "object",
+			"properties": map[string]any{
+				testSiteField: map[string]any{testSchemaTypeKey: testSchemaTypeString},
+				"typed":       map[string]string{testSchemaTypeKey: testSchemaTypeString},
+				"generic":     map[string][]string{"enum": {"a", "b"}},
+				"tuple":       []map[string]any{{testSchemaTypeKey: testSchemaTypeString}},
+				"empty":       map[string]any{},
+			},
+			"required": []string{testSiteField},
+		},
+	}}
+
+	agent := FromConfig(cfg, "prompt")
+	cfg.BrokeredTools[0].Parameters[testSchemaTypeKey] = mutatedValue
+	mutatedProperties, ok := cfg.BrokeredTools[0].Parameters["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("brokered tool properties had unexpected type: %#v", cfg.BrokeredTools[0].Parameters["properties"])
+	}
+	mutatedSite, ok := mutatedProperties[testSiteField].(map[string]any)
+	if !ok {
+		t.Fatalf("brokered tool site property had unexpected type: %#v", mutatedProperties["site"])
+	}
+	mutatedSite[testSchemaTypeKey] = mutatedValue
+	mutatedTyped, ok := mutatedProperties["typed"].(map[string]string)
+	if !ok {
+		t.Fatalf("brokered typed property had unexpected type: %#v", mutatedProperties["typed"])
+	}
+	mutatedTyped[testSchemaTypeKey] = mutatedValue
+	mutatedRequired, ok := cfg.BrokeredTools[0].Parameters["required"].([]string)
+	if !ok {
+		t.Fatalf("brokered tool required slice had unexpected type: %#v", cfg.BrokeredTools[0].Parameters["required"])
+	}
+	mutatedRequired[0] = mutatedValue
+	mutatedGeneric, ok := mutatedProperties["generic"].(map[string][]string)
+	if !ok {
+		t.Fatalf("brokered generic property had unexpected type: %#v", mutatedProperties["generic"])
+	}
+	mutatedGeneric["enum"][0] = mutatedValue
+	mutatedTuple, ok := mutatedProperties["tuple"].([]map[string]any)
+	if !ok {
+		t.Fatalf("brokered tuple property had unexpected type: %#v", mutatedProperties["tuple"])
+	}
+	mutatedTuple[0][testSchemaTypeKey] = mutatedValue
+
+	if got := agent.BrokeredTools[0].Parameters[testSchemaTypeKey]; got != "object" {
+		t.Fatalf("brokered tool parameters were not copied: %q", got)
+	}
+	properties, ok := agent.BrokeredTools[0].Parameters["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("brokered tool properties had unexpected type: %#v", agent.BrokeredTools[0].Parameters["properties"])
+	}
+	site, ok := properties[testSiteField].(map[string]any)
+	if !ok {
+		t.Fatalf("brokered tool site property had unexpected type: %#v", properties["site"])
+	}
+	if got := site[testSchemaTypeKey]; got != "string" {
+		t.Fatalf("nested brokered tool parameters were not copied: %q", got)
+	}
+	typed, ok := properties["typed"].(map[string]string)
+	if !ok || typed[testSchemaTypeKey] != testSchemaTypeString {
+		t.Fatalf("typed brokered tool schema map was not copied: %#v", properties["typed"])
+	}
+	empty, ok := properties["empty"].(map[string]any)
+	if !ok || empty == nil || len(empty) != 0 {
+		t.Fatalf("empty brokered tool schema map was not preserved: %#v", properties["empty"])
+	}
+	generic, ok := properties["generic"].(map[string][]string)
+	if !ok || generic["enum"][0] != "a" {
+		t.Fatalf("generic typed brokered schema map was not copied: %#v", properties["generic"])
+	}
+	tuple, ok := properties["tuple"].([]map[string]any)
+	if !ok || tuple[0][testSchemaTypeKey] != testSchemaTypeString {
+		t.Fatalf("typed brokered schema slice was not copied: %#v", properties["tuple"])
+	}
+	required, ok := agent.BrokeredTools[0].Parameters["required"].([]string)
+	if !ok || len(required) != 1 || required[0] != testSiteField {
+		t.Fatalf("brokered tool required slice was not copied: %#v", agent.BrokeredTools[0].Parameters["required"])
 	}
 }

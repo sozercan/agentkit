@@ -46,10 +46,12 @@ jobs:
             deploy/foundry/search/setup.sh \
             deploy/foundry/memory/setup.sh \
             deploy/foundry/rbac/assign-agent-identity.sh \
-            deploy/foundry/scripts/invoke_responses.sh; do
+            deploy/foundry/scripts/invoke_responses.sh \
+            deploy/foundry/scripts/foundry_brokered_conformance.sh \
+            deploy/foundry/scripts/local_brokered_conformance_container.sh; do
             bash -n "$script"
           done
-          python3 -m py_compile test/foundry-hosted-agent/foundry_live.py
+          python3 -m py_compile test/foundry-hosted-agent/foundry_live.py deploy/foundry/scripts/verify_brokered_transcript.py
           python3 - <<'PY'
           from pathlib import Path
           import re

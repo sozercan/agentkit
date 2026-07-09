@@ -1,6 +1,7 @@
 package abi
 
 import (
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
@@ -16,6 +17,11 @@ import (
 const (
 	testAPIKeyEnvName = "OPENAI_API_KEY" //nolint:gosec // G101: env var NAME, not a credential
 	testInstructions  = "Be helpful and cite sources."
+)
+
+const (
+	jsonSchemaTypeKey    = "type"
+	jsonSchemaMinimumKey = "minimum"
 )
 
 func sampleConfig() *config.AgentConfig {
@@ -243,5 +249,62 @@ func TestRenderAgentYAMLIncludesModelWorkloadIdentityAuth(t *testing.T) {
 		if !strings.Contains(s, want) {
 			t.Fatalf("rendered agent.yaml missing %q\n---\n%s", want, s)
 		}
+	}
+}
+
+func TestRenderAgentYAMLIncludesBrokeredTools(t *testing.T) {
+	cfg := sampleConfig()
+	cfg.Tools = nil
+	cfg.BrokeredTools = []config.BrokeredTool{{
+		Name:          "check-network-telemetry",
+		Description:   "Read telemetry.",
+		BrokeredClass: config.BrokeredClassRead,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey: "object",
+			"properties": map[string]any{
+				"site":        map[string]any{jsonSchemaTypeKey: "string", jsonSchemaMinimumKey: 0.000001},
+				"typedFloats": map[string]float64{jsonSchemaMinimumKey: 0.000001},
+				"empty":       map[string]any{},
+			},
+		},
+	}}
+	out, err := Render(effective.FromConfig(cfg, testInstructions))
+	if err != nil {
+		t.Fatalf("render error: %v", err)
+	}
+	s := string(out)
+	for _, want := range []string{"brokeredTools:", "name: check-network-telemetry", "description: Read telemetry.", "brokeredClass: read", "properties:", "site:", "minimum: 0.000001", "typedFloats:", "empty: {}"} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("rendered agent.yaml missing %q\n---\n%s", want, s)
+		}
+	}
+	for _, never := range []string{"url:", "secretRef:", "headers:", "auth" + ":", "1e-06"} {
+		if strings.Contains(s, never) {
+			t.Fatalf("rendered brokered agent.yaml leaked %q\n---\n%s", never, s)
+		}
+	}
+}
+
+func TestRenderAgentYAMLFormatsJSONNumberBrokeredSchemaValuesAsNumbers(t *testing.T) {
+	cfg := sampleConfig()
+	cfg.Tools = nil
+	cfg.BrokeredTools = []config.BrokeredTool{{
+		Name:          "numeric-tool",
+		Description:   "Read numeric data.",
+		BrokeredClass: config.BrokeredClassRead,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey: "object",
+			"properties": map[string]any{
+				"small": map[string]any{jsonSchemaTypeKey: "number", jsonSchemaMinimumKey: json.Number("1e-7")},
+			},
+		},
+	}}
+
+	out, err := Render(effective.FromConfig(cfg, testInstructions))
+	if err != nil {
+		t.Fatalf("render error: %v", err)
+	}
+	if !strings.Contains(string(out), "minimum: 0.0000001") || strings.Contains(string(out), "1e-7") {
+		t.Fatalf("rendered agent.yaml did not preserve json.Number as fixed YAML number\n---\n%s", out)
 	}
 }

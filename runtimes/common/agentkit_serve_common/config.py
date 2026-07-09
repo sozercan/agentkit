@@ -8,11 +8,16 @@ the *baked* file: ``instructions`` is already a fully-resolved scalar string and
 
 from __future__ import annotations
 
+import hashlib
+import json
+import math
+from decimal import Decimal
 import os
 import posixpath
 import re
 import sys
 from pathlib import Path
+from typing import Any, Literal, Mapping
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -22,6 +27,7 @@ ABI_VERSION = "v0"
 _PROVIDER_OPENAI_COMPATIBLE = "openai-compatible"
 _ENV_NAME_RE = re.compile(r"^[A-Z0-9_]+$")
 _HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+\-.^_`|~]+$")
+_BROKERED_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _SECRET_VALUE_PREFIXES = ("sk-", "sk_", "ghp_", "github_pat_", "xoxb-", "AKIA")
 _TOOL_TYPE_MCP = "mcp"
 _TRANSPORT_STDIO = "stdio"
@@ -45,6 +51,38 @@ _CREDENTIAL_HEADER_NAMES = {
     "subscription-key",
     "x-functions-key",
 }
+_BROKERED_CLASSES = {"read", "write", "coordination"}
+_BROKERED_SCHEMA_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_MAX_BROKERED_SCHEMA_BYTES = 64 * 1024
+_UNSAFE_BROKERED_FIELD_NAMES = {
+    "auth",
+    "authorization",
+    "apikey",
+    "bearer",
+    "cookie",
+    "credential",
+    "credentials",
+    "endpoint",
+    "endpoints",
+    "executionendpoint",
+    "executionurl",
+    "header",
+    "headers",
+    "ocpapimsubscriptionkey",
+    "password",
+    "proxyauthorization",
+    "secret",
+    "secretref",
+    "setcookie",
+    "subscriptionkey",
+    "token",
+    "tokens",
+    "url",
+    "urls",
+    "xapikey",
+    "xfunctionskey",
+}
+
 
 
 class _Strict(BaseModel):
@@ -66,6 +104,260 @@ def _looks_like_secret_literal(value: str) -> bool:
     if not value:
         return False
     return value.startswith(_SECRET_VALUE_PREFIXES)
+
+
+def _contains_secret_prefix(value: str) -> bool:
+    return any(prefix in value for prefix in _SECRET_VALUE_PREFIXES)
+
+
+def _unsafe_brokered_text(value: str) -> bool:
+    lowered = value.lower()
+    normalized = re.sub(r"[^a-z0-9]", "", lowered)
+    return (
+        (_looks_like_secret_literal(value) or _contains_secret_prefix(value))
+        or "://" in value
+        or re.search(r"\bbearer\b", lowered) is not None
+        or re.search(r"\bbasic\b", lowered) is not None
+        or "authorization" in lowered
+        or "secret" in lowered
+        or "token" in lowered
+        or "password" in lowered
+        or "passphrase" in lowered
+        or "pwd" in lowered
+        or "api key" in lowered
+        or "apikey" in lowered
+        or "apikey" in normalized
+        or "xapikey" in normalized
+        or "subscriptionkey" in normalized
+        or "xfunctionskey" in normalized
+        or "cookie" in lowered
+        or "set-cookie" in lowered
+        or "x-api-key" in lowered
+        or "api-key" in lowered
+        or "subscription-key" in lowered
+        or "x-functions-key" in lowered
+        or "ocp-apim-subscription-key" in lowered
+        or "private key" in lowered
+        or "privatekey" in lowered
+        or "key material" in lowered
+        or ".svc" in lowered
+        or "cluster.local" in lowered
+    )
+
+
+def _canonical_number(value: int | float) -> str:
+    if isinstance(value, bool):
+        raise TypeError("boolean is not a JSON number")
+    if isinstance(value, int):
+        return str(value)
+    if not math.isfinite(value):
+        raise ValueError("JSON numbers must be finite")
+    decimal = Decimal(str(value))
+    if decimal == decimal.to_integral_value():
+        return format(decimal.to_integral_value(), "f")
+    out = format(decimal, "f")
+    if "." in out:
+        out = out.rstrip("0").rstrip(".")
+    return out
+
+
+def _canonical_json(value: Any) -> str:
+    """Return a deterministic JSON representation for digests and drift checks."""
+
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return _canonical_number(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if isinstance(value, list):
+        return "[" + ",".join(_canonical_json(item) for item in value) + "]"
+    if isinstance(value, Mapping):
+        parts: list[str] = []
+        for key in sorted(value):
+            if not isinstance(key, str):
+                raise TypeError("JSON object keys must be strings")
+            parts.append(json.dumps(key, ensure_ascii=False, separators=(",", ":")) + ":" + _canonical_json(value[key]))
+        return "{" + ",".join(parts) + "}"
+    raise TypeError(f"unsupported JSON value {type(value).__name__}")
+
+
+def brokered_tool_schema_digest(
+    *,
+    name: str,
+    description: str,
+    brokered_class: str,
+    parameters: Mapping[str, Any],
+) -> str:
+    """Digest the exact safe schema surface AgentKit exposes to a model."""
+
+    payload = {
+        "name": name,
+        "description": description,
+        "brokeredClass": brokered_class,
+        "parameters": parameters,
+    }
+    return "sha256:" + hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def _unsafe_brokered_key(value: str) -> str | None:
+    normalized = re.sub(r"[^A-Za-z0-9]", "", value).lower()
+    if normalized in _UNSAFE_BROKERED_FIELD_NAMES:
+        return value
+    auth_like = (normalized.startswith("auth") and not normalized.startswith("author")) or normalized.endswith("auth")
+    if (
+        auth_like
+        or "authorization" in normalized
+        or "header" in normalized
+        or "url" in normalized
+        or "endpoint" in normalized
+        or "cookie" in normalized
+        or "secret" in normalized
+        or "token" in normalized
+        or "password" in normalized
+        or "passphrase" in normalized
+        or "pwd" in normalized
+        or "apikey" in normalized
+        or "accesskey" in normalized
+        or "privatekey" in normalized
+        or "keymaterial" in normalized
+    ):
+        return value
+    if "credential" in normalized or "executionurl" in normalized or "executionendpoint" in normalized:
+        return value
+    return None
+
+
+def _reject_unsafe_brokered_schema_keys(value: Any, *, path: str) -> None:
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            if not isinstance(key, str):
+                raise ValueError(f"{path} keys must be strings")
+            unsafe = _unsafe_brokered_key(key)
+            if unsafe is not None:
+                raise ValueError(f"{path}.{unsafe} is not safe for brokered tool schemas")
+            if key in {"required", "dependentRequired"}:
+                _reject_unsafe_brokered_property_name_values(child, path=f"{path}.{key}")
+            _reject_unsafe_brokered_schema_keys(child, path=f"{path}.{key}")
+    elif isinstance(value, list):
+        for idx, child in enumerate(value):
+            _reject_unsafe_brokered_schema_keys(child, path=f"{path}[{idx}]")
+    elif isinstance(value, str) and _unsafe_brokered_text(value):
+        raise ValueError(f"{path} contains URL or secret-like material")
+
+
+
+_JSON_SCHEMA_TYPES = {"object", "string", "integer", "number", "boolean", "array", "null"}
+_NUMERIC_SCHEMA_KEYS = {"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"}
+_INTEGER_SCHEMA_KEYS = {"minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties"}
+
+
+def _validate_json_schema_subset(schema: Any, *, path: str) -> None:
+    if not isinstance(schema, Mapping):
+        raise ValueError(f"{path} must be a JSON Schema object")
+    for unsupported_key in (
+        "allOf",
+        "anyOf",
+        "oneOf",
+        "not",
+        "$ref",
+        "if",
+        "then",
+        "else",
+        "contains",
+        "minContains",
+        "maxContains",
+        "propertyNames",
+        "dependentSchemas",
+        "patternProperties",
+        "unevaluatedProperties",
+        "unevaluatedItems",
+        "prefixItems",
+        "uniqueItems",
+    ):
+        if unsupported_key in schema:
+            raise ValueError(f"{path}.{unsupported_key} is not supported for deterministic brokered tool schemas")
+    schema_type = schema.get("type")
+    if schema_type is not None:
+        if isinstance(schema_type, str):
+            if schema_type not in _JSON_SCHEMA_TYPES:
+                raise ValueError(f"{path}.type {schema_type!r} is not supported")
+        elif isinstance(schema_type, list) and schema_type and all(isinstance(item, str) for item in schema_type):
+            unsupported = [item for item in schema_type if item not in _JSON_SCHEMA_TYPES]
+            if unsupported:
+                raise ValueError(f"{path}.type contains unsupported value {unsupported[0]!r}")
+        else:
+            raise ValueError(f"{path}.type must be a string or string array")
+    if "properties" in schema:
+        properties = schema["properties"]
+        if not isinstance(properties, Mapping):
+            raise ValueError(f"{path}.properties must be an object")
+        for name, child in properties.items():
+            if not isinstance(name, str):
+                raise ValueError(f"{path}.properties keys must be strings")
+            _validate_json_schema_subset(child, path=f"{path}.properties.{name}")
+    if "items" in schema:
+        items = schema["items"]
+        if isinstance(items, Mapping):
+            _validate_json_schema_subset(items, path=f"{path}.items")
+        elif isinstance(items, list):
+            raise ValueError(f"{path}.items array form is not supported for brokered tool schemas")
+        else:
+            raise ValueError(f"{path}.items must be an object")
+    if "required" in schema:
+        required = schema["required"]
+        if not isinstance(required, list) or not all(isinstance(item, str) for item in required):
+            raise ValueError(f"{path}.required must be a string array")
+    if "dependentRequired" in schema:
+        dependent_required = schema["dependentRequired"]
+        if not isinstance(dependent_required, Mapping):
+            raise ValueError(f"{path}.dependentRequired must be an object")
+        for key, value in dependent_required.items():
+            if not isinstance(key, str) or not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                raise ValueError(f"{path}.dependentRequired values must be string arrays")
+    if "enum" in schema and not isinstance(schema["enum"], list):
+        raise ValueError(f"{path}.enum must be an array")
+    if "pattern" in schema:
+        raise ValueError(f"{path}.pattern is not supported for deterministic brokered tool schemas")
+    if "additionalProperties" in schema:
+        additional_properties = schema["additionalProperties"]
+        if not isinstance(additional_properties, (bool, dict)):
+            raise ValueError(f"{path}.additionalProperties must be a boolean or object")
+        if isinstance(additional_properties, dict):
+            _validate_json_schema_subset(additional_properties, path=f"{path}.additionalProperties")
+    constraint_keys = _NUMERIC_SCHEMA_KEYS | _INTEGER_SCHEMA_KEYS | {"pattern"}
+    if any(key in schema for key in ("enum", "const", "default")) and any(key in schema for key in constraint_keys):
+        raise ValueError(f"{path} combines enum/const/default with constraints unsupported by deterministic brokered synthesis")
+    if "multipleOf" in schema:
+        raise ValueError(f"{path}.multipleOf is not supported for deterministic brokered tool schemas")
+    for key in _NUMERIC_SCHEMA_KEYS:
+        if key in schema:
+            value = schema[key]
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise ValueError(f"{path}.{key} must be a number")
+    for key in _INTEGER_SCHEMA_KEYS:
+        if key in schema:
+            value = schema[key]
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{path}.{key} must be a non-negative integer")
+
+def _reject_unsafe_brokered_property_name_values(value: Any, *, path: str) -> None:
+    if isinstance(value, str):
+        unsafe = _unsafe_brokered_key(value)
+        if unsafe is not None:
+            raise ValueError(f"{path} value {unsafe!r} is not safe for brokered tool schemas")
+    elif isinstance(value, list):
+        for idx, item in enumerate(value):
+            _reject_unsafe_brokered_property_name_values(item, path=f"{path}[{idx}]")
+    elif isinstance(value, Mapping):
+        for key, child in value.items():
+            if isinstance(key, str):
+                unsafe = _unsafe_brokered_key(key)
+                if unsafe is not None:
+                    raise ValueError(f"{path}.{unsafe} is not safe for brokered tool schemas")
+            _reject_unsafe_brokered_property_name_values(child, path=f"{path}.{key}")
 
 
 class Metadata(_Strict):
@@ -309,6 +601,144 @@ class ContextSpec(_Strict):
     providers: list[ContextProviderSpec] = Field(default_factory=list)
 
 
+def _schema_types(schema: Mapping[str, Any]) -> list[str]:
+    if "type" not in schema:
+        return []
+    raw = schema.get("type")
+    if isinstance(raw, str):
+        return [raw]
+    if isinstance(raw, list) and all(isinstance(item, str) for item in raw):
+        return list(raw)
+    raise ValueError("brokered tool JSON Schema type must be a string or string array")
+
+
+def _value_matches_schema_type(value: Any, schema_type: str) -> bool:
+    if schema_type == "null":
+        return value is None
+    if schema_type == "boolean":
+        return isinstance(value, bool)
+    if schema_type == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if schema_type == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if schema_type == "string":
+        return isinstance(value, str)
+    if schema_type == "array":
+        return isinstance(value, list)
+    if schema_type == "object":
+        return isinstance(value, Mapping)
+    raise ValueError(f"unsupported brokered tool JSON Schema type {schema_type!r}")
+
+
+def _validate_schema_value_constraints(value: Any, *, path: str) -> None:
+    if not isinstance(value, Mapping):
+        return
+    types = _schema_types(value)
+    if types:
+        for keyword in ("const", "default"):
+            if keyword in value and not any(_value_matches_schema_type(value[keyword], schema_type) for schema_type in types):
+                raise ValueError(f"{path}.{keyword} must match the declared JSON Schema type")
+        enum = value.get("enum")
+        if enum is not None:
+            if not isinstance(enum, list):
+                raise ValueError(f"{path}.enum must be an array")
+            for idx, item in enumerate(enum):
+                if not any(_value_matches_schema_type(item, schema_type) for schema_type in types):
+                    raise ValueError(f"{path}.enum[{idx}] must match the declared JSON Schema type")
+    properties = value.get("properties")
+    if isinstance(properties, Mapping):
+        for name, child in properties.items():
+            if isinstance(child, Mapping):
+                _validate_schema_value_constraints(child, path=f"{path}.properties.{name}")
+    items = value.get("items")
+    if isinstance(items, Mapping):
+        _validate_schema_value_constraints(items, path=f"{path}.items")
+    elif isinstance(items, list):
+        for idx, child in enumerate(items):
+            if isinstance(child, Mapping):
+                _validate_schema_value_constraints(child, path=f"{path}.items[{idx}]")
+    additional = value.get("additionalProperties")
+    if isinstance(additional, Mapping):
+        _validate_schema_value_constraints(additional, path=f"{path}.additionalProperties")
+
+
+class BrokeredToolSpec(_Strict):
+    """Static, safe Orka-brokered tool schema exposed to hosted Foundry models."""
+
+    name: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    brokered_class: Literal["read", "write", "coordination"] = Field(alias="brokeredClass")
+    parameters: dict[str, Any]
+    schema_digest: str | None = Field(default=None, alias="schemaDigest")
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_unsafe_top_level_fields(cls, data: Any) -> Any:
+        if isinstance(data, Mapping):
+            for key in data:
+                if isinstance(key, str) and _unsafe_brokered_key(key) is not None and key not in {"schemaDigest"}:
+                    raise ValueError(f"brokered tool field {key!r} is unsafe")
+        return data
+
+    @field_validator("description")
+    @classmethod
+    def _safe_description(cls, value: str) -> str:
+        if _unsafe_brokered_text(value):
+            raise ValueError("brokered tool description must not contain URLs or secret-like material")
+        return value
+
+    @field_validator("name")
+    @classmethod
+    def _valid_name(cls, value: str) -> str:
+        if not _BROKERED_TOOL_NAME_RE.fullmatch(value):
+            raise ValueError("brokered tool name must match [A-Za-z0-9_-]{1,64}")
+        return value
+
+    @field_validator("parameters")
+    @classmethod
+    def _valid_json_schema(cls, value: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            raise ValueError("brokered tool parameters must be a JSON Schema object")
+        try:
+            encoded = _canonical_json(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("brokered tool parameters must be JSON serializable") from exc
+        if len(encoded.encode("utf-8")) > _MAX_BROKERED_SCHEMA_BYTES:
+            raise ValueError("brokered tool parameters schema is too large")
+        cloned = json.loads(encoded)
+        if cloned.get("type") != "object":
+            raise ValueError("brokered tool parameters schema must set type: object")
+        _validate_json_schema_subset(cloned, path="brokeredTools[].parameters")
+        _reject_unsafe_brokered_schema_keys(cloned, path="brokeredTools[].parameters")
+        _validate_schema_value_constraints(cloned, path="brokeredTools[].parameters")
+        return cloned
+
+    @field_validator("schema_digest")
+    @classmethod
+    def _valid_schema_digest(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        normalized = value.lower()
+        if value != normalized or not _BROKERED_SCHEMA_DIGEST_RE.fullmatch(value):
+            raise ValueError("brokered tool schemaDigest must be sha256:<64 lowercase hex>")
+        return value
+
+    @model_validator(mode="after")
+    def _schema_digest_matches(self) -> "BrokeredToolSpec":
+        if self.schema_digest is not None:
+            actual = brokered_tool_schema_digest(
+                name=self.name,
+                description=self.description,
+                brokered_class=self.brokered_class,
+                parameters=self.parameters,
+            )
+            if self.schema_digest != actual:
+                raise ValueError("brokered tool schemaDigest does not match the safe schema")
+        return self
+
+
 class ObservabilityOTelSpec(_Strict):
     endpoint_env: str | None = Field(default=None, alias="endpointEnv")
 
@@ -370,6 +800,7 @@ class AgentSpec(_Strict):
     # Fully-resolved system prompt scalar (writer resolves inline|file -> string).
     instructions: str
     tools: list[ToolSpec] = Field(default_factory=list)
+    brokered_tools: list[BrokeredToolSpec] = Field(default_factory=list, alias="brokeredTools")
     env: list[EnvVarSpec] = Field(default_factory=list)
     context: ContextSpec = Field(default_factory=ContextSpec)
     observability: ObservabilitySpec = Field(default_factory=ObservabilitySpec)
@@ -391,9 +822,30 @@ class AgentSpec(_Strict):
             raise ValueError(f"duplicate env var declarations: {names}")
         return value
 
+    @field_validator("brokered_tools")
+    @classmethod
+    def _unique_brokered_tool_names(cls, value: list[BrokeredToolSpec]) -> list[BrokeredToolSpec]:
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for entry in value:
+            if entry.name in seen:
+                duplicates.append(entry.name)
+            seen.add(entry.name)
+        if duplicates:
+            names = ", ".join(sorted(set(duplicates)))
+            raise ValueError(f"duplicate brokered tool declarations: {names}")
+        return value
+
     @model_validator(mode="after")
     def _valid_context_tool_refs(self) -> "AgentSpec":
         tools = {tool.name: tool for tool in self.tools}
+        owned_tool_names = set(tools)
+        brokered_names = {tool.name for tool in self.brokered_tools}
+        if owned_tool_names and brokered_names:
+            raise ValueError("tools and brokeredTools cannot be mixed in v0; direct AgentKit-owned tools are disabled in brokered Foundry mode")
+        overlap = owned_tool_names & brokered_names
+        if overlap:
+            raise ValueError(f"tool names cannot be both owned and brokered: {', '.join(sorted(overlap))}")
         for provider in self.context.providers:
             if provider.type == _CONTEXT_TYPE_SKILLS and provider.source == _CONTEXT_SOURCE_MCP:
                 if not provider.tool_ref:

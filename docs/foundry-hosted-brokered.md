@@ -1,0 +1,365 @@
+# Foundry hosted brokered Responses mode
+
+AgentKit can expose a Foundry hosted `/responses` surface that pauses on an
+Orka-brokered function call and resumes only after Orka returns a
+`function_call_output`. This mode is for hosted agents that must let Orka remain
+the sole policy, approval, credential, idempotency, and execution authority.
+
+## Security invariant
+
+Hosted AgentKit receives only safe brokered schemas:
+
+- tool name;
+- description;
+- brokered class: `read`, `write`, or `coordination`;
+- JSON parameters schema; and
+- optional `schemaDigest` drift metadata.
+
+Hosted AgentKit must never receive Orka Tool execution URLs, Kubernetes Secret
+refs, auth headers, bearer tokens, downstream credentials, approval-bypass
+metadata, or durable Orka control-plane credentials. Direct AgentKit-owned tools
+are not allowed in the same v0 `agent.yaml` as `brokeredTools`; mixed owned-tool
+and brokered-tool mode is intentionally deferred. `/invocations` is disabled when
+`brokeredTools` are configured so it cannot bypass Orka. The container emits a
+Responses `function_call` item and waits for Orka to execute and resume it.
+
+## Static schema configuration
+
+Foundry hosted-agent endpoint-scoped `/responses` calls do not accept dynamic
+request-level `tools` in this mode. Instead, bake safe schemas into `agent.yaml`:
+
+```yaml
+brokeredTools:
+  - name: check-network-telemetry
+    description: Read sanitized optical telemetry.
+    brokeredClass: read
+    parameters:
+      type: object
+      properties:
+        site:
+          type: string
+      required: [site]
+    schemaDigest: sha256:<optional digest generated from the safe schema>
+```
+
+The ABI loader rejects unsafe fields such as `url`, `headers`, `secretRef`,
+`auth`, and `token`, rejects unknown brokered classes, requires a top-level JSON
+Schema `type: object`, and validates `schemaDigest` when present.
+
+## Drift workflow
+
+Orka Tool CRDs remain the source of truth. Deployment tooling should export only
+the safe model-facing subset into AgentKit `brokeredTools`. The shared helper
+`agentkit_serve_common.brokered.generate_brokered_tools_from_orka_tool_crds` and
+its CLI wrapper produce deterministic entries and compute `schemaDigest`; AgentKit
+startup fails if a configured digest no longer matches the safe schema in
+`agent.yaml`. Orka still validates every live call against current Tool CRDs at
+execution time.
+
+Example export command:
+
+```sh
+agentkit-brokered-tools ./orka-tools/*.yaml -o brokered-tools.generated.yaml
+```
+
+The output is an `agent.yaml` fragment shaped as:
+
+```yaml
+brokeredTools:
+  - name: check-network-telemetry
+    description: Read telemetry.
+    brokeredClass: read
+    parameters:
+      type: object
+    schemaDigest: sha256:...
+```
+
+Use `--no-digest` only for ad-hoc demos where drift failure is not desired, and
+`--bare` when another deployment templater owns the top-level `brokeredTools` key.
+
+## Responses lifecycle
+
+Initial request:
+
+```json
+{"input":"please read telemetry"}
+```
+
+Deterministic local brokered mode requires the prompt to name exactly one
+configured tool whenever multiple tools are configured, and for any non-conformance
+single tool. Only the special `conformance_read` smoke-test schema may be selected
+without an explicit tool-name mention. If no configured tool name is present when
+explicit selection is required, the request is rejected with
+`brokered_tool_selection_required` instead of silently choosing the wrong tool. A
+real model-adapter implementation must replace this deterministic selection with
+model-driven tool choice.
+
+Brokered response:
+
+```json
+{
+  "status": "completed",
+  "output": [
+    {
+      "type": "function_call",
+      "call_id": "call_<response-id>_1",
+      "name": "conformance_read",
+      "arguments": "{\"probe\":true}",
+      "status": "completed"
+    }
+  ]
+}
+```
+
+Continuation request:
+
+```json
+{
+  "previous_response_id": "<response-id>",
+  "input": [
+    {
+      "type": "function_call_output",
+      "call_id": "call_<response-id>_1",
+      "output": "{\"approved\":true,\"output\":{\"success\":true}}",
+      "status": "completed"
+    }
+  ]
+}
+```
+
+Canonical approved payload exposed back to the model:
+
+```json
+{"approved":true,"output":{"success":true}}
+```
+
+Canonical denied/error payload:
+
+```json
+{
+  "approved": false,
+  "error": {
+    "code": "approval_declined",
+    "message": "Human declined dispatch-work-order"
+  }
+}
+```
+
+`function_call_output` is privileged continuation input. It is rejected unless a
+known `previous_response_id` has a pending matching `call_id` **and** the request
+uses the Orka-only continuation path. Configure
+`AGENTKIT_FOUNDRY_BROKERED_CONTINUATION_PROOF` and have the Orka hosted-Responses
+adapter send it as `X-AgentKit-Brokered-Continuation-Proof`; ordinary client
+requests must not be able to submit tool results. Unknown response IDs, unknown
+call IDs, orphan tool outputs, duplicate conflicts, malformed outputs, missing or
+wrong continuation auth, and multiple tool outputs all return deterministic error
+envelopes. An identical duplicate continuation from the broker path returns the
+same final response idempotently.
+
+## Response IDs and state
+
+The adapter uses the Azure hosted Responses SDK ID generator when available, so
+new response IDs use the hosted-compatible `caresp_...` form instead of the old
+hand-rolled `resp_<uuid>` form.
+
+`/readiness` fails with HTTP 503 when continuation auth is missing and reports
+`continuationAuth: missing`; the adapter also refuses to start brokered
+function-call responses until the proof is configured.
+
+By default the state backend is in-memory and suitable for deterministic local
+smoke and single-replica demos only. Set
+`AGENTKIT_FOUNDRY_RESPONSE_STATE_FILE=/path/to/state.json` to persist pending and
+completed brokered response state as an atomically rewritten JSON file; with a
+shared persistent volume and sticky/single-writer deployment this allows a known
+`previous_response_id` to survive a container restart. Deployments without a
+shared file or platform-managed store must pin one replica or use sticky routing;
+otherwise a continuation that lands on a different/restarted container fails
+safely with `unknown_previous_response_id`. Pending state expires after
+`AGENTKIT_FOUNDRY_RESPONSE_STATE_TTL_SECONDS` (default: 900 seconds); expired
+continuations fail with `response_state_expired`. The store is bounded by
+`AGENTKIT_FOUNDRY_RESPONSE_STATE_MAX_PENDING` (default: 128), and generated
+brokered arguments are bounded by `AGENTKIT_FOUNDRY_BROKERED_MAX_ARGUMENT_BYTES`
+(default: 8192) before state is accepted. A platform-managed state backend is
+still required before treating multi-replica production as fully supported.
+
+## Streaming
+
+The current route is non-streaming. If clients send `stream: true`, AgentKit
+returns the same normal JSON response rather than SSE. This keeps azd/direct curl
+smokes deterministic while making streaming support an explicit future step.
+
+## Troubleshooting
+
+- `invocations_disabled_in_brokered_mode`: call `/responses`; brokered mode disables `/invocations` to avoid direct tool bypass.
+- `tools_unsupported`: remove request-level `tools`; use static `brokeredTools`.
+- `tool_choice_unsupported`: brokered Foundry mode owns tool selection.
+- `brokered_continuation_auth_required`: set `AGENTKIT_FOUNDRY_BROKERED_CONTINUATION_PROOF` before accepting brokered continuations.
+- `brokered_continuation_forbidden`: only Orka should send `X-AgentKit-Brokered-Continuation-Proof` with the configured proof.
+- `missing_previous_response_id`: a `function_call_output` cannot start a new run.
+- `unknown_previous_response_id`: state is missing, expired/purged, or routed to a
+  different replica.
+- `response_pending_function_call_output`: finish the pending brokered tool call before sending a normal follow-up turn against that response.
+- `brokered_tool_selection_required`: name exactly one configured brokered tool in deterministic mode when multiple schemas or any non-conformance single schema are configured.
+- `brokered_response_state_full`: too many uncontinued brokered responses are pending. Completed entries are evicted before this error is returned.
+- `brokered_arguments_too_large`: generated brokered call arguments exceeded the configured pending-state byte budget.
+- `unknown_call_id`: the output did not match the pending function call.
+- `conflicting_duplicate_continuation`: the same `call_id` was already completed
+  with different output.
+
+## SDK conformance spike app
+
+`agentkit_serve_common.foundry_conformance.create_foundry_conformance_app()` is a
+small, production-independent hosted Responses app for Phase A0 smokes. It is
+also packaged as the `agentkit-foundry-conformance` console script so the same
+app can be used as a hosted container entrypoint. It uses
+`azure-ai-agentserver-responses` for request parsing, SDK-assigned `caresp_...`
+response IDs, response envelopes, event sequencing, and in-memory response state.
+It returns the deterministic `conformance_read` function call on the first
+`/responses` request and completes when resumed with the matching
+`function_call_output`.
+
+Local runnable entrypoint check:
+
+```sh
+uv run --directory runtimes/common --extra dev agentkit-foundry-conformance --dry-run
+```
+
+Container entrypoint example for the A0 spike image:
+
+```Dockerfile
+ENTRYPOINT ["agentkit-foundry-conformance", "--host", "0.0.0.0", "--port", "8088"]
+```
+
+A minimal deployable container fixture lives in `test/foundry-brokered-conformance/`:
+
+```sh
+docker buildx build --builder desktop-linux . \
+  -f test/foundry-brokered-conformance/Dockerfile \
+  --platform linux/amd64 \
+  -t agentkit-foundry-brokered-conformance:test --load --provenance=false
+```
+
+Use `test/foundry-brokered-conformance/foundry.agent.yaml.example` as the hosted
+agent manifest template; it advertises `responses` protocol version `2.0.0` for
+this A0 spike. You can also run the transcript helper against a local container
+by setting `AGENT_RESPONSES_ENDPOINT=http://127.0.0.1:18088/responses` and
+`AGENT_RESPONSES_BEARER_TOKEN=local-dummy-token`.
+
+For a one-command local pre-deploy smoke of the SDK conformance image, run:
+
+```sh
+deploy/foundry/scripts/local_brokered_conformance_container.sh \
+  --fixture sdk \
+  --platform linux/amd64 \
+  --transcript-dir ./foundry-brokered-local-transcript
+```
+
+Local proof:
+
+```sh
+uv run --directory runtimes/common --extra dev pytest -q tests/test_foundry_conformance.py
+```
+
+Live direct-endpoint proof after deployment:
+
+```sh
+export AGENT_RESPONSES_ENDPOINT="https://<hosted-agent>/responses"
+export AZURE_SUBSCRIPTION_ID="<subscription>"
+deploy/foundry/doctor.sh --brokered-conformance
+deploy/foundry/scripts/foundry_brokered_conformance.sh conformance_read ./foundry-brokered-transcript
+```
+
+The script performs the initial `function_call` request, posts the matching
+`function_call_output` continuation with `previous_response_id`, asserts SDK-style
+`caresp_...` IDs, and saves request/response JSON plus `summary.json` as a
+sanitized transcript. Re-run `python3 deploy/foundry/scripts/verify_brokered_transcript.py <transcript-dir>` to verify archived transcript evidence later. This live transcript is still required before claiming A0
+completion; the local test only proves the SDK-hosted contract before deployment.
+
+## Production brokered-only fixture
+
+`test/foundry-brokered-agentkit/` packages the production AgentKit Foundry
+brokered path, not the standalone SDK conformance app. It bakes a minimal
+`agent.yaml` with static `brokeredTools` and runs:
+
+```sh
+agentkit-foundry-brokered --config /agent/agent.yaml --host 0.0.0.0 --port 8088
+```
+
+Local proof for this production adapter path:
+
+```sh
+docker build . -f test/foundry-brokered-agentkit/Dockerfile -t agentkit-foundry-brokered:local
+docker run --rm \
+  -e AGENTKIT_FOUNDRY_BROKERED_CONTINUATION_PROOF=local-dev-proof \
+  -p 127.0.0.1:18092:8088 \
+  agentkit-foundry-brokered:local
+
+AGENT_RESPONSES_ENDPOINT=http://127.0.0.1:18092/responses \
+AGENT_RESPONSES_BEARER_TOKEN=local-dummy-token \
+AGENTKIT_CONTINUATION_PROOF=local-dev-proof \
+AGENTKIT_EXPECTED_CALL_ID=auto \
+AGENTKIT_EXPECTED_CALL_ID_PREFIX=call_ \
+deploy/foundry/scripts/foundry_brokered_conformance.sh \
+  conformance_read ./foundry-brokered-agentkit-transcript
+```
+
+Use this fixture when you want to validate AgentKit's generated `call_<response-id>_1`
+call IDs and continuation-proof enforcement before pushing a real brokered
+AgentKit image. The all-in-one local helper supports this fixture too:
+
+```sh
+deploy/foundry/scripts/local_brokered_conformance_container.sh \
+  --fixture agentkit \
+  --platform linux/amd64 \
+  --transcript-dir ./foundry-brokered-agentkit-transcript
+```
+
+## Lower-level model-loop fallback
+
+Phase A4/A5 has an opt-in fallback when a high-level framework cannot prove
+pause/resume: set `AGENTKIT_FOUNDRY_BROKERED_MODEL_LOOP=1` in Foundry brokered
+mode. AgentKit then calls the configured OpenAI-compatible chat-completions
+model directly with the static safe `brokeredTools` as function schemas. If the
+model requests exactly one configured tool, AgentKit rewrites the model's tool
+call id to a stable hosted Responses `call_<response-id>_<sequence>` id and
+returns a `function_call` output item for Orka. On the Orka-authenticated
+`function_call_output` continuation, AgentKit resumes the model with a `tool`
+message and returns the final assistant message.
+
+In this mode AgentKit-owned MCP/direct tools remain disabled; only the static
+safe brokered schemas are model-visible. The first implementation intentionally
+limits each turn to one brokered tool call and rejects unknown, multiple, or
+repeated model tool calls deterministically.
+
+## Implementation status and evidence
+
+This section records the current AgentKit-side evidence against the implementation
+plan. It is intentionally explicit about what is locally proven versus what still
+requires deployed Foundry/Orka/Fibey state.
+
+| Plan area | Current AgentKit status | Evidence | Remaining gate |
+|---|---|---|---|
+| Golden hosted Responses fixtures | Implemented locally | `runtimes/common/tests/fixtures/foundry_brokered/*`, `tests/test_foundry_brokered_protocol.py` | Orka repo must consume/verify the same wire shapes. |
+| A0 SDK hosted Responses spike | Local SDK app and container fixture implemented | `agentkit_serve_common.foundry_conformance`, `agentkit-foundry-conformance`, `test/foundry-brokered-conformance/`, `tests/test_foundry_conformance.py` | Deploy to Foundry and archive a verified live transcript with `deploy/foundry/scripts/foundry_brokered_conformance.sh`. |
+| A1 hosted Responses lifecycle/state | Implemented for deterministic/local brokered mode; file-backed state available for single-writer/sticky deployments | `agentkit_serve_common.foundry.create_foundry_app`, `tests/test_foundry_brokered_protocol.py` | Live Foundry must accept generated response IDs and state/routing constraints must be chosen for deployment. |
+| A2 static schemas and drift control | Implemented in Go writer/validator and Python runtime; export CLI added | `brokeredTools` ABI, `agentkit-brokered-tools`, `tests/test_config_validation.py`, `tests/test_brokered_schema.py`, Go config/ABI tests | Orka Tool CRDs must be exported during deployment and current digests verified before live runs. |
+| A3 deterministic brokered runtime | Implemented for local/fake hosted protocol integration | deterministic `/responses` brokered path and tests | Live Orka deterministic read/write smoke still required. |
+| A4 framework pause/resume decision | Lower-level OpenAI-compatible fallback implemented; high-level framework native hooks remain gated | `agentkit_serve_common.foundry_model_loop`, `AGENTKIT_FOUNDRY_BROKERED_MODEL_LOOP=1`, model-loop tests | Live model smoke for brokered read/write prompts. |
+| A5 first real model adapter brokered mode | Fallback model loop can emit/resume brokered calls from static safe schemas | model-loop tests in `tests/test_foundry_brokered_protocol.py` | Deployed real model read and write prompts, including declined/policy/error outcomes. |
+| A6 live Orka integration | Not proven in this repo state | Local AgentKit/Foundry side helpers exist | Deploy AgentKit and Orka hosted-Responses adapter; run brokered read/write approval smoke. |
+| A7 Fibey | Not started; gates not satisfied | N/A | Requires A3/A5/A6 live gates first, then Fibey schemas/instructions/scenario. |
+| A8 hardening/docs/review | Local docs/tests/autoreview complete for current patch | This doc, `docs/agent-abi.md`, `docs/runtime-capabilities.md`; full tests/lint; `$autoreview` clean | Record live transcript and Orka/Fibey validation evidence before final completion. |
+
+Local verification commands used for the current AgentKit patch:
+
+```sh
+uv run --directory runtimes/common --extra dev pytest -q
+go test ./...
+make lint
+git diff --check
+.agents/skills/autoreview/scripts/autoreview
+```
+
+Completion must still be judged against live evidence: this local status matrix is
+not a substitute for Foundry accepting `previous_response_id`, Orka brokering the
+actual read/write calls, or Fibey completing the end-to-end scenario.

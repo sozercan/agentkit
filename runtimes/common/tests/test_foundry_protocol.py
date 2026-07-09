@@ -76,6 +76,19 @@ def test_foundry_invocations_and_responses_protocols():
         assert body["usage"] == {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
 
 
+def test_foundry_non_brokered_ignores_brokered_state_file_env(monkeypatch, tmp_path):
+    state_file = tmp_path / "corrupt-state.json"
+    state_file.write_text("not json", encoding="utf-8")
+    monkeypatch.setenv("AGENTKIT_FOUNDRY_RESPONSE_STATE_FILE", str(state_file))
+
+    app = create_foundry_app(_spec(), EchoFactory())
+    with TestClient(app) as client:
+        resp = client.post("/responses", json={"input": "hi"})
+
+    assert resp.status_code == 200
+    assert resp.json()["output"][0]["content"][0]["text"] == "echo: hi"
+
+
 def test_foundry_responses_tolerates_stream_flag_with_non_streaming_response():
     app = create_foundry_app(_spec(), EchoFactory())
     with TestClient(app) as client:
@@ -147,6 +160,82 @@ def test_foundry_responses_preserves_message_history_for_list_input():
     ]
 
 
+def test_foundry_non_brokered_responses_previous_response_id_does_not_force_continuation():
+    factory = EchoFactory()
+    app = create_foundry_app(_spec(), factory)
+
+    with TestClient(app) as client:
+        resp = client.post("/responses", json={"previous_response_id": "caresp_prior", "input": "next prompt"})
+
+    assert resp.status_code == 200
+    assert resp.json()["output"][0]["content"][0]["text"] == "echo: next prompt"
+    assert factory.runtime.requests[0].prompt == "next prompt"
+
+
+def test_foundry_non_brokered_function_call_output_is_not_routed_to_brokered_state_machine():
+    factory = EchoFactory()
+    app = create_foundry_app(_spec(), factory)
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/responses",
+            json={
+                "previous_response_id": "caresp_prior",
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_prior_1",
+                        "output": '{"approved":true,"output":{"ok":true}}',
+                    }
+                ],
+            },
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["output"][0]["content"][0]["text"].startswith("echo: ")
+    assert "function_call_output" in factory.runtime.requests[0].prompt
+
+
+def test_foundry_non_brokered_function_call_output_input_stays_on_runtime_path():
+    factory = EchoFactory()
+    app = create_foundry_app(_spec(), factory)
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/responses",
+            json={
+                "previous_response_id": "caresp_prior",
+                "input": [{"type": "function_call_output", "call_id": "call_1", "output": "{}"}],
+            },
+        )
+
+    assert resp.status_code == 200
+    assert "function_call_output" in factory.runtime.requests[0].prompt
+    assert resp.json()["output"][0]["content"][0]["text"].startswith("echo:")
+
+
+def test_foundry_response_id_generator_tolerates_zero_arg_sdk(monkeypatch):
+    from agentkit_serve_common import foundry
+
+    class ZeroArgIdGenerator:
+        @staticmethod
+        def new_response_id():
+            return "caresp_zero_arg"
+
+        @staticmethod
+        def new_message_item_id(response_id: str):
+            return f"msg_{response_id}"
+
+    monkeypatch.setattr(foundry, "_AzureResponsesIdGenerator", ZeroArgIdGenerator)
+    app = create_foundry_app(_spec(), EchoFactory())
+
+    with TestClient(app) as client:
+        resp = client.post("/responses", json={"previous_response_id": "caresp_previous", "input": "hi"})
+
+    assert resp.status_code == 200
+    assert resp.json()["id"] == "caresp_zero_arg"
+
+
 def test_foundry_responses_rejects_request_supplied_tools():
     app = create_foundry_app(_spec(), EchoFactory())
     with TestClient(app) as client:
@@ -185,3 +274,69 @@ def test_foundry_protocol_uses_platform_session_env_fallback(monkeypatch):
 
     assert resp.status_code == 200
     assert factory.runtime.requests[0].session_id == "platform-session"
+
+
+def test_foundry_brokered_cli_dry_run_loads_static_brokered_agent(tmp_path, capsys):
+    from agentkit_serve_common.foundry_brokered_cli import main
+
+    config = tmp_path / "agent.yaml"
+    config.write_text(
+        """abiVersion: v0
+metadata:
+  name: brokered-cli
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: Broker tools.
+tools: []
+brokeredTools:
+  - name: conformance_read
+    description: Read conformance data.
+    brokeredClass: read
+    parameters:
+      type: object
+      properties:
+        probe:
+          type: boolean
+expose:
+  openai: true
+  port: 8088
+""",
+        encoding="utf-8",
+    )
+
+    assert main(["--config", str(config), "--dry-run"]) == 0
+
+    output = capsys.readouterr().out
+    assert '"agent": "brokered-cli"' in output
+    assert '"brokeredTools": ["conformance_read"]' in output
+
+
+def test_foundry_brokered_cli_rejects_agents_without_brokered_tools(tmp_path):
+    from agentkit_serve_common.foundry_brokered_cli import main
+
+    config = tmp_path / "agent.yaml"
+    config.write_text(
+        """abiVersion: v0
+metadata:
+  name: not-brokered
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: Be helpful.
+tools: []
+expose:
+  openai: true
+  port: 8088
+""",
+        encoding="utf-8",
+    )
+
+    try:
+        main(["--config", str(config), "--dry-run"])
+    except SystemExit as exc:
+        assert "brokeredTools" in str(exc)
+    else:  # pragma: no cover - assertion path.
+        raise AssertionError("expected missing brokeredTools to fail")

@@ -21,3 +21,9 @@ __pycache__/
 
 # Local provider validation outputs
 deploy/foundry/**/output.env
+
+# Local Foundry brokered conformance transcripts (request/response evidence may contain endpoint-specific data).
+foundry-brokered-transcript*/
+foundry-brokered-local-transcript*/
+agentkit-foundry-brokered.*/
+agentkit-foundry-brokered-local.*/

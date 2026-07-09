@@ -20,7 +20,13 @@ dependencies = [
     "pydantic>=2.7",
     "pyyaml>=6.0",
     "httpx>=0.28",
+    "azure-ai-agentserver-responses>=1.0.0b8",
 ]
+
+[project.scripts]
+agentkit-brokered-tools = "agentkit_serve_common.brokered:main"
+agentkit-foundry-brokered = "agentkit_serve_common.foundry_brokered_cli:main"
+agentkit-foundry-conformance = "agentkit_serve_common.foundry_conformance:main"
 
 [project.optional-dependencies]
 # Starlette/FastAPI TestClient currently imports the httpx2 compatibility package.
