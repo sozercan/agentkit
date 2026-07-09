@@ -1457,6 +1457,39 @@ def test_foundry_brokered_model_loop_validates_large_integer_bounds_exactly():
     assert response.json()["error"]["code"] == "InvalidToolArguments"
 
 
+def test_foundry_brokered_model_loop_rejects_float_arguments_that_cannot_round_trip_exactly():
+    spec = _spec(tool_name="check-network-telemetry")
+    spec.brokered_tools[0].parameters = {
+        "type": "object",
+        "properties": {"count": {"type": "integer", "maximum": 9007199254740992}},
+        "required": ["count"],
+    }
+    fake = _FakeChatTransport(
+        [
+            _chat_response(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_model",
+                            "type": "function",
+                            "function": {"name": "check-network-telemetry", "arguments": '{"count":9007199254740993.0}'},
+                        }
+                    ],
+                }
+            )
+        ]
+    )
+    app = _model_loop_app(spec, fake)
+
+    with TestClient(app) as client:
+        response = client.post("/responses", json={"input": "call check-network-telemetry"})
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "InvalidToolArguments"
+
+
 def test_foundry_brokered_model_loop_rejects_unsafe_model_generated_arguments():
     fake = _FakeChatTransport(
         [

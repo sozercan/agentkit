@@ -13,6 +13,7 @@ import asyncio
 import json
 import os
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Sequence
 
 import httpx
@@ -198,7 +199,9 @@ def _message_text(message: Mapping[str, Any]) -> str:
 def _parse_arguments(raw: Any) -> dict[str, Any]:
     if isinstance(raw, str):
         try:
-            parsed = json.loads(raw or "{}")
+            parsed = json.loads(raw or "{}", parse_float=_parse_json_float, parse_constant=_reject_json_constant)
+        except AgentRunError:
+            raise
         except json.JSONDecodeError as exc:
             raise AgentRunError("model tool arguments must be valid JSON", status=400, code="InvalidToolArguments") from exc
     else:
@@ -206,6 +209,25 @@ def _parse_arguments(raw: Any) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise AgentRunError("model tool arguments must be a JSON object", status=400, code="InvalidToolArguments")
     return parsed
+
+
+def _parse_json_float(raw: str) -> float:
+    try:
+        decimal = Decimal(raw)
+    except InvalidOperation as exc:
+        raise AgentRunError("model tool arguments must contain valid JSON numbers", status=400, code="InvalidToolArguments") from exc
+    parsed = float(decimal)
+    if not Decimal(str(parsed)) == decimal:
+        raise AgentRunError(
+            "model tool arguments contain a number that cannot be represented exactly",
+            status=400,
+            code="InvalidToolArguments",
+        )
+    return parsed
+
+
+def _reject_json_constant(raw: str) -> None:
+    raise AgentRunError(f"model tool arguments contain non-finite number {raw}", status=400, code="InvalidToolArguments")
 
 
 def _usage(data: Mapping[str, Any]) -> dict[str, int]:
