@@ -1345,6 +1345,19 @@ func TestValidateRejectsUnsafeBrokeredToolSchema(t *testing.T) {
 	}
 }
 
+func TestHasUnsafeBrokeredTextMatchesAuthSchemesAsWords(t *testing.T) {
+	for _, safe := range []string{"This tool basically reads telemetry", "Read crossbearer telemetry labels"} {
+		if hasUnsafeBrokeredText(safe) {
+			t.Fatalf("expected %q to be safe brokered text", safe)
+		}
+	}
+	for _, unsafe := range []string{"Use bearer auth", "Basic authentication required"} {
+		if !hasUnsafeBrokeredText(unsafe) {
+			t.Fatalf("expected %q to be unsafe brokered text", unsafe)
+		}
+	}
+}
+
 func TestValidateRejectsSecretLiteralBrokeredSchemaStringValues(t *testing.T) {
 	cfg := validMinimalConfig()
 	cfg.BrokeredTools = []BrokeredTool{{

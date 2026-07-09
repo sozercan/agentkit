@@ -629,7 +629,29 @@ func isSchemaDigest(value string) bool {
 func hasUnsafeBrokeredText(value string) bool {
 	lowered := strings.ToLower(value)
 	normalized := normalizeKey(lowered)
-	return containsSecretPrefix(value) || strings.Contains(value, "://") || strings.Contains(lowered, "bearer") || strings.Contains(lowered, "basic") || strings.Contains(lowered, "authorization") || strings.Contains(lowered, "secret") || strings.Contains(lowered, "token") || strings.Contains(lowered, "password") || strings.Contains(lowered, "passphrase") || strings.Contains(lowered, "pwd") || strings.Contains(lowered, "api key") || strings.Contains(lowered, "apikey") || strings.Contains(normalized, "apikey") || strings.Contains(normalized, "xapikey") || strings.Contains(normalized, "subscriptionkey") || strings.Contains(normalized, "xfunctionskey") || strings.Contains(lowered, brokeredUnsafeCookieKey) || strings.Contains(lowered, "set-cookie") || strings.Contains(lowered, "x-api-key") || strings.Contains(lowered, credentialHeaderAPIKey) || strings.Contains(lowered, "subscription-key") || strings.Contains(lowered, "x-functions-key") || strings.Contains(lowered, "ocp-apim-subscription-key") || strings.Contains(lowered, "private key") || strings.Contains(lowered, "privatekey") || strings.Contains(lowered, "key material") || strings.Contains(lowered, ".svc") || strings.Contains(lowered, "cluster.local")
+	return containsSecretPrefix(value) || strings.Contains(value, "://") || containsBrokeredWord(lowered, "bearer") || containsBrokeredWord(lowered, "basic") || strings.Contains(lowered, "authorization") || strings.Contains(lowered, "secret") || strings.Contains(lowered, "token") || strings.Contains(lowered, "password") || strings.Contains(lowered, "passphrase") || strings.Contains(lowered, "pwd") || strings.Contains(lowered, "api key") || strings.Contains(lowered, "apikey") || strings.Contains(normalized, "apikey") || strings.Contains(normalized, "xapikey") || strings.Contains(normalized, "subscriptionkey") || strings.Contains(normalized, "xfunctionskey") || strings.Contains(lowered, brokeredUnsafeCookieKey) || strings.Contains(lowered, "set-cookie") || strings.Contains(lowered, "x-api-key") || strings.Contains(lowered, credentialHeaderAPIKey) || strings.Contains(lowered, "subscription-key") || strings.Contains(lowered, "x-functions-key") || strings.Contains(lowered, "ocp-apim-subscription-key") || strings.Contains(lowered, "private key") || strings.Contains(lowered, "privatekey") || strings.Contains(lowered, "key material") || strings.Contains(lowered, ".svc") || strings.Contains(lowered, "cluster.local")
+}
+
+func containsBrokeredWord(value string, word string) bool {
+	start := 0
+	for {
+		idx := strings.Index(value[start:], word)
+		if idx < 0 {
+			return false
+		}
+		idx += start
+		after := idx + len(word)
+		beforeOK := idx == 0 || !isBrokeredWordByte(value[idx-1])
+		afterOK := after == len(value) || !isBrokeredWordByte(value[after])
+		if beforeOK && afterOK {
+			return true
+		}
+		start = after
+	}
+}
+
+func isBrokeredWordByte(value byte) bool {
+	return (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') || (value >= '0' && value <= '9') || value == '_'
 }
 
 func isUnsafeBrokeredKey(value string) bool {
