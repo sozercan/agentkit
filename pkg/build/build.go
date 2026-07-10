@@ -45,9 +45,18 @@ func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 	}
 
 	target := opts[keyTarget]
-	matched, route, rc, ok := lookupRoute(target, cfg.Runtime)
+	effectiveRuntime := canonicalEffectiveRuntime(cfg.Runtime)
+	matched, route, rc, ok := lookupRoute(target, effectiveRuntime)
 	if !ok {
-		return nil, errors.Errorf("no route for target %q with runtime %q", target, cfg.Runtime)
+		if targetRuntime, namesRuntime := targetRuntimeSegment(target); namesRuntime && targetRuntime != effectiveRuntime {
+			return nil, errors.Errorf(
+				"no route for target %q: target runtime %q does not match effective runtime %q",
+				target,
+				targetRuntime,
+				effectiveRuntime,
+			)
+		}
+		return nil, errors.Errorf("no route for target %q with effective runtime %q", target, effectiveRuntime)
 	}
 	if handler := contextRouteHandlers[matched]; handler != nil {
 		return handler(ctx, c, cfg, rc, loaded.instructions)

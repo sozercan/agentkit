@@ -91,6 +91,23 @@ func defaultRuntime() string {
 	return runtimes.DefaultRuntime()
 }
 
+func canonicalEffectiveRuntime(runtime string) string {
+	if runtime == "" {
+		runtime = defaultRuntime()
+	}
+	return runtimes.CanonicalRuntime(runtime)
+}
+
+func targetRuntimeSegment(target string) (string, bool) {
+	if target == "" {
+		return "", false
+	}
+	segment, _, _ := strings.Cut(target, "/")
+	runtime := runtimes.CanonicalRuntime(segment)
+	_, registered := runtimeConfigs[runtime]
+	return runtime, registered
+}
+
 // lookupRoute resolves a build target plus the effective runtime to a route and
 // its RuntimeConfig.
 //
@@ -99,12 +116,9 @@ func defaultRuntime() string {
 // target resolves to "<runtime>/image". A bare runtime ("pydantic-ai") resolves
 // to "<runtime>/image". Otherwise exact match, then longest-prefix match.
 func lookupRoute(target, runtime string) (matched string, route Route, rc *RuntimeConfig, ok bool) {
-	if runtime == "" {
-		runtime = defaultRuntime()
-	}
-	// Resolve a user-written alias (e.g. "maf") to its canonical name so the
-	// registry lookup and the "<runtime>/image" route key always agree.
-	runtime = runtimes.CanonicalRuntime(runtime)
+	// Resolve an omitted or aliased runtime to the canonical adapter identity so
+	// the registry lookup and the "<runtime>/image" route key always agree.
+	runtime = canonicalEffectiveRuntime(runtime)
 	rc, rcOK := runtimeConfigs[runtime]
 	if !rcOK {
 		return "", Route{}, nil, false
@@ -115,6 +129,14 @@ func lookupRoute(target, runtime string) (matched string, route Route, rc *Runti
 	// canonicalize the target's runtime segment before any comparison/lookup, or
 	// an alias target would miss every branch and fail to route.
 	target = canonicalizeTargetRuntime(target)
+
+	// A target that names a registered runtime must agree with the effective
+	// runtime. Otherwise route and RuntimeConfig would describe different
+	// adapters (for example, langgraph/image with pydantic-ai config).
+	targetRuntime, namesRuntime := targetRuntimeSegment(target)
+	if namesRuntime && targetRuntime != runtime {
+		return "", Route{}, nil, false
+	}
 
 	// Empty or bare-runtime target → the runtime's image route.
 	if target == "" || target == runtime {

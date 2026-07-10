@@ -21,6 +21,7 @@ import (
 
 const (
 	remoteContextURL              = "https://example.com/agent.git#main"
+	localDockerfileSourcePrefix   = "local://dockerfile"
 	dockerImageSourcePrefix       = "docker-image://"
 	downloadedHTTPContextFilename = "context"
 	redactionTestPrefix           = "redaction"
@@ -247,6 +248,77 @@ instructions: Be reliable.
 expose:
   openai: true
 `)
+}
+
+func inlineAgentkitfileWithRuntime(runtime string) []byte {
+	return []byte(strings.Replace(
+		string(inlineAgentkitfile()),
+		"kind: Agent\n",
+		"kind: Agent\nruntime: "+runtime+"\n",
+		1,
+	))
+}
+
+func TestBuildRejectsTargetRuntimeMismatchBeforeImageSolve(t *testing.T) {
+	tests := []struct {
+		name              string
+		agentkitfile      []byte
+		target            string
+		buildArgValue     string
+		wantTargetRuntime string
+	}{
+		{
+			name:              "config runtime",
+			agentkitfile:      inlineAgentkitfileWithRuntime(runtimePydca),
+			target:            wantLangGraphRoute,
+			wantTargetRuntime: runtimeLangGraph,
+		},
+		{
+			name:              "build arg overrides config runtime",
+			agentkitfile:      inlineAgentkitfileWithRuntime(runtimeLangGraph),
+			target:            wantLangGraphRoute,
+			buildArgValue:     runtimePydca,
+			wantTargetRuntime: runtimeLangGraph,
+		},
+		{
+			name:              "default runtime rejects alias-prefixed route",
+			agentkitfile:      inlineAgentkitfile(),
+			target:            runtimeMAFAls + "/image/debug",
+			wantTargetRuntime: runtimeMAFName,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configRef := &memoryReference{files: map[string][]byte{defaultAgentkitfileName: tt.agentkitfile}}
+			opts := map[string]string{keyTarget: tt.target}
+			if tt.buildArgValue != "" {
+				opts["build-arg:runtime"] = tt.buildArgValue
+			}
+			c := &fakeBuildClient{
+				opts: client.BuildOpts{Opts: opts},
+				expected: []expectedSolve{
+					{sourcePrefix: localDockerfileSourcePrefix, ref: configRef},
+				},
+			}
+
+			_, err := Build(context.Background(), c)
+			if err == nil {
+				t.Fatal("Build() error = nil, want runtime mismatch")
+			}
+			for _, want := range []string{
+				"no route",
+				fmt.Sprintf("target runtime %q", tt.wantTargetRuntime),
+				`effective runtime "pydantic-ai"`,
+			} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("Build() error = %q, want substring %q", err, want)
+				}
+			}
+			if got := len(c.solveSources()); got != 1 {
+				t.Fatalf("Build() solve count = %d, want 1 config solve and no image solve", got)
+			}
+		})
+	}
 }
 
 func tarContext(t *testing.T, files map[string][]byte) []byte {
@@ -557,7 +629,7 @@ func TestBuildLocalContextInstructionsFileUsesLocalContext(t *testing.T) {
 	c := &fakeBuildClient{
 		opts: client.BuildOpts{Opts: map[string]string{}},
 		expected: []expectedSolve{
-			{sourcePrefix: "local://dockerfile", ref: configRef},
+			{sourcePrefix: localDockerfileSourcePrefix, ref: configRef},
 			{sourcePrefix: "local://context", ref: contextRef},
 			{sourcePrefix: dockerImageSourcePrefix, ref: final},
 		},
@@ -626,7 +698,7 @@ func TestBuildNullCacheImportReturnsError(t *testing.T) {
 	c := &fakeBuildClient{
 		opts: client.BuildOpts{Opts: map[string]string{keyCacheImports: "[null]"}},
 		expected: []expectedSolve{
-			{sourcePrefix: "local://dockerfile", ref: configRef},
+			{sourcePrefix: localDockerfileSourcePrefix, ref: configRef},
 		},
 	}
 
