@@ -918,13 +918,15 @@ def create_orka_app(
         try:
             yield
         finally:
-            for state in turns.values():
-                if state.task is not None and not state.task.done():
-                    state.task.cancel()
-            for task in list(background_tasks):
+            active_turn_tasks = [state.task for state in turns.values() if state.task is not None and not state.task.done()]
+            for task in active_turn_tasks:
                 task.cancel()
-            if background_tasks:
-                await asyncio.gather(*background_tasks, return_exceptions=True)
+            if active_turn_tasks:
+                await asyncio.gather(*active_turn_tasks, return_exceptions=True)
+            while background_tasks:
+                terminal_tasks = list(background_tasks)
+                await asyncio.gather(*terminal_tasks, return_exceptions=True)
+                background_tasks.difference_update(terminal_tasks)
             background_tasks.clear()
             for active in reversed(list(active_runtimes.values())):
                 await active.context.__aexit__(None, None, None)
@@ -1146,8 +1148,9 @@ def create_orka_app(
             raise HTTPException(status_code=400, detail="cancel turnID must match route turnID")
         runtime_session_id = _required_string(data, "runtimeSessionID")
         correlation_id = _required_string(data, "correlationID")
-        for field_name in ("namespace", "taskName", "sessionName"):
-            _required_string(data, field_name)
+        namespace = _required_string(data, "namespace")
+        task_name = _required_string(data, "taskName")
+        session_name = _required_string(data, "sessionName")
 
         state = turns.get(turn_id)
         if state is None:
@@ -1156,6 +1159,8 @@ def create_orka_app(
             raise HTTPException(status_code=400, detail="cancel runtimeSessionID must match turn runtimeSessionID")
         if correlation_id != state.correlation_id:
             raise HTTPException(status_code=400, detail="cancel correlationID must match turn correlationID")
+        if namespace != state.namespace or task_name != state.task_name or session_name != state.session_name:
+            raise HTTPException(status_code=400, detail="cancel namespace/taskName/sessionName must match turn")
         if state.terminal_event is None and state.task is not None and not state.task.done():
             state.task.cancel()
         elif state.terminal_event is None:

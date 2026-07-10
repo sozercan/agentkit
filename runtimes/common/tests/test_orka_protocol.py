@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 import time
 from datetime import UTC, datetime, timedelta
 from types import TracebackType
@@ -9,6 +11,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+import agentkit_serve_common.orka as orka_module
 from agentkit_serve_common.config import AgentSpec
 from agentkit_serve_common.conversation import RunRequest
 from agentkit_serve_common.orka import ORKA_HARNESS_VERSION, create_orka_app
@@ -498,6 +501,39 @@ def test_orka_cancel_rejects_runtime_session_or_correlation_mismatch():
     assert "correlationID" in wrong_correlation.text
 
 
+@pytest.mark.parametrize(
+    ("field_name", "mismatched_value"),
+    [
+        ("namespace", "other-namespace"),
+        ("taskName", "other-task"),
+        ("sessionName", "other-session-name"),
+    ],
+)
+def test_orka_cancel_rejects_turn_owner_mismatch_without_cancelling_turn(field_name: str, mismatched_value: str):
+    app = create_orka_app(_spec(), EchoFactory(delay=60), auth_token="test-token")
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(client, turnID=f"turn-cancel-{field_name}", input={"prompt": "slow", "contextRefs": [], "env": []})
+        state = client.app.state.turns[turn_id]
+        mismatch = client.post(
+            f"/v1/turns/{turn_id}/cancel",
+            json=_cancel_payload(turnID=turn_id, **{field_name: mismatched_value}),
+            headers=AUTH,
+        )
+
+        assert mismatch.status_code == 400
+        assert mismatch.json() == {"detail": "cancel namespace/taskName/sessionName must match turn"}
+        assert state.task is not None
+        assert state.task.cancelling() == 0
+        assert state.terminal_event is None
+
+        accepted = client.post(f"/v1/turns/{turn_id}/cancel", json=_cancel_payload(turnID=turn_id), headers=AUTH)
+        frames = _frames(client.get(f"/v1/turns/{turn_id}/events", headers=AUTH).text)
+
+    assert accepted.status_code == 202
+    assert frames[-1]["type"] == "TurnCancelled"
+
+
 def test_orka_cancel_rejects_body_turn_id_mismatch():
     app = create_orka_app(_spec(), EchoFactory(delay=60), auth_token="test-token")
 
@@ -553,6 +589,70 @@ def test_orka_terminal_turn_retention_is_bounded():
     assert evicted.status_code == 404
     assert kept.status_code == 200
     assert [frame["type"] for frame in _frames(kept.text)] == ["RuntimeOutput", "TurnCompleted"]
+
+
+def test_orka_lifespan_awaits_cancelled_turn_and_terminal_callback_before_runtime_close(monkeypatch):
+    turn_started = threading.Event()
+
+    class ShutdownRuntime:
+        def __init__(self) -> None:
+            self.state: Any = None
+            self.close_observations: list[tuple[bool, str | None]] = []
+
+        async def __aenter__(self) -> RuntimeSession:
+            return self
+
+        async def __aexit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            tb: TracebackType | None,
+        ) -> bool | None:
+            terminal_type = self.state.terminal_event.type if self.state.terminal_event is not None else None
+            self.close_observations.append((self.state.task.done(), terminal_type))
+            return None
+
+        async def run(self, request: RunRequest) -> RunResult:
+            raise AssertionError("patched turn runner should own the active task")
+
+    class ShutdownFactory:
+        def __init__(self) -> None:
+            self.runtime = ShutdownRuntime()
+
+        def build_runtime(self, spec: AgentSpec) -> RuntimeSession:
+            return self.runtime
+
+    async def uncaught_cancel_run_turn(
+        get_runtime,
+        turns,
+        terminal_order,
+        state,
+        run_request,
+        *,
+        max_terminal_turns,
+        brokered_tools=None,
+    ) -> None:
+        del turns, terminal_order, state, max_terminal_turns, brokered_tools
+        await get_runtime(run_request)
+        turn_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(orka_module, "_run_turn", uncaught_cancel_run_turn)
+    factory = ShutdownFactory()
+    app = create_orka_app(_spec(), factory, auth_token="test-token")
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(client, turnID="turn-shutdown", input={"prompt": "slow", "contextRefs": [], "env": []})
+        assert turn_started.wait(timeout=2)
+        state = client.app.state.turns[turn_id]
+        factory.runtime.state = state
+        assert state.task is not None
+        assert not state.task.done()
+
+    assert factory.runtime.close_observations == [(True, "TurnCancelled")]
+    assert state.task.done()
+    assert state.terminal_event is not None
+    assert state.terminal_event.type == "TurnCancelled"
 
 
 class EnvRuntime:
