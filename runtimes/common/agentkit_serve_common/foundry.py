@@ -24,6 +24,7 @@ import os
 import re
 import time
 import uuid
+from copy import deepcopy
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from contextlib import asynccontextmanager
@@ -128,6 +129,14 @@ def _error(message: str, status: int = 400, code: str | None = None) -> JSONResp
     return JSONResponse(
         {"error": {"message": message, "code": code}},
         status_code=status,
+    )
+
+
+def _state_storage_error() -> JSONResponse:
+    return _error(
+        "brokered response state storage unavailable",
+        status=503,
+        code="brokered_response_state_storage_error",
     )
 
 
@@ -296,6 +305,7 @@ class _HostedResponseState:
     final_payload: dict[str, Any] | None = None
     model_messages: list[dict[str, Any]] | None = None
     initial_usage: dict[str, int] = field(default_factory=dict)
+    final_persistence_pending: bool = False
 
 
 class _StateExpired(KeyError):
@@ -303,6 +313,10 @@ class _StateExpired(KeyError):
 
 
 class _StateStoreFull(Exception):
+    pass
+
+
+class _StatePersistenceError(Exception):
     pass
 
 
@@ -389,11 +403,11 @@ def _state_from_payload(data: Mapping[str, Any]) -> _HostedResponseState:
         raise ValueError("stored initialUsage must be an object")
     status = str(data.get("status") or "pending")
     accepted = {str(key): str(value) for key, value in accepted_outputs.items()}
-    if final_payload is None and accepted:
-        # A persisted accepted output without a final payload means the process
+    if final_payload is None and (accepted or status == "resuming"):
+        # Persisted in-progress state without a final payload means the process
         # stopped between accepting the continuation and completing the resume.
-        # Clear it on load so Orka can retry the same continuation instead of
-        # being stuck behind duplicate_continuation_in_progress until TTL expiry.
+        # Clear it on load so Orka can retry instead of being stuck behind
+        # duplicate_continuation_in_progress until TTL expiry.
         status = "pending"
         accepted = {}
     return _HostedResponseState(
@@ -422,61 +436,153 @@ class _FoundryResponseStateStore:
         self.max_entries = max_entries
         self.state_file = Path(state_file) if state_file else None
         self._states: dict[str, _HostedResponseState] = {}
+        self._active_resumes: dict[str, asyncio.Task[Any]] = {}
         self._load()
 
     @property
     def backend_name(self) -> str:
         return "file" if self.state_file else "memory"
 
-    def add(self, state: _HostedResponseState) -> None:
-        self.purge_expired()
-        if len(self._states) >= self.max_entries and state.response_id not in self._states:
-            self.evict_completed_to_capacity(reserve_slots=1)
-        if len(self._states) >= self.max_entries and state.response_id not in self._states:
-            raise _StateStoreFull("too many pending brokered responses")
-        self._states[state.response_id] = state
-        self._persist()
+    def _active_resume_ids(self) -> set[str]:
+        finished = [response_id for response_id, task in self._active_resumes.items() if task.done()]
+        for response_id in finished:
+            self._active_resumes.pop(response_id, None)
+        return set(self._active_resumes)
 
-    def save(self, state: _HostedResponseState) -> None:
-        if state.response_id in self._states:
-            self._states[state.response_id] = state
-            self._persist()
+    @staticmethod
+    def _purge_expired_from(
+        states: dict[str, _HostedResponseState],
+        *,
+        now: float,
+        active_resume_ids: set[str],
+    ) -> bool:
+        expired = [
+            response_id
+            for response_id, state in states.items()
+            if state.expires_at <= now and not (state.status == "resuming" and response_id in active_resume_ids)
+        ]
+        for response_id in expired:
+            states.pop(response_id, None)
+        return bool(expired)
 
-    def evict_completed_to_capacity(self, *, reserve_slots: int = 0) -> None:
-        target = max(self.max_entries - reserve_slots, 0)
-        if len(self._states) <= target:
-            return
+    @staticmethod
+    def _evict_completed_from(
+        states: dict[str, _HostedResponseState],
+        *,
+        target: int,
+    ) -> bool:
+        if len(states) <= target:
+            return False
         completed = sorted(
-            (entry for entry in self._states.values() if entry.status == "completed" and entry.final_payload is not None),
+            (
+                entry
+                for entry in states.values()
+                if entry.status == "completed" and entry.final_payload is not None and not entry.final_persistence_pending
+            ),
             key=lambda entry: entry.expires_at,
         )
         changed = False
         for entry in completed:
-            self._states.pop(entry.response_id, None)
+            states.pop(entry.response_id, None)
             changed = True
-            if len(self._states) <= target:
+            if len(states) <= target:
                 break
-        if changed:
-            self._persist()
+        return changed
+
+    def _commit(self, states: dict[str, _HostedResponseState]) -> None:
+        self._persist(states)
+        installed = states
+        pending_finals = [
+            response_id
+            for response_id, state in states.items()
+            if state.final_persistence_pending and state.status == "completed" and state.final_payload is not None
+        ]
+        if pending_finals:
+            installed = dict(states)
+            for response_id in pending_finals:
+                durable = deepcopy(states[response_id])
+                durable.final_persistence_pending = False
+                installed[response_id] = durable
+        self._states = installed
+
+    def add(self, state: _HostedResponseState) -> None:
+        states = dict(self._states)
+        self._purge_expired_from(states, now=time.time(), active_resume_ids=self._active_resume_ids())
+        if len(states) >= self.max_entries and state.response_id not in states:
+            self._evict_completed_from(states, target=max(self.max_entries - 1, 0))
+        if (
+            len(states) >= self.max_entries
+            and state.response_id not in states
+            and any(
+                entry.final_persistence_pending and entry.status == "completed" and entry.final_payload is not None
+                for entry in states.values()
+            )
+        ):
+            self._commit(states)
+            states = dict(self._states)
+            self._evict_completed_from(states, target=max(self.max_entries - 1, 0))
+        if len(states) >= self.max_entries and state.response_id not in states:
+            raise _StateStoreFull("too many pending brokered responses")
+        states[state.response_id] = deepcopy(state)
+        self._commit(states)
+
+    def save(self, state: _HostedResponseState) -> None:
+        if state.response_id not in self._states:
+            return
+        states = dict(self._states)
+        states[state.response_id] = deepcopy(state)
+        self._commit(states)
+
+    def cache_in_memory(self, state: _HostedResponseState) -> None:
+        """Cache one entry after a durable transition could not be written.
+
+        Persisted unfinalized continuations are normalized back to pending by
+        ``_state_from_payload`` on restart. In-process caching also preserves a
+        successfully computed final payload until an identical retry can persist it.
+        """
+
+        if state.response_id not in self._states:
+            return
+        states = dict(self._states)
+        states[state.response_id] = deepcopy(state)
+        self._states = states
+
+    def mark_resume_active(self, response_id: str) -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            self._active_resumes[response_id] = task
+
+    def mark_resume_inactive(self, response_id: str) -> None:
+        self._active_resumes.pop(response_id, None)
+
+    def evict_completed_to_capacity(self, *, reserve_slots: int = 0) -> None:
+        states = dict(self._states)
+        target = max(self.max_entries - reserve_slots, 0)
+        if self._evict_completed_from(states, target=target):
+            self._commit(states)
 
     def get(self, response_id: str) -> _HostedResponseState:
         state = self._states.get(response_id)
         if state is None:
             raise KeyError(response_id)
-        if state.expires_at <= time.time():
-            self._states.pop(response_id, None)
-            self._persist()
+        states = dict(self._states)
+        now = time.time()
+        active_resume_ids = self._active_resume_ids()
+        target_expired = state.expires_at <= now and not (state.status == "resuming" and response_id in active_resume_ids)
+        changed = self._purge_expired_from(states, now=now, active_resume_ids=active_resume_ids)
+        if changed:
+            self._commit(states)
+        if target_expired:
             raise _StateExpired(response_id)
-        self.purge_expired()
-        return state
+        current = self._states.get(response_id)
+        if current is None:
+            raise KeyError(response_id)
+        return deepcopy(current)
 
     def purge_expired(self) -> None:
-        now = time.time()
-        expired = [response_id for response_id, state in self._states.items() if state.expires_at <= now]
-        for response_id in expired:
-            self._states.pop(response_id, None)
-        if expired:
-            self._persist()
+        states = dict(self._states)
+        if self._purge_expired_from(states, now=time.time(), active_resume_ids=self._active_resume_ids()):
+            self._commit(states)
 
     def _load(self) -> None:
         if self.state_file is None or not self.state_file.exists():
@@ -487,39 +593,43 @@ class _FoundryResponseStateStore:
             if not isinstance(states, Mapping):
                 raise ValueError("Foundry response state file states must be an object")
             self._states = {str(response_id): _state_from_payload(state) for response_id, state in states.items() if isinstance(state, Mapping)}
-            self.purge_expired()
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             logger.warning("ignoring invalid Foundry response state file %s: %s", self.state_file, exc)
             self._states = {}
+            return
+        try:
+            self.purge_expired()
+        except _StatePersistenceError as exc:
+            logger.warning("could not persist expired Foundry response state cleanup for %s: %s", self.state_file, exc)
 
-    def _persist(self) -> None:
+    def _persist(self, states: Mapping[str, _HostedResponseState]) -> None:
         if self.state_file is None:
             return
-        self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"states": {response_id: _state_to_payload(state) for response_id, state in self._states.items()}}
+        payload = {"states": {response_id: _state_to_payload(state) for response_id, state in states.items()}}
         tmp = self.state_file.with_name(f".{self.state_file.name}.tmp")
         data = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
         try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        fd = os.open(tmp, flags, 0o600)
-        try:
+            self.state_file.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(tmp, flags, 0o600)
             with os.fdopen(fd, "wb") as handle:
                 handle.write(data)
                 handle.flush()
                 os.fsync(handle.fileno())
-        except Exception:
+            os.chmod(tmp, 0o600)
+            tmp.replace(self.state_file)
+        except OSError as exc:
             try:
                 tmp.unlink(missing_ok=True)
-            finally:
-                raise
-        os.chmod(tmp, 0o600)
-        tmp.replace(self.state_file)
-        os.chmod(self.state_file, 0o600)
+            except OSError:
+                pass
+            raise _StatePersistenceError("Foundry response state persistence failed") from exc
 
 
 def _state_ttl_seconds(value: float | None = None) -> float:
@@ -1163,6 +1273,26 @@ def _final_text_from_tool_output(call: _PendingCall, output: dict[str, Any]) -> 
     return f"Brokered tool {call.tool.name} completed with output: {_canonical_output_json(tool_output)}"
 
 
+def _reset_unfinalized_continuation(
+    store: _FoundryResponseStateStore,
+    state: _HostedResponseState,
+    *,
+    call_id: str,
+) -> bool:
+    state.accepted_outputs.pop(call_id, None)
+    state.status = "pending"
+    state.final_payload = None
+    state.final_persistence_pending = False
+    state.expires_at = time.time() + store.ttl_seconds
+    try:
+        store.save(state)
+    except _StatePersistenceError as exc:
+        logger.warning("failed to persist Foundry continuation rollback: %s", exc)
+        store.cache_in_memory(state)
+        return False
+    return True
+
+
 async def _handle_brokered_continuation(
     *,
     spec: AgentSpec,
@@ -1212,6 +1342,9 @@ async def _handle_brokered_continuation(
         )
     try:
         state = store.get(str(previous_response_id))
+    except _StatePersistenceError as exc:
+        logger.warning("failed to access Foundry brokered response state: %s", exc)
+        return _state_storage_error()
     except _StateExpired:
         return _error("previous_response_id state has expired", status=410, code="response_state_expired")
     except KeyError:
@@ -1241,6 +1374,15 @@ async def _handle_brokered_continuation(
     existing_output = state.accepted_outputs.get(call_id)
     if existing_output is not None:
         if existing_output == output_json and state.final_payload is not None:
+            if state.final_persistence_pending:
+                state.final_persistence_pending = False
+                try:
+                    store.save(state)
+                except _StatePersistenceError as exc:
+                    logger.warning("failed to persist cached Foundry brokered completion: %s", exc)
+                    state.final_persistence_pending = True
+                    store.cache_in_memory(state)
+                    return _state_storage_error()
             return JSONResponse(state.final_payload)
         if existing_output == output_json:
             return _error(
@@ -1256,49 +1398,65 @@ async def _handle_brokered_continuation(
     if state.status != "pending":
         return _error("previous response is not pending a tool result", status=409, code="response_not_pending")
 
-    state.accepted_outputs[call_id] = output_json
-    store.save(state)
     if state.model_messages is not None and model_loop is not None:
+        state.accepted_outputs[call_id] = output_json
         state.status = "resuming"
-        store.save(state)
+        state.expires_at = time.time() + store.ttl_seconds
         try:
-            model_result = await model_loop.resume(state.model_messages, call_id=call_id, output=output_json)
-        except AgentRunError as exc:
-            state.accepted_outputs.pop(call_id, None)
-            state.status = "pending"
             store.save(state)
-            if exc.status >= 500:
-                logger.warning("brokered model-loop resume failed: %s", exc)
-                return _error("model resume failed", status=exc.status, code="ModelResumeError")
-            return _error(str(exc), status=exc.status, code=exc.code)
-        except asyncio.CancelledError:
-            state.accepted_outputs.pop(call_id, None)
-            state.status = "pending"
-            store.save(state)
-            raise
-        except Exception as exc:  # noqa: BLE001 - reset continuation state before surfacing unexpected model failures.
-            logger.exception("brokered model-loop resume failed unexpectedly")
-            state.accepted_outputs.pop(call_id, None)
-            state.status = "pending"
-            store.save(state)
-            return _error("model resume failed", status=502, code="ModelResumeError")
-        if not isinstance(model_result, ModelLoopFinal):
-            state.accepted_outputs.pop(call_id, None)
-            state.status = "pending"
-            store.save(state)
-            return _error(
-                "model requested another brokered tool after resume",
-                status=400,
-                code="tool_loop_limit_exceeded",
-            )
-        result = RunResult(text=model_result.text, usage=_combine_usage(state.initial_usage, model_result.usage))
+        except _StatePersistenceError as exc:
+            logger.warning("failed to persist Foundry brokered continuation state: %s", exc)
+            return _state_storage_error()
+        store.mark_resume_active(state.response_id)
+        try:
+            try:
+                model_result = await model_loop.resume(state.model_messages, call_id=call_id, output=output_json)
+            except AgentRunError as exc:
+                if not _reset_unfinalized_continuation(store, state, call_id=call_id):
+                    return _state_storage_error()
+                if exc.status >= 500:
+                    logger.warning("brokered model-loop resume failed: %s", exc)
+                    return _error("model resume failed", status=exc.status, code="ModelResumeError")
+                return _error(str(exc), status=exc.status, code=exc.code)
+            except asyncio.CancelledError:
+                _reset_unfinalized_continuation(store, state, call_id=call_id)
+                raise
+            except Exception as exc:  # noqa: BLE001 - reset continuation state before surfacing unexpected model failures.
+                logger.exception("brokered model-loop resume failed unexpectedly")
+                if not _reset_unfinalized_continuation(store, state, call_id=call_id):
+                    return _state_storage_error()
+                return _error("model resume failed", status=502, code="ModelResumeError")
+            if not isinstance(model_result, ModelLoopFinal):
+                if not _reset_unfinalized_continuation(store, state, call_id=call_id):
+                    return _state_storage_error()
+                return _error(
+                    "model requested another brokered tool after resume",
+                    status=400,
+                    code="tool_loop_limit_exceeded",
+                )
+            result = RunResult(text=model_result.text, usage=_combine_usage(state.initial_usage, model_result.usage))
+        finally:
+            store.mark_resume_inactive(state.response_id)
     else:
         result = RunResult(text=_final_text_from_tool_output(call, parsed_output))
     final_payload = _responses_payload(spec, result, previous_response_id=state.response_id)
+    state.accepted_outputs[call_id] = output_json
     state.status = "completed"
     state.final_payload = final_payload
-    store.save(state)
-    store.evict_completed_to_capacity()
+    state.final_persistence_pending = False
+    state.expires_at = time.time() + store.ttl_seconds
+    try:
+        store.save(state)
+    except _StatePersistenceError as exc:
+        logger.warning("failed to persist completed Foundry brokered response state: %s", exc)
+        state.final_persistence_pending = True
+        store.cache_in_memory(state)
+        return _state_storage_error()
+    try:
+        store.evict_completed_to_capacity()
+    except _StatePersistenceError as exc:
+        logger.warning("failed to evict completed Foundry brokered response state: %s", exc)
+        return _state_storage_error()
     return JSONResponse(final_payload)
 
 
@@ -1438,9 +1596,12 @@ def create_foundry_app(
         if brokered_tools and isinstance(previous_response_id, str) and previous_response_id:
             try:
                 previous_state = response_states.get(previous_response_id)
+            except _StatePersistenceError as exc:
+                logger.warning("failed to access Foundry brokered response state: %s", exc)
+                return _state_storage_error()
             except (KeyError, _StateExpired):
                 previous_state = None
-            if previous_state is not None and previous_state.status == "pending":
+            if previous_state is not None and previous_state.status in {"pending", "resuming"}:
                 return _error(
                     "previous_response_id is pending a brokered function_call_output",
                     status=409,
@@ -1508,6 +1669,9 @@ def create_foundry_app(
                         status=429,
                         code="brokered_response_state_full",
                     )
+                except _StatePersistenceError as exc:
+                    logger.warning("failed to persist Foundry brokered response state: %s", exc)
+                    return _state_storage_error()
                 return JSONResponse(
                     _function_call_response_payload(
                         spec,
@@ -1558,6 +1722,9 @@ def create_foundry_app(
                     status=429,
                     code="brokered_response_state_full",
                 )
+            except _StatePersistenceError as exc:
+                logger.warning("failed to persist Foundry brokered response state: %s", exc)
+                return _state_storage_error()
             return JSONResponse(
                 _function_call_response_payload(
                     spec,

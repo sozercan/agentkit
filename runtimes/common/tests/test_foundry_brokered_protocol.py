@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+from pathlib import Path
 from types import TracebackType
 from typing import Any
 
 from fastapi.testclient import TestClient
 import httpx
 
+import agentkit_serve_common.foundry as foundry_module
 from agentkit_serve_common.config import AgentSpec
 from agentkit_serve_common.conversation import RunRequest
 from agentkit_serve_common.foundry import create_foundry_app
@@ -241,6 +246,58 @@ def test_foundry_brokered_pending_state_store_is_bounded():
     assert _call(first)
     assert second.status_code == 429
     assert second.json()["error"]["code"] == "brokered_response_state_full"
+
+
+def test_foundry_brokered_failed_initial_state_persist_is_retryable_without_consuming_capacity(monkeypatch, tmp_path):
+    state_file = tmp_path / "responses-state.json"
+    original_replace = Path.replace
+    failed_once = False
+
+    def fail_first_replace(path: Path, target: Path) -> Path:
+        nonlocal failed_once
+        if not failed_once and path.name == f".{state_file.name}.tmp":
+            failed_once = True
+            raise OSError("simulated state storage failure")
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", fail_first_replace)
+    app = _app(response_state_file=state_file, max_pending_responses=1)
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        failed = client.post("/responses", json={"input": "please read telemetry"})
+        retried = client.post("/responses", json={"input": "please read telemetry"})
+
+    assert failed.status_code == 503
+    assert failed.json()["error"] == {
+        "message": "brokered response state storage unavailable",
+        "code": "brokered_response_state_storage_error",
+    }
+    assert retried.status_code == 200, retried.text
+    assert _call(retried.json())
+
+
+def test_foundry_brokered_state_transactions_do_not_deepcopy_existing_state_graph(monkeypatch):
+    app = _app(max_pending_responses=3)
+    original_deepcopy = foundry_module.deepcopy
+
+    def reject_full_store_deepcopy(value: Any, memo: dict[int, Any] | None = None) -> Any:
+        if isinstance(value, dict) and value and all(type(entry).__name__ == "_HostedResponseState" for entry in value.values()):
+            raise AssertionError("state transactions must not deepcopy the entire state store")
+        return original_deepcopy(value, memo) if memo is not None else original_deepcopy(value)
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        first = _start(client)
+        first_call = _call(first)
+        monkeypatch.setattr(foundry_module, "deepcopy", reject_full_store_deepcopy)
+        second = client.post("/responses", json={"input": "please read telemetry again"})
+        completed = client.post(
+            "/responses",
+            headers=CONTINUATION_AUTH,
+            json=_continuation(first["id"], first_call["call_id"], {"approved": True, "output": {"ok": True}}),
+        )
+
+    assert second.status_code == 200, second.text
+    assert completed.status_code == 200, completed.text
 
 
 def test_foundry_brokered_completed_state_is_evicted_before_rejecting_new_pending_state():
@@ -1087,6 +1144,104 @@ def _model_loop_app(spec: AgentSpec, fake: _FakeChatTransport, **kwargs: Any):
     return _app(spec, brokered_model_loop_enabled=True, brokered_model_http_client=client, **kwargs)
 
 
+def test_foundry_brokered_active_resume_survives_ttl_and_completed_state_retains_from_completion():
+    spec = _spec(tool_name="check-network-telemetry")
+
+    class BlockingResumeTransport(httpx.AsyncBaseTransport):
+        def __init__(self) -> None:
+            self.requests: list[dict[str, Any]] = []
+            self.resume_started = threading.Event()
+            self.release_resume = threading.Event()
+            self.initial_calls = 0
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            payload = json.loads(request.content.decode("utf-8"))
+            self.requests.append(payload)
+            if "tools" in payload:
+                self.initial_calls += 1
+                return httpx.Response(
+                    200,
+                    request=request,
+                    json=_chat_response(
+                        {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": f"model_call_{self.initial_calls}",
+                                    "type": "function",
+                                    "function": {"name": "check-network-telemetry", "arguments": "{}"},
+                                }
+                            ],
+                        }
+                    ),
+                )
+            self.resume_started.set()
+            while not self.release_resume.is_set():
+                await asyncio.sleep(0.001)
+            return httpx.Response(
+                200,
+                request=request,
+                json=_chat_response({"role": "assistant", "content": "Resume completed after the lease window."}),
+            )
+
+    transport = BlockingResumeTransport()
+    model_client = httpx.AsyncClient(transport=transport)
+    app = _app(
+        spec,
+        brokered_model_loop_enabled=True,
+        brokered_model_http_client=model_client,
+        state_ttl_seconds=0.05,
+    )
+
+    with TestClient(app) as client, ThreadPoolExecutor(max_workers=1) as executor:
+        initial = client.post("/responses", json={"input": "check-network-telemetry"})
+        call = _call(initial.json())
+        payload = _continuation(initial.json()["id"], call["call_id"], {"approved": True, "output": {"ok": True}})
+        future = executor.submit(client.post, "/responses", headers=CONTINUATION_AUTH, json=payload)
+        try:
+            assert transport.resume_started.wait(timeout=2)
+            time.sleep(0.08)
+            another_pending = client.post("/responses", json={"input": "check-network-telemetry again"})
+            active_duplicate = client.post("/responses", headers=CONTINUATION_AUTH, json=payload)
+        finally:
+            transport.release_resume.set()
+        completed = future.result(timeout=2)
+        immediate_duplicate = client.post("/responses", headers=CONTINUATION_AUTH, json=payload)
+
+    assert another_pending.status_code == 200, another_pending.text
+    assert active_duplicate.status_code == 409
+    assert active_duplicate.json()["error"]["code"] == "duplicate_continuation_in_progress"
+    assert completed.status_code == 200, completed.text
+    assert _message_text(completed.json()) == "Resume completed after the lease window."
+    assert immediate_duplicate.status_code == 200, immediate_duplicate.text
+    assert immediate_duplicate.json() == completed.json()
+
+
+def test_foundry_brokered_abandoned_resuming_state_expires_and_releases_capacity(monkeypatch):
+    stores: list[Any] = []
+    original_store = foundry_module._FoundryResponseStateStore
+
+    def capture_store(*args: Any, **kwargs: Any) -> Any:
+        store = original_store(*args, **kwargs)
+        stores.append(store)
+        return store
+
+    monkeypatch.setattr(foundry_module, "_FoundryResponseStateStore", capture_store)
+    app = _app(max_pending_responses=1)
+
+    with TestClient(app) as client:
+        initial = _start(client)
+        abandoned = stores[0].get(initial["id"])
+        abandoned.status = "resuming"
+        abandoned.expires_at = time.time() - 1
+        stores[0].save(abandoned)
+        replacement = client.post("/responses", json={"input": "please read telemetry again"})
+
+    assert replacement.status_code == 200, replacement.text
+    assert _call(replacement.json())
+
+
 def test_foundry_brokered_model_loop_emits_model_requested_tool_and_resumes_to_final_answer():
     spec = _spec(tool_name="check-network-telemetry")
     spec.brokered_tools[0].parameters["required"] = ["site"]
@@ -1161,6 +1316,248 @@ def test_foundry_brokered_file_state_is_written_with_private_permissions(tmp_pat
 
     assert state_file.exists()
     assert state_file.stat().st_mode & 0o777 == 0o600
+
+
+def test_foundry_brokered_failed_continuation_state_persist_is_retryable_without_stranding_progress(monkeypatch, tmp_path):
+    state_file = tmp_path / "responses-state.json"
+    spec = _spec(tool_name="check-network-telemetry")
+    fake = _FakeChatTransport(
+        [
+            _chat_response(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "model_generated_call_id",
+                            "type": "function",
+                            "function": {"name": "check-network-telemetry", "arguments": "{}"},
+                        }
+                    ],
+                }
+            ),
+            _chat_response({"role": "assistant", "content": "Recovered after storage retry."}),
+        ]
+    )
+    app = _model_loop_app(spec, fake, response_state_file=state_file)
+    original_replace = Path.replace
+    failed_once = False
+
+    def fail_first_resuming_replace(path: Path, target: Path) -> Path:
+        nonlocal failed_once
+        if not failed_once and path.name == f".{state_file.name}.tmp":
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+            stored_state = next(iter(persisted["states"].values()))
+            if stored_state["status"] == "resuming":
+                failed_once = True
+                raise OSError("simulated continuation state storage failure")
+        return original_replace(path, target)
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        initial = client.post("/responses", json={"input": "check-network-telemetry"})
+        call = _call(initial.json())
+        payload = _continuation(initial.json()["id"], call["call_id"], {"approved": True, "output": {"ok": True}})
+        monkeypatch.setattr(Path, "replace", fail_first_resuming_replace)
+        failed = client.post("/responses", headers=CONTINUATION_AUTH, json=payload)
+        retried = client.post("/responses", headers=CONTINUATION_AUTH, json=payload)
+
+    assert failed.status_code == 503
+    assert failed.json()["error"] == {
+        "message": "brokered response state storage unavailable",
+        "code": "brokered_response_state_storage_error",
+    }
+    assert retried.status_code == 200, retried.text
+    assert _message_text(retried.json()) == "Recovered after storage retry."
+    assert len(fake.requests) == 2
+
+
+def test_foundry_brokered_failed_final_state_persist_retries_cached_completion_without_second_resume(monkeypatch, tmp_path):
+    state_file = tmp_path / "responses-state.json"
+    spec = _spec(tool_name="check-network-telemetry")
+    fake = _FakeChatTransport(
+        [
+            _chat_response(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "model_generated_call_id",
+                            "type": "function",
+                            "function": {"name": "check-network-telemetry", "arguments": "{}"},
+                        }
+                    ],
+                }
+            ),
+            _chat_response({"role": "assistant", "content": "Persist this exact completion."}),
+            _chat_response({"role": "assistant", "content": "A duplicate resume incorrectly ran."}),
+        ]
+    )
+    app = _model_loop_app(spec, fake, response_state_file=state_file)
+    original_replace = Path.replace
+    failed_once = False
+
+    def fail_first_completed_replace(path: Path, target: Path) -> Path:
+        nonlocal failed_once
+        if not failed_once and path.name == f".{state_file.name}.tmp":
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+            stored_state = next(iter(persisted["states"].values()))
+            if stored_state["status"] == "completed":
+                failed_once = True
+                raise OSError("simulated completed state storage failure")
+        return original_replace(path, target)
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        initial = client.post("/responses", json={"input": "check-network-telemetry"})
+        call = _call(initial.json())
+        payload = _continuation(initial.json()["id"], call["call_id"], {"approved": True, "output": {"ok": True}})
+        monkeypatch.setattr(Path, "replace", fail_first_completed_replace)
+        failed = client.post("/responses", headers=CONTINUATION_AUTH, json=payload)
+        retried = client.post("/responses", headers=CONTINUATION_AUTH, json=payload)
+
+    assert failed.status_code == 503
+    assert failed.json()["error"]["code"] == "brokered_response_state_storage_error"
+    assert retried.status_code == 200, retried.text
+    assert _message_text(retried.json()) == "Persist this exact completion."
+    assert len(fake.requests) == 2
+    persisted_state = json.loads(state_file.read_text(encoding="utf-8"))["states"][initial.json()["id"]]
+    assert persisted_state["status"] == "completed"
+    assert persisted_state["finalPayload"] == retried.json()
+
+
+def test_foundry_brokered_unrelated_full_map_persist_marks_cached_completion_durable(monkeypatch, tmp_path):
+    state_file = tmp_path / "responses-state.json"
+    spec = _spec(tool_name="check-network-telemetry")
+
+    def tool_request(call_id: str) -> dict[str, Any]:
+        return _chat_response(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": "check-network-telemetry", "arguments": "{}"},
+                    }
+                ],
+            }
+        )
+
+    fake = _FakeChatTransport(
+        [
+            tool_request("model_generated_call_id"),
+            _chat_response({"role": "assistant", "content": "Persisted by an unrelated transaction."}),
+            tool_request("unrelated_call_1"),
+            tool_request("unrelated_call_2"),
+        ]
+    )
+    app = _model_loop_app(spec, fake, response_state_file=state_file, max_pending_responses=2)
+    original_replace = Path.replace
+    first_completed_write_failed = False
+    fail_next_write = False
+    second_failure_triggered = False
+
+    def fail_selected_replaces(path: Path, target: Path) -> Path:
+        nonlocal first_completed_write_failed, second_failure_triggered
+        if path.name == f".{state_file.name}.tmp":
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+            if not first_completed_write_failed and any(state["status"] == "completed" for state in persisted["states"].values()):
+                first_completed_write_failed = True
+                raise OSError("simulated completed state storage failure")
+            if fail_next_write:
+                second_failure_triggered = True
+                raise OSError("simulated later storage failure")
+        return original_replace(path, target)
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        initial = client.post("/responses", json={"input": "check-network-telemetry"})
+        call = _call(initial.json())
+        payload = _continuation(initial.json()["id"], call["call_id"], {"approved": True, "output": {"ok": True}})
+        monkeypatch.setattr(Path, "replace", fail_selected_replaces)
+        failed = client.post("/responses", headers=CONTINUATION_AUTH, json=payload)
+        unrelated = client.post("/responses", json={"input": "check-network-telemetry unrelated"})
+        durable_state = json.loads(state_file.read_text(encoding="utf-8"))["states"][initial.json()["id"]]
+        fail_next_write = True
+        retried = client.post("/responses", headers=CONTINUATION_AUTH, json=payload)
+        fail_next_write = False
+        replacement = client.post("/responses", json={"input": "check-network-telemetry replacement"})
+
+    assert failed.status_code == 503
+    assert unrelated.status_code == 200, unrelated.text
+    assert durable_state["status"] == "completed"
+    assert durable_state["finalPayload"] is not None
+    assert retried.status_code == 200, retried.text
+    assert _message_text(retried.json()) == "Persisted by an unrelated transaction."
+    assert second_failure_triggered is False
+    assert replacement.status_code == 200, replacement.text
+    assert _call(replacement.json())
+    assert len(fake.requests) == 4
+
+
+def test_foundry_brokered_recovered_storage_persists_and_evicts_cached_completion_at_capacity(monkeypatch, tmp_path):
+    state_file = tmp_path / "responses-state.json"
+    spec = _spec(tool_name="check-network-telemetry")
+    fake = _FakeChatTransport(
+        [
+            _chat_response(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "model_generated_call_id",
+                            "type": "function",
+                            "function": {"name": "check-network-telemetry", "arguments": "{}"},
+                        }
+                    ],
+                }
+            ),
+            _chat_response({"role": "assistant", "content": "Completion cached while storage failed."}),
+            _chat_response(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "replacement_model_call",
+                            "type": "function",
+                            "function": {"name": "check-network-telemetry", "arguments": "{}"},
+                        }
+                    ],
+                }
+            ),
+        ]
+    )
+    app = _model_loop_app(spec, fake, response_state_file=state_file, max_pending_responses=1)
+    original_replace = Path.replace
+    failed_once = False
+
+    def fail_first_completed_replace(path: Path, target: Path) -> Path:
+        nonlocal failed_once
+        if not failed_once and path.name == f".{state_file.name}.tmp":
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+            if any(state["status"] == "completed" for state in persisted["states"].values()):
+                failed_once = True
+                raise OSError("simulated completed state storage failure")
+        return original_replace(path, target)
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        initial = client.post("/responses", json={"input": "check-network-telemetry"})
+        call = _call(initial.json())
+        payload = _continuation(initial.json()["id"], call["call_id"], {"approved": True, "output": {"ok": True}})
+        monkeypatch.setattr(Path, "replace", fail_first_completed_replace)
+        failed = client.post("/responses", headers=CONTINUATION_AUTH, json=payload)
+        replacement = client.post("/responses", json={"input": "check-network-telemetry replacement"})
+
+    assert failed.status_code == 503
+    assert replacement.status_code == 200, replacement.text
+    replacement_body = replacement.json()
+    assert _call(replacement_body)
+    persisted_states = json.loads(state_file.read_text(encoding="utf-8"))["states"]
+    assert initial.json()["id"] not in persisted_states
+    assert replacement_body["id"] in persisted_states
+    assert len(fake.requests) == 3
 
 
 def test_foundry_brokered_file_state_recovers_unfinalized_accepted_continuation_after_restart(tmp_path):
