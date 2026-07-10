@@ -13,6 +13,7 @@ const (
 	jsonSchemaPropertiesKey = "properties"
 	brokeredSiteField       = "site"
 	brokeredSafeDescription = "safe schema"
+	benignNearMissValue     = "near miss"
 )
 
 // TestKindProbeRejectsKindlessFile is the regression guard for the AIKit
@@ -127,6 +128,65 @@ expose:
 		if !strings.Contains(msg, want) {
 			t.Errorf("validation error missing %q; full: %s", want, msg)
 		}
+	}
+}
+
+func TestValidateRejectsControlPlaneMetadataLabels(t *testing.T) {
+	reserved := []string{
+		nativeImageLabelNamespace,
+		ImageLabelNativeRuntime,
+		ImageLabelNativeName,
+		ImageLabelNativeABI,
+		nativeImageLabelNamespace + ".future-control",
+		portableImageLabelNamespace,
+		ImageLabelPortableABI,
+		ImageLabelPortableRuntime,
+		ImageLabelPortableProtocols,
+		ImageLabelPortableCapabilities,
+		portableImageLabelNamespace + ".future-control",
+		orkaImageLabelNamespace,
+		ImageLabelOrkaHarnessVersion,
+		orkaImageLabelNamespace + ".future-control",
+		ImageLabelOCITitle,
+	}
+
+	for _, label := range reserved {
+		t.Run(label, func(t *testing.T) {
+			cfg, err := NewFromBytes(agentBaseYAML(""))
+			if err != nil {
+				t.Fatalf("parse error: %v", err)
+			}
+			cfg.Metadata.Labels = map[string]string{label: "spoofed"}
+
+			verr := cfg.Validate()
+			if verr == nil {
+				t.Fatalf("expected reserved metadata label %q to be rejected", label)
+			}
+			for _, want := range []string{"metadata.labels", label, "reserved"} {
+				if !strings.Contains(verr.Error(), want) {
+					t.Errorf("validation error missing %q; full: %s", want, verr)
+				}
+			}
+		})
+	}
+}
+
+func TestValidateAllowsUnrelatedMetadataLabels(t *testing.T) {
+	cfg, err := NewFromBytes(agentBaseYAML(""))
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	cfg.Metadata.Labels = map[string]string{
+		"com.example/team":                      "agentkit",
+		"org.opencontainers.image.description":  "helpful agent",
+		nativeImageLabelNamespace + "-runtime":  benignNearMissValue,
+		portableImageLabelNamespace + "-custom": benignNearMissValue,
+		orkaImageLabelNamespace + "-tools":      benignNearMissValue,
+		"ai.example.agentkit.runtime":           "unrelated namespace",
+	}
+
+	if verr := cfg.Validate(); verr != nil {
+		t.Fatalf("unrelated metadata labels should be allowed: %v", verr)
 	}
 }
 

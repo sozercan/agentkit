@@ -14,6 +14,7 @@ import (
 )
 
 const (
+	testAgentName = "acme-support"
 	testTeamLabel = "com.example/team"
 	testTeamValue = "agentkit"
 )
@@ -21,7 +22,7 @@ const (
 func imageAgent(runtime string, port int) effective.Agent {
 	cfg := &config.AgentConfig{
 		Metadata: config.Metadata{
-			Name:   "acme-support",
+			Name:   testAgentName,
 			Labels: map[string]string{testTeamLabel: testTeamValue},
 		},
 		Runtime: runtime,
@@ -52,29 +53,63 @@ func TestNewImageConfigUsesEffectiveAgentContract(t *testing.T) {
 	if _, ok := img.Config.ExposedPorts[fmt.Sprintf("%d/tcp", utils.DefaultFoundryPort)]; !ok {
 		t.Fatalf("ExposedPorts = %#v, want Foundry default port %d", img.Config.ExposedPorts, utils.DefaultFoundryPort)
 	}
-	if got := img.Config.Labels[utils.LabelPrefix+".runtime"]; got != runtimes.MAF {
+	if got := img.Config.Labels[config.ImageLabelNativeRuntime]; got != runtimes.MAF {
 		t.Fatalf("runtime label = %q, want canonical %q", got, runtimes.MAF)
 	}
-	if got := img.Config.Labels[utils.LabelPrefix+".abi"]; got != abi.Version {
+	if got := img.Config.Labels[config.ImageLabelNativeABI]; got != abi.Version {
 		t.Fatalf("abi label = %q, want %q", got, abi.Version)
 	}
-	if got := img.Config.Labels["ai.agentkit.abi"]; got != abi.Version {
+	if got := img.Config.Labels[config.ImageLabelPortableABI]; got != abi.Version {
 		t.Fatalf("portable abi label = %q, want %q", got, abi.Version)
 	}
-	if got := img.Config.Labels["ai.agentkit.runtime"]; got != runtimes.MAF {
+	if got := img.Config.Labels[config.ImageLabelPortableRuntime]; got != runtimes.MAF {
 		t.Fatalf("portable runtime label = %q, want %q", got, runtimes.MAF)
 	}
-	if got := img.Config.Labels["ai.agentkit.protocols"]; got != "openai,foundry,orka" {
+	if got := img.Config.Labels[config.ImageLabelPortableProtocols]; got != imageProtocols {
 		t.Fatalf("protocols label = %q", got)
 	}
-	if got := img.Config.Labels["ai.orka.harness.version"]; got != "orka.harness.v1" {
+	if got := img.Config.Labels[config.ImageLabelOrkaHarnessVersion]; got != orkaHarnessVersion {
 		t.Fatalf("orka harness label = %q", got)
 	}
-	if got := img.Config.Labels["ai.agentkit.capabilities"]; !strings.Contains(got, runtimes.CapabilityOrkaHarnessV1) {
+	if got := img.Config.Labels[config.ImageLabelPortableCapabilities]; !strings.Contains(got, runtimes.CapabilityOrkaHarnessV1) {
 		t.Fatalf("capabilities label = %q, want %s", got, runtimes.CapabilityOrkaHarnessV1)
 	}
 	if got := img.Config.Labels[testTeamLabel]; got != testTeamValue {
 		t.Fatalf("custom label = %q, want %s", got, testTeamValue)
+	}
+}
+
+func TestNewImageConfigGeneratedLabelsOverrideMetadataLabels(t *testing.T) {
+	agent := imageAgent(runtimes.MAFAlias, 0)
+	runtimeSpec, ok := runtimes.RuntimeByName(agent.Runtime)
+	if !ok {
+		t.Fatalf("runtime %q is not registered", agent.Runtime)
+	}
+	expected := map[string]string{
+		config.ImageLabelNativeRuntime:        runtimes.MAF,
+		config.ImageLabelNativeName:           testAgentName,
+		config.ImageLabelNativeABI:            abi.Version,
+		config.ImageLabelPortableABI:          abi.Version,
+		config.ImageLabelPortableRuntime:      runtimes.MAF,
+		config.ImageLabelPortableProtocols:    imageProtocols,
+		config.ImageLabelPortableCapabilities: strings.Join(runtimeSpec.Capabilities, ","),
+		config.ImageLabelOrkaHarnessVersion:   orkaHarnessVersion,
+		config.ImageLabelOCITitle:             testAgentName,
+	}
+	agent.Metadata.Labels = map[string]string{testTeamLabel: testTeamValue}
+	for key := range expected {
+		agent.Metadata.Labels[key] = "user-controlled"
+	}
+
+	img := NewImageConfig(agent, &specs.Platform{Architecture: utils.PlatformAMD64})
+
+	for key, want := range expected {
+		if got := img.Config.Labels[key]; got != want {
+			t.Errorf("generated label %q = %q, want %q", key, got, want)
+		}
+	}
+	if got := img.Config.Labels[testTeamLabel]; got != testTeamValue {
+		t.Fatalf("unrelated user label = %q, want %q", got, testTeamValue)
 	}
 }
 
