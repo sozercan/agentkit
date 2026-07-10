@@ -27,6 +27,8 @@ from pathlib import Path
 __all__ = [
     "test_healthz_open",
     "test_models_listing",
+    "test_structurally_invalid_request_body_uses_openai_error",
+    "test_malformed_json_uses_secret_safe_openai_error",
     "test_stream_true_rejected",
     "test_caller_tools_rejected",
     "test_caller_tool_choice_required_rejected",
@@ -70,6 +72,57 @@ def test_models_listing(make_client, model_name):
         body = r.json()
         assert body["object"] == "list"
         assert body["data"][0]["id"] == model_name
+
+
+def test_structurally_invalid_request_body_uses_openai_error(make_client):
+    with make_client() as c:
+        r = c.post(
+            "/v1/chat/completions",
+            json={"model": "x", "messages": {"role": "user", "content": "private-value"}},
+        )
+
+    assert r.status_code == 400
+    assert r.json() == {
+        "error": {
+            "message": "request body is invalid",
+            "type": "invalid_request_error",
+            "code": "invalid_request",
+        }
+    }
+
+
+def test_malformed_json_uses_secret_safe_openai_error(make_client):
+    malformed_bodies = [
+        (
+            "sk-private-request-value",
+            '{"model":"x","messages":[{"role":"user","content":"sk-private-request-value"}',
+        ),
+        (
+            "sk-another-private-value",
+            '{"model":"x" "private":"sk-another-private-value"}',
+        ),
+    ]
+    with make_client() as c:
+        responses = [
+            c.post(
+                "/v1/chat/completions",
+                content=body,
+                headers={"Content-Type": "application/json"},
+            )
+            for _, body in malformed_bodies
+        ]
+
+    expected = {
+        "error": {
+            "message": "request body must be valid JSON",
+            "type": "invalid_request_error",
+            "code": "invalid_json",
+        }
+    }
+    for response, (secret_marker, _) in zip(responses, malformed_bodies, strict=True):
+        assert response.status_code == 400
+        assert response.json() == expected
+        assert secret_marker not in response.text
 
 
 def test_stream_true_rejected(make_client):
@@ -143,7 +196,15 @@ def test_final_message_must_be_user(make_client):
             "/v1/chat/completions",
             json={"model": "x", "messages": [{"role": "assistant", "content": "hi"}]},
         )
-        assert r.status_code == 400
+
+    assert r.status_code == 400
+    assert r.json() == {
+        "error": {
+            "message": "the final message must have role 'user'",
+            "type": "invalid_request_error",
+            "code": None,
+        }
+    }
 
 
 def test_multi_turn_history_accepted(make_client):

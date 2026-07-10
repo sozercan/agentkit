@@ -827,6 +827,20 @@ class AgentSpec(_Strict):
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
+    @field_validator("tools")
+    @classmethod
+    def _unique_tool_names(cls, value: list[ToolSpec]) -> list[ToolSpec]:
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for entry in value:
+            if entry.name in seen:
+                duplicates.append(entry.name)
+            seen.add(entry.name)
+        if duplicates:
+            names = ", ".join(sorted(set(duplicates)))
+            raise ValueError(f"duplicate tool names: {names}")
+        return value
+
     @field_validator("env")
     @classmethod
     def _unique_env_names(cls, value: list[EnvVarSpec]) -> list[EnvVarSpec]:

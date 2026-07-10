@@ -81,6 +81,18 @@ def test_load_rejects_invalid_tool_env_name(tmp_path):
     assert "[A-Z0-9_]+" in msg
 
 
+def test_load_rejects_duplicate_direct_tool_names(tmp_path):
+    msg = _invalid_message(
+        tmp_path,
+        lambda spec: spec["tools"].append(
+            {"name": "fetch", "command": ["uvx", "another-mcp-server"]}
+        ),
+    )
+    assert "tools" in msg
+    assert "duplicate tool name" in msg
+    assert "fetch" in msg
+
+
 def test_load_rejects_expose_openai_false(tmp_path):
     msg = _invalid_message(tmp_path, lambda spec: spec["expose"].update(openai=False))
     assert "expose.openai" in msg
