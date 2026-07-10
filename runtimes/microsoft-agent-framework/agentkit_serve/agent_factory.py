@@ -297,6 +297,10 @@ class MAFRuntime:
         self.agent: Agent | None = None
         self.sessions: dict[str, AgentSession] = {}
         self.session_locks: dict[str, asyncio.Lock] = {}
+        # Claims cover both lock holders and queued waiters during eviction.
+        self.session_claims: dict[str, int] = {}
+        self.initialized_sessions: set[str] = set()
+        self.most_recent_session_id: str | None = None
         self.session_cache_max = _session_cache_max()
 
     async def __aenter__(self) -> RuntimeSession:
@@ -325,37 +329,68 @@ class MAFRuntime:
     async def run(self, request: RunRequest) -> RunResult:
         if self.agent is None:
             raise AgentBuildError("MAF runtime session is not initialized")
-        session, existed, lock = self._session_for(request.session_id)
-        include_history = not (session is not None and existed)
+        session_id = request.session_id
+        session, lock = self._session_for(session_id)
         if lock is None:
-            return await run_agent(self.agent, request, session=session, include_history=include_history)
-        async with lock:
-            return await run_agent(self.agent, request, session=session, include_history=include_history)
+            return await run_agent(self.agent, request, session=session, include_history=True)
+        assert session_id
+        try:
+            async with lock:
+                self._touch_session(session_id)
+                include_history = session_id not in self.initialized_sessions
+                result = await run_agent(self.agent, request, session=session, include_history=include_history)
+                self.initialized_sessions.add(session_id)
+                return result
+        finally:
+            self._release_session_claim(session_id)
 
-    def _session_for(self, session_id: str | None) -> tuple[AgentSession | None, bool, asyncio.Lock | None]:
+    def _session_for(self, session_id: str | None) -> tuple[AgentSession | None, asyncio.Lock | None]:
         if not session_id:
-            return None, False, None
-        session = self.sessions.pop(session_id, None)
-        lock = self.session_locks.pop(session_id, None)
-        existed = session is not None
+            return None, None
+        session = self.sessions.get(session_id)
+        lock = self.session_locks.get(session_id)
         if session is None:
             session = AgentSession(session_id=session_id)
+            self.sessions[session_id] = session
+            self.initialized_sessions.discard(session_id)
         if lock is None:
             lock = asyncio.Lock()
+            self.session_locks[session_id] = lock
+        self.session_claims[session_id] = self.session_claims.get(session_id, 0) + 1
+        self._evict_idle_sessions()
+        return session, lock
+
+    def _touch_session(self, session_id: str) -> None:
+        session = self.sessions.pop(session_id)
+        lock = self.session_locks.pop(session_id)
         self.sessions[session_id] = session
         self.session_locks[session_id] = lock
+        self.most_recent_session_id = session_id
         self._evict_idle_sessions()
-        return session, existed, lock
+
+    def _release_session_claim(self, session_id: str) -> None:
+        claims = self.session_claims.get(session_id, 0)
+        if claims <= 1:
+            self.session_claims.pop(session_id, None)
+            self._evict_idle_sessions()
+        else:
+            self.session_claims[session_id] = claims - 1
 
     def _evict_idle_sessions(self) -> None:
         for session_id in list(self.sessions):
             if len(self.sessions) <= self.session_cache_max:
                 return
+            if session_id == self.most_recent_session_id:
+                continue
+            if self.session_claims.get(session_id, 0) > 0:
+                continue
             lock = self.session_locks.get(session_id)
             if lock is not None and lock.locked():
                 continue
             self.sessions.pop(session_id, None)
             self.session_locks.pop(session_id, None)
+            self.session_claims.pop(session_id, None)
+            self.initialized_sessions.discard(session_id)
 
     async def _build_context_providers(self):
         providers = []
