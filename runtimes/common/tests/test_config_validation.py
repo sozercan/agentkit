@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from copy import deepcopy
 
 import pytest
@@ -865,6 +866,42 @@ def test_load_rejects_owned_and_brokered_tool_name_overlap(tmp_path):
         ),
     )
     assert "tools and brokeredTools cannot be mixed" in msg
+
+
+def test_load_preserves_negative_zero_for_brokered_schema_digest(tmp_path):
+    from agentkit_serve_common.config import brokered_tool_schema_digest
+
+    parameters = {
+        "type": "object",
+        "properties": {"n": {"type": "number", "minimum": -0.0}},
+    }
+    digest = brokered_tool_schema_digest(
+        name="negative-zero-tool",
+        description="Negative zero schema.",
+        brokered_class="read",
+        parameters=parameters,
+    )
+    spec_dict = deepcopy(_BASE_SPEC)
+    spec_dict.update(
+        tools=[],
+        brokeredTools=[
+            {
+                "name": "negative-zero-tool",
+                "description": "Negative zero schema.",
+                "brokeredClass": "read",
+                "parameters": parameters,
+                "schemaDigest": digest,
+            }
+        ],
+    )
+
+    spec = load(_write_spec(tmp_path, spec_dict))
+
+    minimum = spec.brokered_tools[0].parameters["properties"]["n"]["minimum"]
+    assert isinstance(minimum, float)
+    assert minimum == 0.0
+    assert math.copysign(1.0, minimum) == -1.0
+    assert spec.brokered_tools[0].schema_digest == digest
 
 
 def test_brokered_tool_schema_digest_uses_utf8_canonical_json():

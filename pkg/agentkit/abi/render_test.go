@@ -2,6 +2,7 @@ package abi
 
 import (
 	"encoding/json"
+	"math"
 	"os"
 	"strings"
 	"testing"
@@ -20,8 +21,11 @@ const (
 )
 
 const (
-	jsonSchemaTypeKey    = "type"
-	jsonSchemaMinimumKey = "minimum"
+	jsonSchemaTypeKey       = "type"
+	jsonSchemaObject        = "object"
+	jsonSchemaNumber        = "number"
+	jsonSchemaPropertiesKey = "properties"
+	jsonSchemaMinimumKey    = "minimum"
 )
 
 func sampleConfig() *config.AgentConfig {
@@ -260,8 +264,8 @@ func TestRenderAgentYAMLIncludesBrokeredTools(t *testing.T) {
 		Description:   "Read telemetry.",
 		BrokeredClass: config.BrokeredClassRead,
 		Parameters: map[string]any{
-			jsonSchemaTypeKey: "object",
-			"properties": map[string]any{
+			jsonSchemaTypeKey: jsonSchemaObject,
+			jsonSchemaPropertiesKey: map[string]any{
 				"site":        map[string]any{jsonSchemaTypeKey: "string", jsonSchemaMinimumKey: 0.000001},
 				"typedFloats": map[string]float64{jsonSchemaMinimumKey: 0.000001},
 				"empty":       map[string]any{},
@@ -293,9 +297,9 @@ func TestRenderAgentYAMLFormatsJSONNumberBrokeredSchemaValuesAsNumbers(t *testin
 		Description:   "Read numeric data.",
 		BrokeredClass: config.BrokeredClassRead,
 		Parameters: map[string]any{
-			jsonSchemaTypeKey: "object",
-			"properties": map[string]any{
-				"small": map[string]any{jsonSchemaTypeKey: "number", jsonSchemaMinimumKey: json.Number("1e-7")},
+			jsonSchemaTypeKey: jsonSchemaObject,
+			jsonSchemaPropertiesKey: map[string]any{
+				"small": map[string]any{jsonSchemaTypeKey: jsonSchemaNumber, jsonSchemaMinimumKey: json.Number("1e-7")},
 			},
 		},
 	}}
@@ -306,5 +310,95 @@ func TestRenderAgentYAMLFormatsJSONNumberBrokeredSchemaValuesAsNumbers(t *testin
 	}
 	if !strings.Contains(string(out), "minimum: 0.0000001") || strings.Contains(string(out), "1e-7") {
 		t.Fatalf("rendered agent.yaml did not preserve json.Number as fixed YAML number\n---\n%s", out)
+	}
+}
+
+func TestRenderAgentYAMLEdgeCasesMatchCrossLanguageGolden(t *testing.T) {
+	const (
+		lineBreakText = "NEL:\u0085LS:\u2028PS:\u2029end"
+		propertyName  = "line:\u2028break"
+	)
+
+	tool := config.BrokeredTool{
+		Name:          "unicode-numeric-tool",
+		Description:   "description " + lineBreakText,
+		BrokeredClass: config.BrokeredClassRead,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey: jsonSchemaObject,
+			"description":     "schema " + lineBreakText,
+			jsonSchemaPropertiesKey: map[string]any{
+				propertyName: map[string]any{
+					jsonSchemaTypeKey:    "number",
+					"description":        "property " + lineBreakText,
+					jsonSchemaMinimumKey: math.Copysign(0, -1),
+				},
+			},
+			"required": []any{propertyName},
+		},
+	}
+	digest, err := config.BrokeredToolSchemaDigest(tool)
+	if err != nil {
+		t.Fatalf("schema digest: %v", err)
+	}
+	tool.SchemaDigest = digest
+
+	cfg := sampleConfig()
+	cfg.Tools = nil
+	cfg.Model.APIKeyEnv = ""
+	cfg.Instructions = config.Source{Inline: "instructions " + lineBreakText}
+	cfg.BrokeredTools = []config.BrokeredTool{tool}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("edge-case config should pass Go validation: %v", err)
+	}
+
+	out, err := Render(effective.FromConfig(cfg, cfg.Instructions.Inline))
+	if err != nil {
+		t.Fatalf("render error: %v", err)
+	}
+	want, err := os.ReadFile("testdata/edge-cases.yaml")
+	if err != nil {
+		t.Fatalf("read edge-case golden: %v", err)
+	}
+	if string(out) != string(want) {
+		t.Fatalf("rendered edge-case agent.yaml drifted from cross-language golden\n--- got ---\n%s\n--- want ---\n%s", out, want)
+	}
+}
+
+func TestRenderAgentYAMLDoesNotTreatUnderflowingJSONNumberAsNegativeZero(t *testing.T) {
+	cfg := sampleConfig()
+	cfg.Tools = nil
+	cfg.Instructions = config.Source{Inline: testInstructions}
+	cfg.BrokeredTools = []config.BrokeredTool{{
+		Name:          "tiny-number-tool",
+		Description:   "Read tiny numeric data.",
+		BrokeredClass: config.BrokeredClassRead,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey: jsonSchemaObject,
+			jsonSchemaPropertiesKey: map[string]any{
+				"tiny": map[string]any{jsonSchemaTypeKey: jsonSchemaNumber, jsonSchemaMinimumKey: json.Number("-1e-350")},
+				"zero": map[string]any{jsonSchemaTypeKey: jsonSchemaNumber, jsonSchemaMinimumKey: json.Number("-0e-350")},
+			},
+		},
+	}}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("tiny nonzero json.Number should pass Go validation: %v", err)
+	}
+
+	out, err := Render(effective.FromConfig(cfg, testInstructions))
+	if err != nil {
+		t.Fatalf("render error: %v", err)
+	}
+	want := "minimum: -0." + strings.Repeat("0", 349) + "1"
+	if !strings.Contains(string(out), want) {
+		t.Fatalf("rendered agent.yaml collapsed a nonzero json.Number to negative zero\n---\n%s", out)
+	}
+	negativeZeroLines := 0
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.TrimSpace(line) == "minimum: -0.0" {
+			negativeZeroLines++
+		}
+	}
+	if negativeZeroLines != 1 {
+		t.Fatalf("rendered agent.yaml must preserve only the lexical negative zero, got %d exact lines\n---\n%s", negativeZeroLines, out)
 	}
 }

@@ -1,0 +1,27 @@
+abiVersion: v0
+metadata:
+  name: acme-support
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: "instructions NEL:\u0085LS:\u2028PS:\u2029end"
+tools: []
+brokeredTools:
+- name: unicode-numeric-tool
+  description: "description NEL:\u0085LS:\u2028PS:\u2029end"
+  brokeredClass: read
+  parameters:
+    description: "schema NEL:\u0085LS:\u2028PS:\u2029end"
+    properties:
+      "line:\u2028break":
+        description: "property NEL:\u0085LS:\u2028PS:\u2029end"
+        minimum: -0.0
+        type: number
+    required:
+    - "line:\u2028break"
+    type: object
+  schemaDigest: sha256:c11250fadb3b86c3bdd4ced8fc9741b4fa1295b88f9faadefb56c64bbb986e2f
+expose:
+  openai: true
+  port: 8080

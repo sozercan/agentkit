@@ -4,6 +4,7 @@ package abi
 
 import (
 	"encoding/json"
+	"math"
 	"strconv"
 	"strings"
 
@@ -27,6 +28,21 @@ type yamlNumber string
 
 func (n yamlNumber) MarshalYAML() ([]byte, error) {
 	return []byte(n), nil
+}
+
+// yamlQuotedString forces YAML double-quoted escaping for code points that YAML
+// treats as line breaks but goccy/go-yaml otherwise emits raw in plain scalars.
+type yamlQuotedString string
+
+func (s yamlQuotedString) MarshalYAML() ([]byte, error) {
+	return []byte(strconv.Quote(string(s))), nil
+}
+
+func yamlStringValue(value string) any {
+	if strings.ContainsAny(value, "\u0085\u2028\u2029") {
+		return yamlQuotedString(value)
+	}
+	return value
 }
 
 type abiMetadata struct {
@@ -66,11 +82,11 @@ type abiTool struct {
 }
 
 type abiBrokeredTool struct {
-	Name          string         `yaml:"name"`
-	Description   string         `yaml:"description"`
-	BrokeredClass string         `yaml:"brokeredClass"`
-	Parameters    map[string]any `yaml:"parameters"`
-	SchemaDigest  string         `yaml:"schemaDigest,omitempty"`
+	Name          string `yaml:"name"`
+	Description   any    `yaml:"description"`
+	BrokeredClass string `yaml:"brokeredClass"`
+	Parameters    any    `yaml:"parameters"`
+	SchemaDigest  string `yaml:"schemaDigest,omitempty"`
 }
 
 type abiEnvVar struct {
@@ -113,7 +129,7 @@ type abiAgent struct {
 	ABIVersion    string            `yaml:"abiVersion"`
 	Metadata      abiMetadata       `yaml:"metadata"`
 	Model         abiModel          `yaml:"model"`
-	Instructions  string            `yaml:"instructions"`
+	Instructions  any               `yaml:"instructions"`
 	Tools         []abiTool         `yaml:"tools"`
 	BrokeredTools []abiBrokeredTool `yaml:"brokeredTools,omitempty"`
 	Env           []abiEnvVar       `yaml:"env,omitempty"`
@@ -169,45 +185,71 @@ func expandJSONNumber(value string) string {
 	return sign + out
 }
 
-func copyMap(in map[string]any) map[string]any {
+func yamlFloat(value float64, bitSize int) yamlNumber {
+	if value == 0 && math.Signbit(value) {
+		return yamlNumber("-0.0")
+	}
+	return yamlNumber(strconv.FormatFloat(value, 'f', -1, bitSize))
+}
+
+func isNegativeJSONZero(value string) bool {
+	if !strings.HasPrefix(value, "-") {
+		return false
+	}
+	coefficient := value[1:]
+	if exponent := strings.IndexAny(coefficient, "eE"); exponent >= 0 {
+		coefficient = coefficient[:exponent]
+	}
+	sawZero := false
+	for _, char := range coefficient {
+		switch char {
+		case '0':
+			sawZero = true
+		case '.':
+		default:
+			return false
+		}
+	}
+	return sawZero
+}
+
+func yamlJSONNumber(value json.Number) yamlNumber {
+	raw := value.String()
+	if isNegativeJSONZero(raw) {
+		return yamlNumber("-0.0")
+	}
+	return yamlNumber(expandJSONNumber(raw))
+}
+
+func copyStringKeyedMap[T any](in map[string]T) map[any]any {
 	if in == nil {
 		return nil
 	}
-	out := make(map[string]any, len(in))
-	for k, v := range in {
-		out[k] = copyAny(v)
+	out := make(map[any]any, len(in))
+	for key, value := range in {
+		out[yamlStringValue(key)] = copyAny(value)
 	}
 	return out
 }
 
+func copyMap(in map[string]any) map[any]any {
+	return copyStringKeyedMap(in)
+}
+
 func copyAny(v any) any {
 	switch typed := v.(type) {
+	case string:
+		return yamlStringValue(typed)
 	case map[string]any:
 		return copyMap(typed)
 	case map[string]string:
-		out := make(map[string]string, len(typed))
-		for key, value := range typed {
-			out[key] = value
-		}
-		return out
+		return copyStringKeyedMap(typed)
 	case map[string]int:
-		out := make(map[string]int, len(typed))
-		for key, value := range typed {
-			out[key] = value
-		}
-		return out
+		return copyStringKeyedMap(typed)
 	case map[string]float64:
-		out := make(map[string]any, len(typed))
-		for key, value := range typed {
-			out[key] = yamlNumber(strconv.FormatFloat(value, 'f', -1, 64))
-		}
-		return out
+		return copyStringKeyedMap(typed)
 	case map[string]bool:
-		out := make(map[string]bool, len(typed))
-		for key, value := range typed {
-			out[key] = value
-		}
-		return out
+		return copyStringKeyedMap(typed)
 	case []any:
 		out := make([]any, len(typed))
 		for i, item := range typed {
@@ -215,23 +257,27 @@ func copyAny(v any) any {
 		}
 		return out
 	case []string:
-		return append([]string(nil), typed...)
+		out := make([]any, len(typed))
+		for i, item := range typed {
+			out[i] = yamlStringValue(item)
+		}
+		return out
 	case []int:
 		return append([]int(nil), typed...)
 	case []float64:
 		out := make([]any, len(typed))
 		for i, item := range typed {
-			out[i] = yamlNumber(strconv.FormatFloat(item, 'f', -1, 64))
+			out[i] = yamlFloat(item, 64)
 		}
 		return out
 	case []bool:
 		return append([]bool(nil), typed...)
 	case float32:
-		return yamlNumber(strconv.FormatFloat(float64(typed), 'f', -1, 32))
+		return yamlFloat(float64(typed), 32)
 	case float64:
-		return yamlNumber(strconv.FormatFloat(typed, 'f', -1, 64))
+		return yamlFloat(typed, 64)
 	case json.Number:
-		return yamlNumber(expandJSONNumber(typed.String()))
+		return yamlJSONNumber(typed)
 	default:
 		return typed
 	}
@@ -249,7 +295,7 @@ func Render(agent effective.Agent) ([]byte, error) {
 			Name:      agent.Model.Name,
 			APIKeyEnv: agent.Model.APIKeyEnv,
 		},
-		Instructions: agent.Instructions,
+		Instructions: yamlStringValue(agent.Instructions),
 		Tools:        make([]abiTool, 0, len(agent.Tools)),
 		Env:          make([]abiEnvVar, 0, len(agent.Env)),
 		Expose:       abiExpose{OpenAI: agent.Expose.OpenAI, Port: agent.Expose.Port},
@@ -282,7 +328,7 @@ func Render(agent effective.Agent) ([]byte, error) {
 	for _, t := range agent.BrokeredTools {
 		out.BrokeredTools = append(out.BrokeredTools, abiBrokeredTool{
 			Name:          t.Name,
-			Description:   t.Description,
+			Description:   yamlStringValue(t.Description),
 			BrokeredClass: t.BrokeredClass,
 			Parameters:    copyMap(t.Parameters),
 			SchemaDigest:  t.SchemaDigest,

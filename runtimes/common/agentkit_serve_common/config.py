@@ -161,6 +161,22 @@ def _canonical_number(value: int | float) -> str:
     return out
 
 
+def _canonical_json_string(value: str) -> str:
+    # Go's encoding/json always escapes these two JSON-compatible line separators,
+    # even with HTML escaping disabled. Match the Go digest writer exactly.
+    return (
+        json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
+def _parse_canonical_json_int(token: str) -> int | float:
+    # json.loads normally collapses JSON -0 to integer 0, losing the sign that
+    # participates in the Go writer's canonical digest.
+    return -0.0 if token == "-0" else int(token)
+
+
 def _canonical_json(value: Any) -> str:
     """Return a deterministic JSON representation for digests and drift checks."""
 
@@ -171,7 +187,7 @@ def _canonical_json(value: Any) -> str:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return _canonical_number(value)
     if isinstance(value, str):
-        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        return _canonical_json_string(value)
     if isinstance(value, list):
         return "[" + ",".join(_canonical_json(item) for item in value) + "]"
     if isinstance(value, Mapping):
@@ -179,7 +195,7 @@ def _canonical_json(value: Any) -> str:
         for key in sorted(value):
             if not isinstance(key, str):
                 raise TypeError("JSON object keys must be strings")
-            parts.append(json.dumps(key, ensure_ascii=False, separators=(",", ":")) + ":" + _canonical_json(value[key]))
+            parts.append(_canonical_json_string(key) + ":" + _canonical_json(value[key]))
         return "{" + ",".join(parts) + "}"
     raise TypeError(f"unsupported JSON value {type(value).__name__}")
 
@@ -707,7 +723,10 @@ class BrokeredToolSpec(_Strict):
             raise ValueError("brokered tool parameters must be JSON serializable") from exc
         if len(encoded.encode("utf-8")) > _MAX_BROKERED_SCHEMA_BYTES:
             raise ValueError("brokered tool parameters schema is too large")
-        cloned = json.loads(encoded)
+        cloned = json.loads(
+            encoded,
+            parse_int=_parse_canonical_json_int,
+        )
         if cloned.get("type") != "object":
             raise ValueError("brokered tool parameters schema must set type: object")
         _validate_json_schema_subset(cloned, path="brokeredTools[].parameters")
