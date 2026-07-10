@@ -14,9 +14,10 @@ import (
 // RouteHandler builds a result for a resolved <runtime>/<outputkind> route.
 type RouteHandler func(ctx context.Context, c client.Client, cfg *config.AgentConfig, rc *RuntimeConfig) (*client.Result, error)
 
-// Route is one entry in the flat router (plan §7.1). Output kinds are
-// re-packagings of the one agent layer, so v0 has a single handler (image);
-// adding agentpack/compose later is a new route, not a Build() rewrite.
+type contextRouteHandler func(ctx context.Context, c client.Client, cfg *config.AgentConfig, rc *RuntimeConfig, reader contextFileReader) (*client.Result, error)
+
+// Route is one entry in the flat router (plan §7.1). Keep this as the original
+// single-field public layout: downstream packages may use unkeyed Route literals.
 type Route struct {
 	Handler RouteHandler
 }
@@ -46,14 +47,19 @@ func (rc *RuntimeConfig) AdapterRef(opts map[string]string) string {
 // runtime name to its config. Both are DERIVED in init() from runtimes.Runtimes
 // (the single source of truth) — dispatch as data.
 var (
-	routes         = map[string]Route{}
-	runtimeConfigs = map[string]*RuntimeConfig{}
+	routes = map[string]Route{}
+	// Keep request-scoped context dispatch outside the exported Route value so
+	// its historical one-field unkeyed literals remain source-compatible.
+	contextRouteHandlers = map[string]contextRouteHandler{}
+	runtimeConfigs       = map[string]*RuntimeConfig{}
 )
 
 // registerRuntime wires a runtime adapter and its image output route.
 func registerRuntime(rc *RuntimeConfig) {
 	runtimeConfigs[rc.Name] = rc
-	routes[rc.Name+"/"+utils.OutputKindImage] = Route{Handler: HandleAgent}
+	key := rc.Name + "/" + utils.OutputKindImage
+	routes[key] = Route{Handler: HandleAgent}
+	contextRouteHandlers[key] = handleAgent
 }
 
 func init() {
