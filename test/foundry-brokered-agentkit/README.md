@@ -9,7 +9,8 @@ agentkit-foundry-brokered --config /agent/agent.yaml --host 0.0.0.0 --port 8088
 ```
 
 Set `AGENTKIT_FOUNDRY_BROKERED_CONTINUATION_PROOF` at runtime so transcript
-validation can exercise the Orka-only continuation proof header. For real
+validation can exercise the Orka-only continuation proof. AgentKit accepts the
+proof from the compatibility header or top-level JSON body field. For real
 deployments, inject this value from runtime configuration or a secret.
 
 Build and validate locally:
