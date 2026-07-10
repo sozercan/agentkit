@@ -28,6 +28,7 @@ from agent_framework import (
 from agent_framework.openai import OpenAIChatCompletionClient
 from agentkit_serve_common.adapter_support import (
     FORWARDED_ROLES,
+    AsyncExitStackLifecycle,
     AgentBuildError,
     declared_tool_env,
     normalize_agent_run_error,
@@ -57,17 +58,18 @@ _CONTEXT_SOURCE_FILESYSTEM = "filesystem"
 _CONTEXT_SOURCE_MCP = "mcp"
 _DEFAULT_SEARCH_AUDIENCE = "https://search.azure.com/.default"
 _DEFAULT_FOUNDRY_AUDIENCE = "https://ai.azure.com/.default"
+_DEFAULT_MCP_REQUEST_TIMEOUT = 120
 _DEFAULT_SESSION_CACHE_MAX = 256
 
 
-def _mcp_request_timeout() -> int | None:
+def _mcp_request_timeout() -> int:
     """MCP request timeout (seconds), overridable via ``AGENTKIT_MCP_TIMEOUT``."""
-    return positive_int_env(default=None)
+    return positive_int_env(default=_DEFAULT_MCP_REQUEST_TIMEOUT) or _DEFAULT_MCP_REQUEST_TIMEOUT
 
 
 def _remote_mcp_timeout() -> float:
-    """Bound network-backed MCP calls even when stdio timeout is left uncapped."""
-    return float(_mcp_request_timeout() or 120)
+    """Use the shared bounded MCP timeout for network-backed calls."""
+    return float(_mcp_request_timeout())
 
 
 def _resolve_api_key(spec: AgentSpec) -> str:
@@ -272,8 +274,7 @@ def build_tool(tool: ToolSpec):
         "env": declared_tool_env(tool),
         "tool_name_prefix": tool.name,
     }
-    if timeout is not None:
-        kwargs["request_timeout"] = timeout
+    kwargs["request_timeout"] = timeout
     return MCPStdioTool(**kwargs)
 
 
@@ -294,6 +295,7 @@ class MAFRuntime:
     def __init__(self, spec: AgentSpec) -> None:
         self.spec = spec
         self.stack = AsyncExitStack()
+        self.lifecycle = AsyncExitStackLifecycle(self.stack)
         self.agent: Agent | None = None
         self.sessions: dict[str, AgentSession] = {}
         self.session_locks: dict[str, asyncio.Lock] = {}
@@ -304,13 +306,19 @@ class MAFRuntime:
         self.session_cache_max = _session_cache_max()
 
     async def __aenter__(self) -> RuntimeSession:
-        try:
+        async def start() -> RuntimeSession:
             context_providers = await self._build_context_providers()
             self.agent = build_agent(self.spec, context_providers=context_providers)
+            # Register before entering so a partially failed Agent.__aenter__ still
+            # unwinds the Agent's own internal AsyncExitStack.
+            self.stack.push_async_exit(self.agent)
             await self.agent.__aenter__()
             return self
-        except Exception:
-            await self.stack.aclose()
+
+        try:
+            return await self.lifecycle.enter(start)
+        except BaseException:
+            self.agent = None
             raise
 
     async def __aexit__(
@@ -319,12 +327,10 @@ class MAFRuntime:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> bool | None:
-        agent_result = None
-        if self.agent is not None:
-            agent_result = await self.agent.__aexit__(exc_type, exc, tb)
+        try:
+            return await self.lifecycle.exit(exc_type, exc, tb)
+        finally:
             self.agent = None
-        await self.stack.aclose()
-        return agent_result
 
     async def run(self, request: RunRequest) -> RunResult:
         if self.agent is None:
