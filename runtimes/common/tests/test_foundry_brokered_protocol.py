@@ -886,6 +886,92 @@ def test_foundry_brokered_file_state_survives_restart_for_deterministic_continua
     assert duplicate.json() == final.json()
 
 
+def test_foundry_brokered_rejects_caller_session_conflicts_with_trusted_gateway_header(monkeypatch):
+    monkeypatch.delenv("FOUNDRY_AGENT_SESSION_ID", raising=False)
+    app = _app()
+
+    with TestClient(app) as client:
+        body_conflict = client.post(
+            "/responses",
+            headers={"x-agent-session-id": "trusted-session"},
+            json={"input": "please read telemetry", "agent_session_id": "caller-session"},
+        )
+        query_conflict = client.post(
+            "/responses?session_id=caller-session",
+            headers={"x-agent-session-id": "trusted-session"},
+            json={"input": "please read telemetry"},
+        )
+
+    for response in (body_conflict, query_conflict):
+        assert response.status_code == 409
+        assert response.json()["error"]["code"] == "response_session_mismatch"
+
+
+def test_foundry_brokered_rejects_session_conflicts_with_hosted_environment(monkeypatch):
+    monkeypatch.setenv("FOUNDRY_AGENT_SESSION_ID", "hosted-session")
+    app = _app()
+
+    with TestClient(app) as client:
+        gateway_conflict = client.post(
+            "/responses",
+            headers={"x-agent-session-id": "other-session"},
+            json={"input": "please read telemetry"},
+        )
+        caller_conflict = client.post(
+            "/responses",
+            json={"input": "please read telemetry", "agent_session_id": "other-session"},
+        )
+        matching = client.post(
+            "/responses?session_id=hosted-session",
+            headers={"x-agent-session-id": "hosted-session"},
+            json={"input": "please read telemetry", "agent_session_id": "hosted-session"},
+        )
+
+    for response in (gateway_conflict, caller_conflict):
+        assert response.status_code == 409
+        assert response.json()["error"]["code"] == "response_session_mismatch"
+    assert matching.status_code == 200, matching.text
+
+
+def test_foundry_brokered_trusted_gateway_session_accepts_matching_local_compatibility(monkeypatch, tmp_path):
+    state_file = tmp_path / "foundry-trusted-session-state.json"
+    monkeypatch.delenv("FOUNDRY_AGENT_SESSION_ID", raising=False)
+
+    with TestClient(_app(response_state_file=state_file)) as client:
+        response = client.post(
+            "/responses?session_id=gateway-session",
+            headers={
+                "x-agent-session-id": "gateway-session",
+                "x-agentkit-session-id": "gateway-session",
+            },
+            json={"input": "please read telemetry", "agent_session_id": "gateway-session"},
+        )
+
+    assert response.status_code == 200, response.text
+    stored = json.loads(state_file.read_text(encoding="utf-8"))["states"][response.json()["id"]]
+    assert stored["sessionID"] == "gateway-session"
+
+
+def test_foundry_brokered_preserves_local_session_fallback_precedence_without_trusted_identity(monkeypatch, tmp_path):
+    state_file = tmp_path / "foundry-local-session-state.json"
+    monkeypatch.delenv("FOUNDRY_AGENT_SESSION_ID", raising=False)
+
+    with TestClient(_app(response_state_file=state_file)) as client:
+        response = client.post(
+            "/responses?agent_session_id=query-session",
+            headers={"x-agentkit-session-id": "legacy-header-session"},
+            json={
+                "input": "please read telemetry",
+                "agent_session_id": "body-session",
+                "session_id": "legacy-body-session",
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    stored = json.loads(state_file.read_text(encoding="utf-8"))["states"][response.json()["id"]]
+    assert stored["sessionID"] == "body-session"
+
+
 def test_foundry_brokered_file_state_tracks_session_and_rejects_cross_session_continuation(monkeypatch, tmp_path):
     state_file = tmp_path / "foundry-session-state.json"
     monkeypatch.delenv("FOUNDRY_AGENT_SESSION_ID", raising=False)
@@ -1142,6 +1228,265 @@ def _chat_response(message: dict[str, Any], *, prompt_tokens: int = 1, completio
 def _model_loop_app(spec: AgentSpec, fake: _FakeChatTransport, **kwargs: Any):
     client = httpx.AsyncClient(transport=httpx.MockTransport(fake.handler))
     return _app(spec, brokered_model_loop_enabled=True, brokered_model_http_client=client, **kwargs)
+
+
+def test_foundry_brokered_max_pending_reserves_capacity_before_initial_model_work():
+    spec = _spec(tool_name="check-network-telemetry")
+
+    class BlockingInitialTransport(httpx.AsyncBaseTransport):
+        def __init__(self) -> None:
+            self.requests: list[dict[str, Any]] = []
+            self.first_started = threading.Event()
+            self.release_first = threading.Event()
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            self.requests.append(json.loads(request.content.decode("utf-8")))
+            if len(self.requests) == 1:
+                self.first_started.set()
+                while not self.release_first.is_set():
+                    await asyncio.sleep(0.001)
+            return httpx.Response(
+                200,
+                request=request,
+                json=_chat_response(
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": f"model_call_{len(self.requests)}",
+                                "type": "function",
+                                "function": {"name": "check-network-telemetry", "arguments": "{}"},
+                            }
+                        ],
+                    }
+                ),
+            )
+
+    transport = BlockingInitialTransport()
+    app = _app(
+        spec,
+        brokered_model_loop_enabled=True,
+        brokered_model_http_client=httpx.AsyncClient(transport=transport),
+        max_pending_responses=1,
+    )
+
+    with TestClient(app) as client, ThreadPoolExecutor(max_workers=1) as executor:
+        first_future = executor.submit(client.post, "/responses", json={"input": "check-network-telemetry"})
+        try:
+            assert transport.first_started.wait(timeout=2)
+            excess = client.post("/responses", json={"input": "check-network-telemetry again"})
+        finally:
+            transport.release_first.set()
+        first = first_future.result(timeout=2)
+
+    assert first.status_code == 200, first.text
+    assert excess.status_code == 429
+    assert excess.json()["error"]["code"] == "brokered_response_state_full"
+    assert len(transport.requests) == 1
+
+
+def test_foundry_brokered_initial_model_reservation_releases_for_final_and_error_paths():
+    spec = _spec(tool_name="check-network-telemetry")
+    fake = _FakeChatTransport(
+        [
+            _chat_response({"role": "assistant", "content": "No tool needed."}),
+            _chat_response(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "unknown_call",
+                            "type": "function",
+                            "function": {"name": "unknown-tool", "arguments": "{}"},
+                        }
+                    ],
+                }
+            ),
+            _chat_response(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "valid_call",
+                            "type": "function",
+                            "function": {"name": "check-network-telemetry", "arguments": "{}"},
+                        }
+                    ],
+                }
+            ),
+        ]
+    )
+    app = _model_loop_app(spec, fake, max_pending_responses=1)
+
+    with TestClient(app) as client:
+        final = client.post("/responses", json={"input": "say hello"})
+        invalid = client.post("/responses", json={"input": "request an unknown tool"})
+        pending = client.post("/responses", json={"input": "check-network-telemetry"})
+
+    assert final.status_code == 200, final.text
+    assert _message_text(final.json()) == "No tool needed."
+    assert invalid.status_code == 400
+    assert invalid.json()["error"]["code"] == "unknown_brokered_tool"
+    assert pending.status_code == 200, pending.text
+    assert _call(pending.json())["name"] == "check-network-telemetry"
+    assert len(fake.requests) == 3
+
+
+def test_foundry_brokered_final_model_result_does_not_evict_completed_replay_state():
+    spec = _spec(tool_name="check-network-telemetry")
+    fake = _FakeChatTransport(
+        [
+            _chat_response(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "initial_tool_call",
+                            "type": "function",
+                            "function": {"name": "check-network-telemetry", "arguments": "{}"},
+                        }
+                    ],
+                }
+            ),
+            _chat_response({"role": "assistant", "content": "Stored completion."}),
+            _chat_response({"role": "assistant", "content": "No pending state needed."}),
+        ]
+    )
+    app = _model_loop_app(spec, fake, max_pending_responses=1)
+
+    with TestClient(app) as client:
+        initial = client.post("/responses", json={"input": "check-network-telemetry"})
+        call = _call(initial.json())
+        continuation = _continuation(initial.json()["id"], call["call_id"], {"approved": True, "output": {"ok": True}})
+        completed = client.post("/responses", headers=CONTINUATION_AUTH, json=continuation)
+        final_only = client.post("/responses", json={"input": "say hello without a tool"})
+        replay = client.post("/responses", headers=CONTINUATION_AUTH, json=continuation)
+
+    assert completed.status_code == 200, completed.text
+    assert final_only.status_code == 200, final_only.text
+    assert _message_text(final_only.json()) == "No pending state needed."
+    assert replay.status_code == 200, replay.text
+    assert replay.json() == completed.json()
+
+
+def test_foundry_brokered_initial_model_reservation_releases_after_state_persist_failure(monkeypatch, tmp_path):
+    state_file = tmp_path / "model-loop-responses-state.json"
+    spec = _spec(tool_name="check-network-telemetry")
+    fake = _FakeChatTransport(
+        [
+            _chat_response(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "first_call",
+                            "type": "function",
+                            "function": {"name": "check-network-telemetry", "arguments": "{}"},
+                        }
+                    ],
+                }
+            ),
+            _chat_response(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "retry_call",
+                            "type": "function",
+                            "function": {"name": "check-network-telemetry", "arguments": "{}"},
+                        }
+                    ],
+                }
+            ),
+        ]
+    )
+    app = _model_loop_app(
+        spec,
+        fake,
+        response_state_file=state_file,
+        max_pending_responses=1,
+    )
+    original_replace = Path.replace
+    failed_once = False
+
+    def fail_first_replace(path: Path, target: Path) -> Path:
+        nonlocal failed_once
+        if not failed_once and path.name == f".{state_file.name}.tmp":
+            failed_once = True
+            raise OSError("simulated model-loop state storage failure")
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", fail_first_replace)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        failed = client.post("/responses", json={"input": "check-network-telemetry"})
+        retried = client.post("/responses", json={"input": "check-network-telemetry"})
+
+    assert failed.status_code == 503
+    assert failed.json()["error"]["code"] == "brokered_response_state_storage_error"
+    assert retried.status_code == 200, retried.text
+    assert _call(retried.json())["name"] == "check-network-telemetry"
+    assert len(fake.requests) == 2
+
+
+def test_foundry_brokered_cancelled_initial_model_work_releases_reserved_capacity():
+    spec = _spec(tool_name="check-network-telemetry")
+
+    class CancellingInitialTransport(httpx.AsyncBaseTransport):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            self.calls += 1
+            if self.calls == 1:
+                raise asyncio.CancelledError
+            return httpx.Response(
+                200,
+                request=request,
+                json=_chat_response(
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "model_call_after_cancellation",
+                                "type": "function",
+                                "function": {"name": "check-network-telemetry", "arguments": "{}"},
+                            }
+                        ],
+                    }
+                ),
+            )
+
+    transport = CancellingInitialTransport()
+    app = _app(
+        spec,
+        brokered_model_loop_enabled=True,
+        brokered_model_http_client=httpx.AsyncClient(transport=transport),
+        max_pending_responses=1,
+    )
+
+    async def exercise() -> httpx.Response:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://testserver",
+        ) as client:
+            try:
+                await client.post("/responses", json={"input": "cancel this model call"})
+            except asyncio.CancelledError:
+                pass
+            return await client.post("/responses", json={"input": "check-network-telemetry"})
+
+    response = asyncio.run(exercise())
+
+    assert response.status_code == 200, response.text
+    assert _call(response.json())["name"] == "check-network-telemetry"
+    assert transport.calls == 2
 
 
 def test_foundry_brokered_active_resume_survives_ttl_and_completed_state_retains_from_completion():

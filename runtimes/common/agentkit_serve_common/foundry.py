@@ -22,6 +22,7 @@ import logging
 import math
 import os
 import re
+import threading
 import time
 import uuid
 from copy import deepcopy
@@ -164,19 +165,57 @@ def _session_id_from_request(request: Request) -> str | None:
     return None
 
 
-def _effective_responses_session_id(request: Request, data: Mapping[str, Any]) -> str | None:
+class _SessionIdentityConflict(ValueError):
+    pass
+
+
+def _clean_session_id(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _effective_responses_session_id(
+    request: Request,
+    data: Mapping[str, Any],
+    *,
+    enforce_trusted_precedence: bool = False,
+) -> str | None:
     # The hosted platform identity describes the sandbox that actually received
     # the request, so prefer it over caller-controlled routing fields. Body
     # fields remain useful for direct/local protocol fidelity when the hosted
     # runtime environment is unavailable.
-    hosted = os.environ.get(_FOUNDRY_SESSION_ENV)
-    if hosted and hosted.strip():
-        return hosted.strip()
-    for name in ("agent_session_id", "session_id"):
-        value = data.get(name)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return _session_id_from_request(request)
+    hosted = _clean_session_id(os.environ.get(_FOUNDRY_SESSION_ENV))
+    if not enforce_trusted_precedence:
+        if hosted:
+            return hosted
+        for name in ("agent_session_id", "session_id"):
+            value = _clean_session_id(data.get(name))
+            if value:
+                return value
+        return _session_id_from_request(request)
+
+    # Brokered continuations persist a session binding. The hosted ingress
+    # contract strips/replaces x-agent-session-id, so that gateway-owned header
+    # and the sandbox environment must not be silently replaced by local
+    # body/query compatibility fields. Matching duplicates remain valid.
+    gateway = _clean_session_id(request.headers.get("x-agent-session-id"))
+    compatibility = [
+        _clean_session_id(data.get("agent_session_id")),
+        _clean_session_id(data.get("session_id")),
+        _clean_session_id(request.query_params.get("agent_session_id")),
+        _clean_session_id(request.query_params.get("session_id")),
+        _clean_session_id(request.headers.get("x-agentkit-session-id")),
+    ]
+    trusted = hosted or gateway
+    if trusted is not None and any(
+        value is not None and value != trusted
+        for value in (hosted, gateway, *compatibility)
+    ):
+        raise _SessionIdentityConflict("conflicting Foundry session identities")
+    if trusted is not None:
+        return trusted
+    return next((value for value in compatibility if value), None)
 
 
 def _continuation_proof_matches(
@@ -428,7 +467,10 @@ class _FoundryResponseStateStore:
 
     Without a file path this is in-memory only. With a file path, the store
     persists pending/final response state using atomic JSON writes so a restarted
-    single-replica/sticky deployment can resume known response IDs.
+    single-replica/sticky deployment can resume known response IDs. Initial model
+    work reserves capacity in memory; a reservation may provisionally claim a
+    completed replay entry, but eviction is committed only when pending state is
+    installed in its place.
     """
 
     def __init__(self, ttl_seconds: float, max_entries: int, state_file: str | Path | None = None) -> None:
@@ -437,6 +479,8 @@ class _FoundryResponseStateStore:
         self.state_file = Path(state_file) if state_file else None
         self._states: dict[str, _HostedResponseState] = {}
         self._active_resumes: dict[str, asyncio.Task[Any]] = {}
+        self._reservations: dict[str, str | None] = {}
+        self._lock = threading.RLock()
         self._load()
 
     @property
@@ -448,6 +492,33 @@ class _FoundryResponseStateStore:
         for response_id in finished:
             self._active_resumes.pop(response_id, None)
         return set(self._active_resumes)
+
+    def _claimed_response_ids(
+        self,
+        states: Mapping[str, _HostedResponseState],
+        *,
+        exclude_reservation_id: str | None = None,
+    ) -> set[str]:
+        return {
+            claimed_response_id
+            for reservation_id, claimed_response_id in self._reservations.items()
+            if reservation_id != exclude_reservation_id
+            and claimed_response_id is not None
+            and claimed_response_id in states
+        }
+
+    def _reservation_slots(
+        self,
+        states: Mapping[str, _HostedResponseState],
+        *,
+        exclude_reservation_id: str | None = None,
+    ) -> int:
+        return sum(
+            1
+            for reservation_id, claimed_response_id in self._reservations.items()
+            if reservation_id != exclude_reservation_id
+            and (claimed_response_id is None or claimed_response_id not in states)
+        )
 
     @staticmethod
     def _purge_expired_from(
@@ -470,14 +541,19 @@ class _FoundryResponseStateStore:
         states: dict[str, _HostedResponseState],
         *,
         target: int,
+        excluded_response_ids: set[str] | None = None,
     ) -> bool:
         if len(states) <= target:
             return False
+        excluded = excluded_response_ids or set()
         completed = sorted(
             (
                 entry
                 for entry in states.values()
-                if entry.status == "completed" and entry.final_payload is not None and not entry.final_persistence_pending
+                if entry.status == "completed"
+                and entry.final_payload is not None
+                and not entry.final_persistence_pending
+                and entry.response_id not in excluded
             ),
             key=lambda entry: entry.expires_at,
         )
@@ -488,6 +564,25 @@ class _FoundryResponseStateStore:
             if len(states) <= target:
                 break
         return changed
+
+    @staticmethod
+    def _completed_reservation_candidate(
+        states: Mapping[str, _HostedResponseState],
+        *,
+        excluded_response_ids: set[str],
+    ) -> str | None:
+        candidates = sorted(
+            (
+                entry
+                for entry in states.values()
+                if entry.status == "completed"
+                and entry.final_payload is not None
+                and not entry.final_persistence_pending
+                and entry.response_id not in excluded_response_ids
+            ),
+            key=lambda entry: entry.expires_at,
+        )
+        return candidates[0].response_id if candidates else None
 
     def _commit(self, states: dict[str, _HostedResponseState]) -> None:
         self._persist(states)
@@ -505,14 +600,20 @@ class _FoundryResponseStateStore:
                 installed[response_id] = durable
         self._states = installed
 
-    def add(self, state: _HostedResponseState) -> None:
+    def _add_locked(self, state: _HostedResponseState, *, reservation_id: str | None = None) -> None:
+        if reservation_id is not None:
+            if reservation_id != state.response_id or reservation_id not in self._reservations:
+                raise RuntimeError("Foundry response state reservation is missing")
         states = dict(self._states)
         self._purge_expired_from(states, now=time.time(), active_resume_ids=self._active_resume_ids())
-        if len(states) >= self.max_entries and state.response_id not in states:
-            self._evict_completed_from(states, target=max(self.max_entries - 1, 0))
+        is_new_state = state.response_id not in states
+        reservation_slots = self._reservation_slots(
+            states,
+            exclude_reservation_id=reservation_id,
+        )
         if (
-            len(states) >= self.max_entries
-            and state.response_id not in states
+            is_new_state
+            and len(states) + reservation_slots >= self.max_entries
             and any(
                 entry.final_persistence_pending and entry.status == "completed" and entry.final_payload is not None
                 for entry in states.values()
@@ -520,18 +621,89 @@ class _FoundryResponseStateStore:
         ):
             self._commit(states)
             states = dict(self._states)
-            self._evict_completed_from(states, target=max(self.max_entries - 1, 0))
-        if len(states) >= self.max_entries and state.response_id not in states:
+
+        claimed_response_id = self._reservations.get(reservation_id) if reservation_id is not None else None
+        if claimed_response_id is not None:
+            states.pop(claimed_response_id, None)
+        reservation_slots = self._reservation_slots(
+            states,
+            exclude_reservation_id=reservation_id,
+        )
+        protected_response_ids = self._claimed_response_ids(
+            states,
+            exclude_reservation_id=reservation_id,
+        )
+        if len(states) + reservation_slots >= self.max_entries and is_new_state:
+            self._evict_completed_from(
+                states,
+                target=max(self.max_entries - reservation_slots - 1, 0),
+                excluded_response_ids=protected_response_ids,
+            )
+        if len(states) + reservation_slots >= self.max_entries and is_new_state:
             raise _StateStoreFull("too many pending brokered responses")
         states[state.response_id] = deepcopy(state)
         self._commit(states)
+        if reservation_id is not None:
+            self._reservations.pop(reservation_id, None)
+
+    def reserve(self, response_id: str) -> None:
+        with self._lock:
+            if response_id in self._states or response_id in self._reservations:
+                raise RuntimeError("Foundry response state ID is already in use")
+            states = dict(self._states)
+            changed = self._purge_expired_from(
+                states,
+                now=time.time(),
+                active_resume_ids=self._active_resume_ids(),
+            )
+            reservation_slots = self._reservation_slots(states)
+            if (
+                len(states) + reservation_slots >= self.max_entries
+                and any(
+                    entry.final_persistence_pending and entry.status == "completed" and entry.final_payload is not None
+                    for entry in states.values()
+                )
+            ):
+                self._commit(states)
+                states = dict(self._states)
+                changed = False
+                reservation_slots = self._reservation_slots(states)
+
+            if len(states) + reservation_slots < self.max_entries:
+                if changed:
+                    self._commit(states)
+                self._reservations[response_id] = None
+                return
+
+            claimed_response_id = self._completed_reservation_candidate(
+                states,
+                excluded_response_ids=self._claimed_response_ids(states),
+            )
+            if claimed_response_id is None:
+                raise _StateStoreFull("too many pending brokered responses")
+            if changed:
+                self._commit(states)
+            self._reservations[response_id] = claimed_response_id
+
+    def release_reservation(self, response_id: str) -> None:
+        with self._lock:
+            self._reservations.pop(response_id, None)
+
+    def add(self, state: _HostedResponseState) -> None:
+        with self._lock:
+            self._add_locked(state)
+
+    def add_reserved(self, state: _HostedResponseState) -> None:
+        with self._lock:
+            self._add_locked(state, reservation_id=state.response_id)
 
     def save(self, state: _HostedResponseState) -> None:
-        if state.response_id not in self._states:
-            return
-        states = dict(self._states)
-        states[state.response_id] = deepcopy(state)
-        self._commit(states)
+        with self._lock:
+            if state.response_id not in self._states:
+                return
+            states = dict(self._states)
+            states[state.response_id] = deepcopy(state)
+            self._commit(states)
 
     def cache_in_memory(self, state: _HostedResponseState) -> None:
         """Cache one entry after a durable transition could not be written.
@@ -541,48 +713,59 @@ class _FoundryResponseStateStore:
         successfully computed final payload until an identical retry can persist it.
         """
 
-        if state.response_id not in self._states:
-            return
-        states = dict(self._states)
-        states[state.response_id] = deepcopy(state)
-        self._states = states
+        with self._lock:
+            if state.response_id not in self._states:
+                return
+            states = dict(self._states)
+            states[state.response_id] = deepcopy(state)
+            self._states = states
 
     def mark_resume_active(self, response_id: str) -> None:
-        task = asyncio.current_task()
-        if task is not None:
-            self._active_resumes[response_id] = task
+        with self._lock:
+            task = asyncio.current_task()
+            if task is not None:
+                self._active_resumes[response_id] = task
 
     def mark_resume_inactive(self, response_id: str) -> None:
-        self._active_resumes.pop(response_id, None)
+        with self._lock:
+            self._active_resumes.pop(response_id, None)
 
     def evict_completed_to_capacity(self, *, reserve_slots: int = 0) -> None:
-        states = dict(self._states)
-        target = max(self.max_entries - reserve_slots, 0)
-        if self._evict_completed_from(states, target=target):
-            self._commit(states)
+        with self._lock:
+            states = dict(self._states)
+            reservation_slots = self._reservation_slots(states)
+            target = max(self.max_entries - reservation_slots - reserve_slots, 0)
+            if self._evict_completed_from(
+                states,
+                target=target,
+                excluded_response_ids=self._claimed_response_ids(states),
+            ):
+                self._commit(states)
 
     def get(self, response_id: str) -> _HostedResponseState:
-        state = self._states.get(response_id)
-        if state is None:
-            raise KeyError(response_id)
-        states = dict(self._states)
-        now = time.time()
-        active_resume_ids = self._active_resume_ids()
-        target_expired = state.expires_at <= now and not (state.status == "resuming" and response_id in active_resume_ids)
-        changed = self._purge_expired_from(states, now=now, active_resume_ids=active_resume_ids)
-        if changed:
-            self._commit(states)
-        if target_expired:
-            raise _StateExpired(response_id)
-        current = self._states.get(response_id)
-        if current is None:
-            raise KeyError(response_id)
-        return deepcopy(current)
+        with self._lock:
+            state = self._states.get(response_id)
+            if state is None:
+                raise KeyError(response_id)
+            states = dict(self._states)
+            now = time.time()
+            active_resume_ids = self._active_resume_ids()
+            target_expired = state.expires_at <= now and not (state.status == "resuming" and response_id in active_resume_ids)
+            changed = self._purge_expired_from(states, now=now, active_resume_ids=active_resume_ids)
+            if changed:
+                self._commit(states)
+            if target_expired:
+                raise _StateExpired(response_id)
+            current = self._states.get(response_id)
+            if current is None:
+                raise KeyError(response_id)
+            return deepcopy(current)
 
     def purge_expired(self) -> None:
-        states = dict(self._states)
-        if self._purge_expired_from(states, now=time.time(), active_resume_ids=self._active_resume_ids()):
-            self._commit(states)
+        with self._lock:
+            states = dict(self._states)
+            if self._purge_expired_from(states, now=time.time(), active_resume_ids=self._active_resume_ids()):
+                self._commit(states)
 
     def _load(self) -> None:
         if self.state_file is None or not self.state_file.exists():
@@ -1578,7 +1761,18 @@ def create_foundry_app(
         if "input" not in data:
             return _error("Missing 'input' in request", status=400, code="missing_input")
 
-        session_id = _effective_responses_session_id(request, data)
+        try:
+            session_id = _effective_responses_session_id(
+                request,
+                data,
+                enforce_trusted_precedence=bool(brokered_tools),
+            )
+        except _SessionIdentityConflict:
+            return _error(
+                "request contains conflicting Foundry session identities",
+                status=409,
+                code="response_session_mismatch",
+            )
         previous_response_id = data.get("previous_response_id")
         function_outputs = _function_call_outputs_from_input(data["input"])
         if brokered_tools and function_outputs:
@@ -1628,41 +1822,7 @@ def create_foundry_app(
                 response_id = _new_response_id(previous_response_id_for_output)
                 call_id = f"call_{response_id}_1"
                 try:
-                    model_result = await model_loop.start(run_request, call_id=call_id)
-                except AgentRunError as exc:
-                    return _error(str(exc), status=exc.status, code=exc.code)
-                if isinstance(model_result, ModelLoopFinal):
-                    return JSONResponse(_responses_payload(spec, RunResult(text=model_result.text, usage=model_result.usage), previous_response_id=previous_response_id_for_output))
-                tool = {tool.name: tool for tool in brokered_tools}.get(model_result.name)
-                if tool is None:
-                    return _error("model requested unknown brokered tool", status=400, code="unknown_brokered_tool")
-                try:
-                    _validate_model_brokered_arguments(model_result.arguments)
-                    _validate_model_arguments_for_tool(model_result.arguments, tool)
-                except AgentRunError as exc:
-                    return _error(str(exc), status=exc.status, code=exc.code)
-                if len(_canonical_output_json(model_result.arguments).encode("utf-8")) > max_argument_bytes:
-                    return _error(
-                        "brokered function_call arguments are too large for pending state",
-                        status=413,
-                        code="brokered_arguments_too_large",
-                    )
-                call = _PendingCall(
-                    call_id=call_id,
-                    item_id=_new_function_call_id(response_id),
-                    tool=tool,
-                    arguments=model_result.arguments,
-                )
-                state = _HostedResponseState(
-                    response_id=response_id,
-                    session_id=run_request.session_id,
-                    pending_calls={call_id: call},
-                    expires_at=time.time() + response_states.ttl_seconds,
-                    model_messages=model_result.messages,
-                    initial_usage=dict(model_result.usage),
-                )
-                try:
-                    response_states.add(state)
+                    response_states.reserve(response_id)
                 except _StateStoreFull:
                     return _error(
                         "too many pending brokered responses",
@@ -1672,15 +1832,69 @@ def create_foundry_app(
                 except _StatePersistenceError as exc:
                     logger.warning("failed to persist Foundry brokered response state: %s", exc)
                     return _state_storage_error()
-                return JSONResponse(
-                    _function_call_response_payload(
-                        spec,
-                        response_id=response_id,
-                        call=call,
-                        previous_response_id=previous_response_id_for_output,
-                        usage=model_result.usage,
+                try:
+                    try:
+                        model_result = await model_loop.start(run_request, call_id=call_id)
+                    except AgentRunError as exc:
+                        return _error(str(exc), status=exc.status, code=exc.code)
+                    if isinstance(model_result, ModelLoopFinal):
+                        return JSONResponse(
+                            _responses_payload(
+                                spec,
+                                RunResult(text=model_result.text, usage=model_result.usage),
+                                previous_response_id=previous_response_id_for_output,
+                            )
+                        )
+                    tool = {tool.name: tool for tool in brokered_tools}.get(model_result.name)
+                    if tool is None:
+                        return _error("model requested unknown brokered tool", status=400, code="unknown_brokered_tool")
+                    try:
+                        _validate_model_brokered_arguments(model_result.arguments)
+                        _validate_model_arguments_for_tool(model_result.arguments, tool)
+                    except AgentRunError as exc:
+                        return _error(str(exc), status=exc.status, code=exc.code)
+                    if len(_canonical_output_json(model_result.arguments).encode("utf-8")) > max_argument_bytes:
+                        return _error(
+                            "brokered function_call arguments are too large for pending state",
+                            status=413,
+                            code="brokered_arguments_too_large",
+                        )
+                    call = _PendingCall(
+                        call_id=call_id,
+                        item_id=_new_function_call_id(response_id),
+                        tool=tool,
+                        arguments=model_result.arguments,
                     )
-                )
+                    state = _HostedResponseState(
+                        response_id=response_id,
+                        session_id=run_request.session_id,
+                        pending_calls={call_id: call},
+                        expires_at=time.time() + response_states.ttl_seconds,
+                        model_messages=model_result.messages,
+                        initial_usage=dict(model_result.usage),
+                    )
+                    try:
+                        response_states.add_reserved(state)
+                    except _StateStoreFull:
+                        return _error(
+                            "too many pending brokered responses",
+                            status=429,
+                            code="brokered_response_state_full",
+                        )
+                    except _StatePersistenceError as exc:
+                        logger.warning("failed to persist Foundry brokered response state: %s", exc)
+                        return _state_storage_error()
+                    return JSONResponse(
+                        _function_call_response_payload(
+                            spec,
+                            response_id=response_id,
+                            call=call,
+                            previous_response_id=previous_response_id_for_output,
+                            usage=model_result.usage,
+                        )
+                    )
+                finally:
+                    response_states.release_reservation(response_id)
             tool = _select_brokered_tool(brokered_tools, run_request)
             if tool is None:
                 return _error(
