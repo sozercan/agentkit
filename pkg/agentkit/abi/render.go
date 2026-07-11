@@ -3,8 +3,8 @@
 package abi
 
 import (
+	"bytes"
 	"encoding/json"
-	"math"
 	"strconv"
 	"strings"
 
@@ -30,81 +30,86 @@ func (n yamlNumber) MarshalYAML() ([]byte, error) {
 	return []byte(n), nil
 }
 
-// yamlQuotedString forces YAML double-quoted escaping for code points that YAML
-// treats as line breaks but goccy/go-yaml otherwise emits raw in plain scalars.
-type yamlQuotedString string
+// yamlString centralizes scalar rendering for every string in the ABI. Always
+// emitting a quoted scalar prevents YAML syntax and implicit type resolution
+// from changing string data across the Go and Python readers.
+type yamlString string
 
-func (s yamlQuotedString) MarshalYAML() ([]byte, error) {
+func (s yamlString) MarshalYAML() ([]byte, error) {
 	return []byte(strconv.Quote(string(s))), nil
 }
 
-func yamlStringValue(value string) any {
-	if strings.ContainsAny(value, "\u0085\u2028\u2029") {
-		return yamlQuotedString(value)
+func yamlStrings(values []string) []yamlString {
+	if len(values) == 0 {
+		return nil
 	}
-	return value
+	out := make([]yamlString, len(values))
+	for i, value := range values {
+		out[i] = yamlString(value)
+	}
+	return out
 }
 
 type abiMetadata struct {
-	Name string `yaml:"name"`
+	Name yamlString `yaml:"name"`
 }
 
 type abiModel struct {
-	Provider  string   `yaml:"provider"`
-	BaseURL   string   `yaml:"baseURL"`
-	Name      string   `yaml:"name"`
-	APIKeyEnv string   `yaml:"apiKeyEnv,omitempty"`
-	Auth      *abiAuth `yaml:"auth,omitempty"`
+	Provider  yamlString `yaml:"provider"`
+	BaseURL   yamlString `yaml:"baseURL"`
+	Name      yamlString `yaml:"name"`
+	APIKeyEnv yamlString `yaml:"apiKeyEnv,omitempty"`
+	Auth      *abiAuth   `yaml:"auth,omitempty"`
 }
 
 type abiToolHeader struct {
-	Name     string `yaml:"name"`
-	Value    string `yaml:"value,omitempty"`
-	ValueEnv string `yaml:"valueEnv,omitempty"`
+	Name     yamlString `yaml:"name"`
+	Value    yamlString `yaml:"value,omitempty"`
+	ValueEnv yamlString `yaml:"valueEnv,omitempty"`
 }
 
 type abiAuth struct {
-	Type     string `yaml:"type"`
-	TokenEnv string `yaml:"tokenEnv,omitempty"`
-	Audience string `yaml:"audience,omitempty"`
+	Type     yamlString `yaml:"type"`
+	TokenEnv yamlString `yaml:"tokenEnv,omitempty"`
+	Audience yamlString `yaml:"audience,omitempty"`
 }
 
 type abiTool struct {
-	Name      string          `yaml:"name"`
-	Type      string          `yaml:"type,omitempty"`
-	Transport string          `yaml:"transport,omitempty"`
-	Command   []string        `yaml:"command,omitempty"`
-	URLEnv    string          `yaml:"urlEnv,omitempty"`
+	Name      yamlString      `yaml:"name"`
+	Type      yamlString      `yaml:"type,omitempty"`
+	Transport yamlString      `yaml:"transport,omitempty"`
+	Command   []yamlString    `yaml:"command,omitempty"`
+	URLEnv    yamlString      `yaml:"urlEnv,omitempty"`
 	Headers   []abiToolHeader `yaml:"headers,omitempty"`
 	Auth      *abiAuth        `yaml:"auth,omitempty"`
-	Approval  string          `yaml:"approval,omitempty"`
-	Env       []string        `yaml:"env,omitempty"`
+	Approval  yamlString      `yaml:"approval,omitempty"`
+	Env       []yamlString    `yaml:"env,omitempty"`
 }
 
 type abiBrokeredTool struct {
-	Name          string `yaml:"name"`
-	Description   any    `yaml:"description"`
-	BrokeredClass string `yaml:"brokeredClass"`
-	Parameters    any    `yaml:"parameters"`
-	SchemaDigest  string `yaml:"schemaDigest,omitempty"`
+	Name          yamlString `yaml:"name"`
+	Description   yamlString `yaml:"description"`
+	BrokeredClass yamlString `yaml:"brokeredClass"`
+	Parameters    any        `yaml:"parameters"`
+	SchemaDigest  yamlString `yaml:"schemaDigest,omitempty"`
 }
 
 type abiEnvVar struct {
-	Name     string `yaml:"name"`
-	Required bool   `yaml:"required,omitempty"`
+	Name     yamlString `yaml:"name"`
+	Required bool       `yaml:"required,omitempty"`
 }
 
 type abiContextProvider struct {
-	Name         string   `yaml:"name,omitempty"`
-	Type         string   `yaml:"type"`
-	Source       string   `yaml:"source,omitempty"`
-	Path         string   `yaml:"path,omitempty"`
-	ToolRef      string   `yaml:"toolRef,omitempty"`
-	Index        string   `yaml:"index,omitempty"`
-	EndpointEnv  string   `yaml:"endpointEnv,omitempty"`
-	IndexEnv     string   `yaml:"indexEnv,omitempty"`
-	StoreNameEnv string   `yaml:"storeNameEnv,omitempty"`
-	Auth         *abiAuth `yaml:"auth,omitempty"`
+	Name         yamlString `yaml:"name,omitempty"`
+	Type         yamlString `yaml:"type"`
+	Source       yamlString `yaml:"source,omitempty"`
+	Path         yamlString `yaml:"path,omitempty"`
+	ToolRef      yamlString `yaml:"toolRef,omitempty"`
+	Index        yamlString `yaml:"index,omitempty"`
+	EndpointEnv  yamlString `yaml:"endpointEnv,omitempty"`
+	IndexEnv     yamlString `yaml:"indexEnv,omitempty"`
+	StoreNameEnv yamlString `yaml:"storeNameEnv,omitempty"`
+	Auth         *abiAuth   `yaml:"auth,omitempty"`
 }
 
 type abiContext struct {
@@ -113,10 +118,10 @@ type abiContext struct {
 
 type abiObservability struct {
 	OTel struct {
-		EndpointEnv string `yaml:"endpointEnv,omitempty"`
+		EndpointEnv yamlString `yaml:"endpointEnv,omitempty"`
 	} `yaml:"otel,omitempty"`
 	Logs struct {
-		LevelEnv string `yaml:"levelEnv,omitempty"`
+		LevelEnv yamlString `yaml:"levelEnv,omitempty"`
 	} `yaml:"logs,omitempty"`
 }
 
@@ -126,10 +131,10 @@ type abiExpose struct {
 }
 
 type abiAgent struct {
-	ABIVersion    string            `yaml:"abiVersion"`
+	ABIVersion    yamlString        `yaml:"abiVersion"`
 	Metadata      abiMetadata       `yaml:"metadata"`
 	Model         abiModel          `yaml:"model"`
-	Instructions  any               `yaml:"instructions"`
+	Instructions  yamlString        `yaml:"instructions"`
 	Tools         []abiTool         `yaml:"tools"`
 	BrokeredTools []abiBrokeredTool `yaml:"brokeredTools,omitempty"`
 	Env           []abiEnvVar       `yaml:"env,omitempty"`
@@ -185,13 +190,6 @@ func expandJSONNumber(value string) string {
 	return sign + out
 }
 
-func yamlFloat(value float64, bitSize int) yamlNumber {
-	if value == 0 && math.Signbit(value) {
-		return yamlNumber("-0.0")
-	}
-	return yamlNumber(strconv.FormatFloat(value, 'f', -1, bitSize))
-}
-
 func isNegativeJSONZero(value string) bool {
 	if !strings.HasPrefix(value, "-") {
 		return false
@@ -221,61 +219,45 @@ func yamlJSONNumber(value json.Number) yamlNumber {
 	return yamlNumber(expandJSONNumber(raw))
 }
 
-func copyStringKeyedMap[T any](in map[string]T) map[any]any {
+func copyMap(in map[string]any) map[any]any {
 	if in == nil {
 		return nil
 	}
 	out := make(map[any]any, len(in))
 	for key, value := range in {
-		out[yamlStringValue(key)] = copyAny(value)
+		out[yamlString(key)] = copyAny(value)
 	}
 	return out
 }
 
-func copyMap(in map[string]any) map[any]any {
-	return copyStringKeyedMap(in)
+// normalizeJSONValue routes brokered schemas through encoding/json, matching the
+// representation used by Go validation and digesting (including []byte base64).
+func normalizeJSONValue(v any) (any, error) {
+	encoded, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.UseNumber()
+	var normalized any
+	if err := decoder.Decode(&normalized); err != nil {
+		return nil, err
+	}
+	return copyAny(normalized), nil
 }
 
 func copyAny(v any) any {
 	switch typed := v.(type) {
 	case string:
-		return yamlStringValue(typed)
+		return yamlString(typed)
 	case map[string]any:
 		return copyMap(typed)
-	case map[string]string:
-		return copyStringKeyedMap(typed)
-	case map[string]int:
-		return copyStringKeyedMap(typed)
-	case map[string]float64:
-		return copyStringKeyedMap(typed)
-	case map[string]bool:
-		return copyStringKeyedMap(typed)
 	case []any:
 		out := make([]any, len(typed))
 		for i, item := range typed {
 			out[i] = copyAny(item)
 		}
 		return out
-	case []string:
-		out := make([]any, len(typed))
-		for i, item := range typed {
-			out[i] = yamlStringValue(item)
-		}
-		return out
-	case []int:
-		return append([]int(nil), typed...)
-	case []float64:
-		out := make([]any, len(typed))
-		for i, item := range typed {
-			out[i] = yamlFloat(item, 64)
-		}
-		return out
-	case []bool:
-		return append([]bool(nil), typed...)
-	case float32:
-		return yamlFloat(float64(typed), 32)
-	case float64:
-		return yamlFloat(typed, 64)
 	case json.Number:
 		return yamlJSONNumber(typed)
 	default:
@@ -287,58 +269,62 @@ func copyAny(v any) any {
 // output is byte-compatible with agentkit-serve's strict (extra=forbid) reader.
 func Render(agent effective.Agent) ([]byte, error) {
 	out := abiAgent{
-		ABIVersion: Version,
-		Metadata:   abiMetadata{Name: agent.Metadata.Name},
+		ABIVersion: yamlString(Version),
+		Metadata:   abiMetadata{Name: yamlString(agent.Metadata.Name)},
 		Model: abiModel{
-			Provider:  agent.Model.Provider,
-			BaseURL:   agent.Model.BaseURL,
-			Name:      agent.Model.Name,
-			APIKeyEnv: agent.Model.APIKeyEnv,
+			Provider:  yamlString(agent.Model.Provider),
+			BaseURL:   yamlString(agent.Model.BaseURL),
+			Name:      yamlString(agent.Model.Name),
+			APIKeyEnv: yamlString(agent.Model.APIKeyEnv),
 		},
-		Instructions: yamlStringValue(agent.Instructions),
+		Instructions: yamlString(agent.Instructions),
 		Tools:        make([]abiTool, 0, len(agent.Tools)),
 		Env:          make([]abiEnvVar, 0, len(agent.Env)),
 		Expose:       abiExpose{OpenAI: agent.Expose.OpenAI, Port: agent.Expose.Port},
 	}
 	if agent.Model.Auth != nil {
-		out.Model.Auth = &abiAuth{Type: agent.Model.Auth.Type, TokenEnv: agent.Model.Auth.TokenEnv, Audience: agent.Model.Auth.Audience}
+		out.Model.Auth = &abiAuth{Type: yamlString(agent.Model.Auth.Type), TokenEnv: yamlString(agent.Model.Auth.TokenEnv), Audience: yamlString(agent.Model.Auth.Audience)}
 	}
 	for _, t := range agent.Tools {
 		tool := abiTool{
-			Name:      t.Name,
-			Type:      t.Type,
-			Transport: t.Transport,
-			Command:   t.Command,
-			URLEnv:    t.URLEnv,
+			Name:      yamlString(t.Name),
+			Type:      yamlString(t.Type),
+			Transport: yamlString(t.Transport),
+			Command:   yamlStrings(t.Command),
+			URLEnv:    yamlString(t.URLEnv),
 			Headers:   make([]abiToolHeader, 0, len(t.Headers)),
-			Approval:  t.Approval,
-			Env:       t.Env,
+			Approval:  yamlString(t.Approval),
+			Env:       yamlStrings(t.Env),
 		}
 		for _, h := range t.Headers {
-			tool.Headers = append(tool.Headers, abiToolHeader{Name: h.Name, Value: h.Value, ValueEnv: h.ValueEnv})
+			tool.Headers = append(tool.Headers, abiToolHeader{Name: yamlString(h.Name), Value: yamlString(h.Value), ValueEnv: yamlString(h.ValueEnv)})
 		}
 		if len(tool.Headers) == 0 {
 			tool.Headers = nil
 		}
 		if t.Auth != nil {
-			tool.Auth = &abiAuth{Type: t.Auth.Type, TokenEnv: t.Auth.TokenEnv, Audience: t.Auth.Audience}
+			tool.Auth = &abiAuth{Type: yamlString(t.Auth.Type), TokenEnv: yamlString(t.Auth.TokenEnv), Audience: yamlString(t.Auth.Audience)}
 		}
 		out.Tools = append(out.Tools, tool)
 	}
 	for _, t := range agent.BrokeredTools {
+		parameters, err := normalizeJSONValue(t.Parameters)
+		if err != nil {
+			return nil, err
+		}
 		out.BrokeredTools = append(out.BrokeredTools, abiBrokeredTool{
-			Name:          t.Name,
-			Description:   yamlStringValue(t.Description),
-			BrokeredClass: t.BrokeredClass,
-			Parameters:    copyMap(t.Parameters),
-			SchemaDigest:  t.SchemaDigest,
+			Name:          yamlString(t.Name),
+			Description:   yamlString(t.Description),
+			BrokeredClass: yamlString(t.BrokeredClass),
+			Parameters:    parameters,
+			SchemaDigest:  yamlString(t.SchemaDigest),
 		})
 	}
 	if len(out.BrokeredTools) == 0 {
 		out.BrokeredTools = nil
 	}
 	for _, e := range agent.Env {
-		out.Env = append(out.Env, abiEnvVar{Name: e.Name, Required: e.Required})
+		out.Env = append(out.Env, abiEnvVar{Name: yamlString(e.Name), Required: e.Required})
 	}
 	if len(out.Env) == 0 {
 		out.Env = nil
@@ -347,18 +333,18 @@ func Render(agent effective.Agent) ([]byte, error) {
 		ctx := &abiContext{Providers: make([]abiContextProvider, 0, len(agent.Context.Providers))}
 		for _, provider := range agent.Context.Providers {
 			p := abiContextProvider{
-				Name:         provider.Name,
-				Type:         provider.Type,
-				Source:       provider.Source,
-				Path:         provider.Path,
-				ToolRef:      provider.ToolRef,
-				Index:        provider.Index,
-				EndpointEnv:  provider.EndpointEnv,
-				IndexEnv:     provider.IndexEnv,
-				StoreNameEnv: provider.StoreNameEnv,
+				Name:         yamlString(provider.Name),
+				Type:         yamlString(provider.Type),
+				Source:       yamlString(provider.Source),
+				Path:         yamlString(provider.Path),
+				ToolRef:      yamlString(provider.ToolRef),
+				Index:        yamlString(provider.Index),
+				EndpointEnv:  yamlString(provider.EndpointEnv),
+				IndexEnv:     yamlString(provider.IndexEnv),
+				StoreNameEnv: yamlString(provider.StoreNameEnv),
 			}
 			if provider.Auth != nil {
-				p.Auth = &abiAuth{Type: provider.Auth.Type, TokenEnv: provider.Auth.TokenEnv, Audience: provider.Auth.Audience}
+				p.Auth = &abiAuth{Type: yamlString(provider.Auth.Type), TokenEnv: yamlString(provider.Auth.TokenEnv), Audience: yamlString(provider.Auth.Audience)}
 			}
 			ctx.Providers = append(ctx.Providers, p)
 		}
@@ -366,8 +352,8 @@ func Render(agent effective.Agent) ([]byte, error) {
 	}
 	if agent.Observability.OTel.EndpointEnv != "" || agent.Observability.Logs.LevelEnv != "" {
 		obs := &abiObservability{}
-		obs.OTel.EndpointEnv = agent.Observability.OTel.EndpointEnv
-		obs.Logs.LevelEnv = agent.Observability.Logs.LevelEnv
+		obs.OTel.EndpointEnv = yamlString(agent.Observability.OTel.EndpointEnv)
+		obs.Logs.LevelEnv = yamlString(agent.Observability.Logs.LevelEnv)
 		out.Observability = obs
 	}
 

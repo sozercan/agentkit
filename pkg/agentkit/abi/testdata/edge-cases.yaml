@@ -1,27 +1,45 @@
-abiVersion: v0
+abiVersion: "v0"
 metadata:
-  name: acme-support
+  name: "acme-support"
 model:
-  provider: openai-compatible
-  baseURL: https://api.openai.com/v1
-  name: gpt-4o-mini
+  provider: "openai-compatible"
+  baseURL: "https://api.openai.com/v1"
+  name: "gpt-4o-mini"
 instructions: "instructions NEL:\u0085LS:\u2028PS:\u2029end"
 tools: []
 brokeredTools:
-- name: unicode-numeric-tool
+- name: "unicode-numeric-tool"
   description: "description NEL:\u0085LS:\u2028PS:\u2029end"
-  brokeredClass: read
+  brokeredClass: "read"
   parameters:
-    description: "schema NEL:\u0085LS:\u2028PS:\u2029end"
-    properties:
+    "description": "schema NEL:\u0085LS:\u2028PS:\u2029end"
+    "properties":
+      ".inf":
+        "default": ".inf"
+        "type": "string"
+      "12:34:56":
+        "default": "2001-12-14 21:59:43.10 -5"
+        "type": "string"
+      "<<":
+        "default": "<<"
+        "type": "string"
+      "=":
+        "default": "="
+        "type": "string"
+      "? ask":
+        "default": "before\tafter"
+        "type": "string"
+      "binary":
+        "default": "SGVsbG8="
+        "type": "string"
       "line:\u2028break":
-        description: "property NEL:\u0085LS:\u2028PS:\u2029end"
-        minimum: -0.0
-        type: number
-    required:
+        "description": "property NEL:\u0085LS:\u2028PS:\u2029end"
+        "minimum": -0.0
+        "type": "number"
+    "required":
     - "line:\u2028break"
-    type: object
-  schemaDigest: sha256:c11250fadb3b86c3bdd4ced8fc9741b4fa1295b88f9faadefb56c64bbb986e2f
+    "type": "object"
+  schemaDigest: "sha256:50d18ec3547b6ebc50aebf140716b6eac1e54f7eb4e5d84e69abef731ad7af64"
 expose:
   openai: true
   port: 8080

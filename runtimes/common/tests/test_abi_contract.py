@@ -41,8 +41,17 @@ def test_go_rendered_edge_case_agent_yaml_loads_exactly_in_python_reader():
     assert tool.description == "description " + line_break_text
     assert tool.parameters["description"] == "schema " + line_break_text
     assert tool.parameters["properties"][property_name]["description"] == "property " + line_break_text
+    binary_default = tool.parameters["properties"]["binary"]["default"]
+    assert isinstance(binary_default, str)
+    assert binary_default == "SGVsbG8="
+    yaml_sensitive_default = tool.parameters["properties"]["? ask"]["default"]
+    assert yaml_sensitive_default == "before\tafter"
+    assert tool.parameters["properties"]["<<"]["default"] == "<<"
+    assert tool.parameters["properties"]["="]["default"] == "="
+    assert tool.parameters["properties"][".inf"]["default"] == ".inf"
+    assert tool.parameters["properties"]["12:34:56"]["default"] == "2001-12-14 21:59:43.10 -5"
     minimum = tool.parameters["properties"][property_name]["minimum"]
     assert isinstance(minimum, float)
     assert minimum == 0.0
     assert math.copysign(1.0, minimum) == -1.0
-    assert tool.schema_digest == "sha256:c11250fadb3b86c3bdd4ced8fc9741b4fa1295b88f9faadefb56c64bbb986e2f"
+    assert tool.schema_digest == "sha256:50d18ec3547b6ebc50aebf140716b6eac1e54f7eb4e5d84e69abef731ad7af64"
