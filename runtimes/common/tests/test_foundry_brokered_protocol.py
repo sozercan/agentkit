@@ -895,6 +895,27 @@ def test_foundry_brokered_rejects_oversized_function_call_output_before_state_ch
     assert accepted.status_code == 200, accepted.text
 
 
+def test_foundry_brokered_replay_ceiling_is_independent_from_non_brokered_request_limit():
+    app = _app(
+        max_request_body_bytes=64,
+        max_brokered_output_bytes=512,
+        max_response_state_bytes=4 * 1024,
+    )
+
+    with TestClient(app) as client:
+        initial = _start(client)
+        call = _call(initial)
+        continuation = _continuation(
+            initial["id"],
+            call["call_id"],
+            {"approved": True, "output": {"blob": "x" * 128}},
+        )
+        assert len(json.dumps(continuation).encode("utf-8")) > 64
+        response = client.post("/responses", headers=CONTINUATION_AUTH, json=continuation)
+
+    assert response.status_code == 200, response.text
+
+
 def test_foundry_brokered_rejects_oversized_request_body_without_truncation_or_state_change(tmp_path):
     state_file = tmp_path / "responses-state.json"
     app = _app(
@@ -1889,6 +1910,65 @@ def _model_loop_app(spec: AgentSpec, fake: _FakeChatTransport, **kwargs: Any):
     return _app(spec, brokered_model_loop_enabled=True, brokered_model_http_client=client, **kwargs)
 
 
+def test_foundry_brokered_model_loop_bounds_streamed_upstream_body_before_json_materialization():
+    class TrackingStream(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self.chunks_read = 0
+            self.tail_read = False
+
+        async def __aiter__(self):
+            chunks = [
+                b'{"choices":[{"message":{"role":"assistant","content":"',
+                b"x" * 300,
+                b'"}}],"usage":{}}',
+            ]
+            for index, chunk in enumerate(chunks):
+                self.chunks_read += 1
+                if index == 2:
+                    self.tail_read = True
+                yield chunk
+
+        async def aclose(self) -> None:
+            return None
+
+    class Transport(httpx.AsyncBaseTransport):
+        def __init__(self) -> None:
+            self.stream = TrackingStream()
+            self.calls = 0
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            self.calls += 1
+            if self.calls == 1:
+                return httpx.Response(200, request=request, stream=self.stream)
+            return httpx.Response(
+                200,
+                request=request,
+                json=_chat_response({"role": "assistant", "content": "Retry stayed available."}),
+            )
+
+    transport = Transport()
+    app = _app(
+        _spec(tool_name="check-network-telemetry"),
+        brokered_model_loop_enabled=True,
+        brokered_model_http_client=httpx.AsyncClient(transport=transport),
+        max_pending_responses=1,
+        max_response_state_bytes=256,
+    )
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        oversized = client.post("/responses", json={"input": "Say hello"})
+        retry = client.post("/responses", json={"input": "Say hello again"})
+
+    assert oversized.status_code == 502
+    assert oversized.json()["error"] == {
+        "message": "model response is too large to retain safely",
+        "code": "ModelResponseTooLarge",
+    }
+    assert transport.stream.tail_read is False
+    assert retry.status_code == 200, retry.text
+    assert _message_text(retry.json()) == "Retry stayed available."
+
+
 def test_foundry_brokered_max_pending_reserves_capacity_before_initial_model_work():
     spec = _spec(tool_name="check-network-telemetry")
 
@@ -2477,22 +2557,21 @@ def test_foundry_brokered_model_loop_sanitizes_transport_failure_urls():
     assert "/chat/completions" not in response.text
 
 
-def test_foundry_brokered_model_loop_normalizes_unexpected_json_decode_failure():
-    class RecursiveJsonResponse:
-        def raise_for_status(self) -> None:
-            return None
+def test_foundry_brokered_model_loop_normalizes_non_object_json_response():
+    non_object_json = b"[0]"
 
-        def json(self) -> dict[str, Any]:
-            raise RecursionError("nested model response")
-
-    class RecursiveJsonClient:
-        async def post(self, *_args: Any, **_kwargs: Any) -> RecursiveJsonResponse:
-            return RecursiveJsonResponse()
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            request=request,
+            content=non_object_json,
+            headers={"content-type": "application/json"},
+        )
 
     app = _app(
         _spec(tool_name="check-network-telemetry"),
         brokered_model_loop_enabled=True,
-        brokered_model_http_client=RecursiveJsonClient(),
+        brokered_model_http_client=httpx.AsyncClient(transport=httpx.MockTransport(respond)),
     )
 
     with TestClient(app, raise_server_exceptions=False) as client:
@@ -2500,7 +2579,7 @@ def test_foundry_brokered_model_loop_normalizes_unexpected_json_decode_failure()
 
     assert response.status_code == 502
     assert response.json()["error"] == {
-        "message": "model service returned an invalid JSON response",
+        "message": "model response must be a JSON object",
         "code": "InvalidModelResponse",
     }
 
@@ -3124,6 +3203,59 @@ def test_foundry_brokered_model_loop_failed_resume_can_be_retried():
     assert _message_text(retried.json()) == "Retry worked."
 
 
+def test_foundry_brokered_model_loop_bounds_resumed_final_text_without_installing_completion(tmp_path):
+    state_file = tmp_path / "responses-state.json"
+    oversized_text = "é" * 80
+    assert len(oversized_text) < 128 < len(oversized_text.encode("utf-8"))
+    spec = _spec(tool_name="check-network-telemetry")
+    fake = _FakeChatTransport(
+        [
+            _chat_response(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "model_generated_call_id",
+                            "type": "function",
+                            "function": {"name": "check-network-telemetry", "arguments": "{}"},
+                        }
+                    ],
+                }
+            ),
+            _chat_response({"role": "assistant", "content": oversized_text}),
+            _chat_response({"role": "assistant", "content": "Retry stayed bounded."}),
+        ]
+    )
+    app = _model_loop_app(
+        spec,
+        fake,
+        response_state_file=state_file,
+        max_brokered_output_bytes=128,
+        max_response_state_bytes=4 * 1024,
+    )
+
+    with TestClient(app) as client:
+        initial = client.post("/responses", json={"input": "check-network-telemetry"})
+        call = _call(initial.json())
+        payload = _continuation(initial.json()["id"], call["call_id"], {"approved": True, "output": {"ok": True}})
+        failed = client.post("/responses", headers=CONTINUATION_AUTH, json=payload)
+        state_after_failure = json.loads(state_file.read_text(encoding="utf-8"))["states"][initial.json()["id"]]
+        retried = client.post("/responses", headers=CONTINUATION_AUTH, json=payload)
+
+    assert failed.status_code == 502
+    assert failed.json()["error"] == {
+        "message": "model response is too large to retain safely",
+        "code": "ModelResponseTooLarge",
+    }
+    assert state_after_failure["status"] == "pending"
+    assert state_after_failure["finalPayload"] is None
+    assert state_after_failure["acceptedOutputDigests"] == {}
+    assert retried.status_code == 200, retried.text
+    assert _message_text(retried.json()) == "Retry stayed bounded."
+    assert len(fake.requests) == 3
+
+
 def test_foundry_brokered_model_loop_oversized_completion_can_be_retried():
     spec = _spec(tool_name="check-network-telemetry")
     fake = _FakeChatTransport(
@@ -3311,8 +3443,42 @@ def test_foundry_brokered_bounds_initial_model_state_before_copying(monkeypatch)
     with TestClient(app, raise_server_exceptions=False) as client:
         response = client.post("/responses", json={"input": "check-network-telemetry"})
 
-    assert response.status_code == 413
-    assert response.json()["error"]["code"] == "brokered_response_state_too_large"
+    assert response.status_code == 502
+    assert response.json()["error"] == {
+        "message": "model response is too large to retain safely",
+        "code": "ModelResponseTooLarge",
+    }
+
+
+def test_foundry_brokered_model_loop_bounds_immediate_final_text_in_utf8_bytes_without_state_install():
+    oversized_text = "é" * 80
+    assert len(oversized_text) < 128 < len(oversized_text.encode("utf-8"))
+    fake = _FakeChatTransport(
+        [
+            _chat_response({"role": "assistant", "content": oversized_text}),
+            _chat_response({"role": "assistant", "content": "Retry stayed available."}),
+        ]
+    )
+    app = _model_loop_app(
+        _spec(tool_name="check-network-telemetry"),
+        fake,
+        max_pending_responses=1,
+        max_brokered_output_bytes=128,
+        max_response_state_bytes=4 * 1024,
+    )
+
+    with TestClient(app) as client:
+        oversized = client.post("/responses", json={"input": "Say hello"})
+        retry = client.post("/responses", json={"input": "Say hello again"})
+
+    assert oversized.status_code == 502
+    assert oversized.json()["error"] == {
+        "message": "model response is too large to retain safely",
+        "code": "ModelResponseTooLarge",
+    }
+    assert retry.status_code == 200, retry.text
+    assert _message_text(retry.json()) == "Retry stayed available."
+    assert len(fake.requests) == 2
 
 
 def test_foundry_brokered_model_loop_can_return_final_message_without_tool_call():

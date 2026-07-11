@@ -55,6 +55,7 @@ _DEFAULT_MAX_PENDING_RESPONSES = 128
 _DEFAULT_MAX_ARGUMENT_BYTES = 8192
 _DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024
 _DEFAULT_MAX_RESPONSE_STATE_BYTES = 4 * 1024 * 1024
+_DEFAULT_MAX_REQUEST_BODY_BYTES = 4 * 1024 * 1024
 _REQUEST_BODY_OVERHEAD_BYTES = 16 * 1024
 _MAX_SYNTHETIC_ARRAY_ITEMS = 32
 _MAX_SYNTHETIC_STRING_LENGTH = 4096
@@ -63,6 +64,7 @@ _MAX_PENDING_ENV = "AGENTKIT_FOUNDRY_RESPONSE_STATE_MAX_PENDING"
 _MAX_ARGUMENT_BYTES_ENV = "AGENTKIT_FOUNDRY_BROKERED_MAX_ARGUMENT_BYTES"
 _MAX_OUTPUT_BYTES_ENV = "AGENTKIT_FOUNDRY_BROKERED_MAX_OUTPUT_BYTES"
 _MAX_RESPONSE_STATE_BYTES_ENV = "AGENTKIT_FOUNDRY_RESPONSE_STATE_MAX_BYTES"
+_MAX_REQUEST_BODY_BYTES_ENV = "AGENTKIT_FOUNDRY_REQUEST_BODY_MAX_BYTES"
 _CONTINUATION_PROOF_ENV = "AGENTKIT_FOUNDRY_BROKERED_CONTINUATION_PROOF"
 _CONTINUATION_PROOF_HEADER = "x-agentkit-brokered-continuation-proof"
 _CONTINUATION_PROOF_BODY_FIELD = "brokered_continuation_proof"
@@ -161,6 +163,43 @@ def _state_full_error() -> JSONResponse:
         "too many pending brokered responses",
         status=429,
         code="brokered_response_state_full",
+    )
+
+
+def _request_too_large_error() -> JSONResponse:
+    return _error(
+        "Foundry request body is too large",
+        status=413,
+        code="request_too_large",
+    )
+
+
+def _model_response_too_large_error() -> JSONResponse:
+    return _error(
+        "model response is too large to retain safely",
+        status=502,
+        code="ModelResponseTooLarge",
+    )
+
+
+def _non_brokered_agent_run_error(exc: AgentRunError) -> JSONResponse:
+    if exc.status < 500:
+        return _error(str(exc), status=exc.status, code=exc.code)
+    logger.warning("non-brokered Foundry runtime request failed: %s", exc, exc_info=True)
+    status = exc.status if 500 <= exc.status <= 599 else 502
+    return _error(
+        "agent runtime request failed",
+        status=status,
+        code="RuntimeFailure",
+    )
+
+
+def _non_brokered_unexpected_runtime_error() -> JSONResponse:
+    logger.exception("non-brokered Foundry runtime request failed unexpectedly")
+    return _error(
+        "agent runtime request failed",
+        status=502,
+        code="RuntimeFailure",
     )
 
 
@@ -1090,6 +1129,14 @@ def _max_response_state_bytes(value: int | None = None) -> int:
         value,
         env_name=_MAX_RESPONSE_STATE_BYTES_ENV,
         default=_DEFAULT_MAX_RESPONSE_STATE_BYTES,
+    )
+
+
+def _max_request_body_bytes(value: int | None = None) -> int:
+    return _positive_int_setting(
+        value,
+        env_name=_MAX_REQUEST_BODY_BYTES_ENV,
+        default=_DEFAULT_MAX_REQUEST_BODY_BYTES,
     )
 
 
@@ -2063,6 +2110,9 @@ async def _handle_brokered_continuation(
             except AgentRunError as exc:
                 if not _reset_unfinalized_continuation(store, state, call_id=call_id):
                     return _state_storage_error()
+                if exc.code == "ModelResponseTooLarge":
+                    logger.warning("brokered model-loop response exceeded configured limits")
+                    return _model_response_too_large_error()
                 if exc.status >= 500:
                     logger.warning("brokered model-loop resume failed: %s", exc)
                     return _error("model resume failed", status=exc.status, code="ModelResumeError")
@@ -2120,11 +2170,7 @@ async def _handle_brokered_continuation(
             if not _reset_unfinalized_continuation(store, state, call_id=call_id):
                 return _state_storage_error()
         if used_model_resume:
-            return _error(
-                "model response is too large to retain safely",
-                status=502,
-                code="ModelResponseTooLarge",
-            )
+            return _model_response_too_large_error()
         return _state_too_large_error()
     except _StatePersistenceError as exc:
         logger.warning("failed to persist completed Foundry brokered response state: %s", exc)
@@ -2150,6 +2196,7 @@ def create_foundry_app(
     max_brokered_argument_bytes: int | None = None,
     max_brokered_output_bytes: int | None = None,
     max_response_state_bytes: int | None = None,
+    max_request_body_bytes: int | None = None,
     brokered_model_loop_enabled: bool | None = None,
     brokered_model_http_client: Any | None = None,
     response_state_file: str | Path | None = None,
@@ -2160,25 +2207,29 @@ def create_foundry_app(
     continuation_proof = brokered_continuation_proof or os.environ.get(_CONTINUATION_PROOF_ENV) or None
     max_argument_bytes = _max_argument_bytes(max_brokered_argument_bytes)
     max_output_bytes = _max_output_bytes(max_brokered_output_bytes)
+    request_body_bytes = _max_request_body_bytes(max_request_body_bytes)
     response_states = _FoundryResponseStateStore(
         ttl_seconds=_state_ttl_seconds(state_ttl_seconds),
         max_entries=_max_pending_responses(max_pending_responses),
         max_bytes=_max_response_state_bytes(max_response_state_bytes),
         state_file=_response_state_file(response_state_file) if brokered_tools else None,
     )
-    def max_request_body_bytes() -> int:
+
+    def max_brokered_request_body_bytes() -> int:
         replay_ceiling = max(
             response_states.max_bytes,
             max_output_bytes,
             response_states.max_accepted_output_bytes(),
         )
         return max(6 * replay_ceiling, max_argument_bytes) + _REQUEST_BODY_OVERHEAD_BYTES
+
     model_loop = (
         BrokeredChatModelLoop(
             spec,
             brokered_tools,
             http_client=brokered_model_http_client,
             max_output_bytes=max_output_bytes,
+            max_response_bytes=response_states.max_bytes,
         )
         if brokered_tools and _brokered_model_loop_enabled(brokered_model_loop_enabled)
         else None
@@ -2231,8 +2282,10 @@ def create_foundry_app(
                 code="invocations_disabled_in_brokered_mode",
             )
         try:
-            data = await request.json()
-        except json.JSONDecodeError:
+            data = await _read_json_request_bounded(request, max_bytes=request_body_bytes)
+        except _RequestBodyTooLarge:
+            return _request_too_large_error()
+        except (UnicodeDecodeError, RecursionError, ValueError):
             return Response("Request body must be JSON", status_code=400)
 
         if not isinstance(data, dict):
@@ -2246,23 +2299,22 @@ def create_foundry_app(
                 RunRequest(prompt=prompt, session_id=_session_id_from_request(request))
             )
         except AgentRunError as exc:
-            return _error(str(exc), status=exc.status, code=exc.code)
-        except Exception as exc:  # noqa: BLE001 - deterministic protocol envelope.
-            return _error(str(exc), status=502, code=exc.__class__.__name__)
+            return _non_brokered_agent_run_error(exc)
+        except Exception:  # noqa: BLE001 - deterministic protocol envelope.
+            return _non_brokered_unexpected_runtime_error()
 
         return JSONResponse({"response": result.text, "usage": _usage(result)})
 
     @app.post("/responses", dependencies=[auth])
     async def responses(request: Request):
         try:
-            if brokered_tools:
-                data = await _read_json_request_bounded(
-                    request,
-                    max_bytes=max_request_body_bytes(),
-                )
-            else:
-                data = await request.json()
+            data = await _read_json_request_bounded(
+                request,
+                max_bytes=max_brokered_request_body_bytes() if brokered_tools else request_body_bytes,
+            )
         except _RequestBodyTooLarge:
+            if not brokered_tools:
+                return _request_too_large_error()
             return _error(
                 "brokered Responses request body is too large",
                 status=413,
@@ -2372,6 +2424,8 @@ def create_foundry_app(
                     try:
                         model_result = await model_loop.start(run_request, call_id=call_id)
                     except AgentRunError as exc:
+                        if exc.code == "ModelResponseTooLarge":
+                            return _model_response_too_large_error()
                         return _error(str(exc), status=exc.status, code=exc.code)
                     if isinstance(model_result, ModelLoopFinal):
                         return JSONResponse(
@@ -2491,9 +2545,9 @@ def create_foundry_app(
         try:
             result = await request.app.state.runtime.run(run_request)
         except AgentRunError as exc:
-            return _error(str(exc), status=exc.status, code=exc.code)
-        except Exception as exc:  # noqa: BLE001 - deterministic protocol envelope.
-            return _error(str(exc), status=502, code=exc.__class__.__name__)
+            return _non_brokered_agent_run_error(exc)
+        except Exception:  # noqa: BLE001 - deterministic protocol envelope.
+            return _non_brokered_unexpected_runtime_error()
 
         return JSONResponse(_responses_payload(spec, result))
 

@@ -48,11 +48,13 @@ class BrokeredChatModelLoop:
         *,
         http_client: httpx.AsyncClient | None = None,
         max_output_bytes: int = 64 * 1024,
+        max_response_bytes: int = 4 * 1024 * 1024,
     ) -> None:
         self.spec = spec
         self.tools = list(tools)
         self.http_client = http_client
         self.max_output_bytes = max_output_bytes
+        self.max_response_bytes = max_response_bytes
         self.tools_by_name = {tool.name: tool for tool in self.tools}
 
     async def start(self, request: RunRequest, *, call_id: str) -> ModelLoopFinal | ModelLoopToolRequest:
@@ -62,7 +64,7 @@ class BrokeredChatModelLoop:
         usage = _usage(data)
         tool_calls = message.get("tool_calls")
         if not tool_calls:
-            return ModelLoopFinal(text=_message_text(message), usage=usage)
+            return ModelLoopFinal(text=_message_text(message, max_bytes=self.max_output_bytes), usage=usage)
         if not isinstance(tool_calls, list) or len(tool_calls) != 1:
             raise AgentRunError(
                 "model requested multiple brokered tools; deterministic brokered mode supports one call per turn",
@@ -114,7 +116,7 @@ class BrokeredChatModelLoop:
         message = _choice_message(data)
         if message.get("tool_calls"):
             raise AgentRunError("model requested another brokered tool after resume", status=400, code="tool_loop_limit_exceeded")
-        return ModelLoopFinal(text=_message_text(message), usage=_usage(data))
+        return ModelLoopFinal(text=_message_text(message, max_bytes=self.max_output_bytes), usage=_usage(data))
 
     async def validate_credentials(self) -> None:
         await self._auth_headers()
@@ -165,14 +167,21 @@ class BrokeredChatModelLoop:
             client = httpx.AsyncClient(headers=headers, timeout=60)
             close_client = True
         try:
-            response = await client.post(
+            async with client.stream(
+                "POST",
                 _chat_completions_url(self.spec.model.base_url),
                 json=payload,
                 headers=headers or None,
-            )
-            response.raise_for_status()
+            ) as response:
+                response.raise_for_status()
+                response_body = await _read_response_body_bounded(
+                    response,
+                    max_bytes=self.max_response_bytes,
+                )
         except httpx.HTTPStatusError as exc:
             raise _normalized_model_http_error(exc.response.status_code) from exc
+        except AgentRunError:
+            raise
         except Exception as exc:  # noqa: BLE001 - normalize transport/model failures without leaking request URLs.
             raise AgentRunError(
                 "model service request failed",
@@ -183,7 +192,7 @@ class BrokeredChatModelLoop:
             if close_client:
                 await client.aclose()
         try:
-            data = response.json()
+            data = json.loads(response_body)
         except Exception as exc:  # noqa: BLE001 - normalize decoder failures without exposing response internals.
             raise AgentRunError(
                 "model service returned an invalid JSON response",
@@ -211,6 +220,32 @@ class BrokeredChatModelLoop:
         except AgentBuildError as exc:
             raise _model_auth_missing_error() from exc
         return headers
+
+
+async def _read_response_body_bounded(response: httpx.Response, *, max_bytes: int) -> bytearray:
+    content_length = response.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_length = int(content_length)
+        except ValueError:
+            declared_length = -1
+        if declared_length > max_bytes:
+            raise _model_response_too_large_error()
+
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        if len(body) + len(chunk) > max_bytes:
+            raise _model_response_too_large_error()
+        body.extend(chunk)
+    return body
+
+
+def _model_response_too_large_error() -> AgentRunError:
+    return AgentRunError(
+        "model response is too large to retain safely",
+        status=502,
+        code="ModelResponseTooLarge",
+    )
 
 
 def _chat_completions_url(base_url: str) -> str:
@@ -282,9 +317,22 @@ def _choice_message(data: Mapping[str, Any]) -> Mapping[str, Any]:
     return message
 
 
-def _message_text(message: Mapping[str, Any]) -> str:
+def _message_text(message: Mapping[str, Any], *, max_bytes: int) -> str:
     content = message.get("content", "")
-    return content if isinstance(content, str) else str(content or "")
+    text = content if isinstance(content, str) else str(content or "")
+    if len(text) > max_bytes:
+        raise _model_response_too_large_error()
+    try:
+        text_bytes = text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise AgentRunError(
+            "model service returned an invalid JSON response",
+            status=502,
+            code="InvalidModelResponse",
+        ) from exc
+    if len(text_bytes) > max_bytes:
+        raise _model_response_too_large_error()
+    return text
 
 
 def _parse_arguments(raw: Any) -> dict[str, Any]:
