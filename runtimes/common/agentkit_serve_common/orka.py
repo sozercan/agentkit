@@ -1124,6 +1124,120 @@ def create_orka_app(
     active_runtimes: dict[str, ActiveRuntime] = {}
     runtime_order: list[str] = []
     background_tasks: set[asyncio.Task[None]] = set()
+    runtime_close_tasks: set[asyncio.Task[BaseException | None]] = set()
+    runtime_close_tasks_by_session: dict[str, asyncio.Task[BaseException | None]] = {}
+    runtime_close_failed = False
+
+    async def run_runtime_close(active: ActiveRuntime) -> BaseException | None:
+        try:
+            await active.context.__aexit__(None, None, None)
+        except BaseException as exc:
+            return exc
+        return None
+
+    def runtime_close_error(close_task: asyncio.Task[BaseException | None]) -> BaseException | None:
+        try:
+            return close_task.result()
+        except BaseException as exc:
+            return exc
+
+    def record_runtime_close_failure(close_error: BaseException | None) -> None:
+        nonlocal runtime_close_failed
+        if close_error is not None:
+            # Do not retain exception text or tracebacks across turns: adapter
+            # cleanup errors may contain prior-turn URLs, headers, or env data.
+            runtime_close_failed = True
+
+    def new_runtime_close_failure() -> AgentRunError | None:
+        if not runtime_close_failed:
+            return None
+        return AgentRunError(
+            "runtime cleanup failed; restart required before opening another runtime session",
+            status=500,
+            code="RuntimeCloseFailed",
+        )
+
+    def runtime_close_done(runtime_session_id: str, close_task: asyncio.Task[BaseException | None]) -> None:
+        runtime_close_tasks.discard(close_task)
+        if runtime_close_tasks_by_session.get(runtime_session_id) is close_task:
+            runtime_close_tasks_by_session.pop(runtime_session_id, None)
+        # Retrieve every result even when the awaiting caller was cancelled,
+        # and fail closed after any cleanup error because framework resources
+        # may still occupy the configured runtime-session capacity.
+        record_runtime_close_failure(runtime_close_error(close_task))
+
+    async def close_runtime(runtime_session_id: str, active: ActiveRuntime) -> None:
+        close_task = asyncio.create_task(run_runtime_close(active), name="agentkit-orka-runtime-close")
+        runtime_close_tasks.add(close_task)
+        runtime_close_tasks_by_session[runtime_session_id] = close_task
+        close_task.add_done_callback(lambda task: runtime_close_done(runtime_session_id, task))
+        try:
+            # asyncio.wait does not forward cancellation to the supplied task.
+            # Unlike an abandoned shield future, it also leaves no wrapper that
+            # can report a late close failure before shutdown retrieves it.
+            await asyncio.wait((close_task,))
+        except asyncio.CancelledError:
+            # The runtime has already been removed from active ownership. Keep
+            # the close task rooted so turn cancellation cannot orphan cleanup;
+            # lifespan shutdown will await it if the caller cannot.
+            raise
+        close_error = runtime_close_error(close_task)
+        record_runtime_close_failure(close_error)
+        if close_error is not None:
+            close_failure = new_runtime_close_failure()
+            if close_failure is None:  # pragma: no cover - record above establishes the invariant.
+                raise RuntimeError("runtime cleanup failed") from None
+            raise close_failure from None
+
+    async def drain_runtime_close_tasks() -> list[BaseException]:
+        while runtime_close_tasks:
+            closing = list(runtime_close_tasks)
+            await asyncio.gather(*closing, return_exceptions=True)
+            runtime_close_tasks.difference_update(closing)
+            for close_task in closing:
+                record_runtime_close_failure(runtime_close_error(close_task))
+        runtime_close_tasks_by_session.clear()
+        close_failure = new_runtime_close_failure()
+        return [close_failure] if close_failure is not None else []
+
+    async def wait_for_runtime_session_close(runtime_session_id: str) -> None:
+        while close_task := runtime_close_tasks_by_session.get(runtime_session_id):
+            await asyncio.wait((close_task,))
+            runtime_close_tasks.discard(close_task)
+            if runtime_close_tasks_by_session.get(runtime_session_id) is close_task:
+                runtime_close_tasks_by_session.pop(runtime_session_id, None)
+            record_runtime_close_failure(runtime_close_error(close_task))
+
+    async def wait_for_runtime_close_progress() -> None:
+        closing = tuple(runtime_close_tasks)
+        if not closing:
+            return
+        done, _ = await asyncio.wait(closing, return_when=asyncio.FIRST_COMPLETED)
+        runtime_close_tasks.difference_update(done)
+        for close_task in done:
+            record_runtime_close_failure(runtime_close_error(close_task))
+
+    async def reserve_runtime_slot() -> None:
+        # create_turn enforces the advertised maxConcurrentTurns=1, and a turn
+        # publishes its terminal event only after it has stopped opening a
+        # runtime. Runtime admission is therefore serialized at this seam.
+        while True:
+            if close_failure := new_runtime_close_failure():
+                # A failed close may still own framework resources. Keep the
+                # cache fail-closed instead of treating that slot as reusable.
+                raise close_failure
+            if len(active_runtimes) + len(runtime_close_tasks) < runtime_session_limit:
+                return
+            if runtime_close_tasks:
+                # A removed runtime still owns framework resources until its
+                # close task finishes. Count it against cache capacity so
+                # repeated cancelled turns cannot build an unbounded backlog.
+                await wait_for_runtime_close_progress()
+                continue
+            evict_id = runtime_order.pop(0)
+            evicted = active_runtimes.pop(evict_id, None)
+            if evicted is not None:
+                await close_runtime(evict_id, evicted)
 
     async def get_runtime(run_request: RunRequest) -> Any:
         runtime_session_id = run_request.session_id or ""
@@ -1134,10 +1248,14 @@ def create_orka_app(
                     runtime_order.remove(runtime_session_id)
                 runtime_order.append(runtime_session_id)
                 return active.session
+            if close_failure := new_runtime_close_failure():
+                raise close_failure
             active_runtimes.pop(runtime_session_id, None)
             if runtime_session_id in runtime_order:
                 runtime_order.remove(runtime_session_id)
-            await asyncio.shield(active.context.__aexit__(None, None, None))
+            await close_runtime(runtime_session_id, active)
+        await wait_for_runtime_session_close(runtime_session_id)
+        await reserve_runtime_slot()
         # Runtime factories read the process environment today. Keep this scoped
         # section on the event loop thread so cancellation cannot leave a worker
         # thread running with turn credentials in process-global os.environ.
@@ -1146,11 +1264,6 @@ def create_orka_app(
             session = await context.__aenter__()
         active_runtimes[runtime_session_id] = ActiveRuntime(context=context, session=session, env=dict(run_request.env))
         runtime_order.append(runtime_session_id)
-        while len(runtime_order) > runtime_session_limit:
-            evict_id = runtime_order.pop(0)
-            evicted = active_runtimes.pop(evict_id, None)
-            if evicted is not None:
-                await evicted.context.__aexit__(None, None, None)
         return session
 
     @asynccontextmanager
@@ -1170,10 +1283,16 @@ def create_orka_app(
                 await asyncio.gather(*terminal_tasks, return_exceptions=True)
                 background_tasks.difference_update(terminal_tasks)
             background_tasks.clear()
+            close_errors = await drain_runtime_close_tasks()
             for active in reversed(list(active_runtimes.values())):
-                await active.context.__aexit__(None, None, None)
+                try:
+                    await active.context.__aexit__(None, None, None)
+                except BaseException as exc:
+                    close_errors.append(exc)
             active_runtimes.clear()
             runtime_order.clear()
+            if close_errors:
+                raise close_errors[0]
 
     app = FastAPI(title="agentkit-serve-orka", lifespan=lifespan)
     auth = Depends(make_auth_dependency(auth_token))

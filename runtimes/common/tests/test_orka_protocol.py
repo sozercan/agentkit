@@ -16,6 +16,7 @@ from agentkit_serve_common.config import AgentSpec
 from agentkit_serve_common.conversation import RunRequest
 from agentkit_serve_common.orka import ORKA_HARNESS_VERSION, create_orka_app
 from agentkit_serve_common.runtime import (
+    AgentRunError,
     BrokeredToolCall,
     BrokeredToolDefinition,
     BrokeredToolResult,
@@ -967,6 +968,81 @@ class EnvFactory:
         return runtime
 
 
+class SlowCloseEnvRuntime(EnvRuntime):
+    def __init__(
+        self,
+        token: str,
+        *,
+        close_delay: float,
+        close_error: BaseException | None = None,
+        close_release: threading.Event | None = None,
+    ) -> None:
+        super().__init__(token)
+        self.close_delay = close_delay
+        self.close_error = close_error
+        self.close_release = close_release
+        self.close_calls = 0
+        self.close_completed = 0
+        self.close_cancelled = 0
+        self.close_failed = 0
+        self.close_started = threading.Event()
+        self.close_finished = threading.Event()
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool | None:
+        self.close_calls += 1
+        self.close_started.set()
+        try:
+            if self.close_release is not None:
+                await asyncio.to_thread(self.close_release.wait)
+            else:
+                await asyncio.sleep(self.close_delay)
+        except asyncio.CancelledError:
+            self.close_cancelled += 1
+            raise
+        if self.close_error is not None:
+            self.close_failed += 1
+            self.close_finished.set()
+            raise self.close_error
+        self.close_completed += 1
+        self.exited += 1
+        self.close_finished.set()
+        return None
+
+
+class SlowFirstCloseEnvFactory:
+    def __init__(
+        self,
+        *,
+        close_delay: float = 0.25,
+        close_error: BaseException | None = None,
+        close_release: threading.Event | None = None,
+    ) -> None:
+        self.close_delay = close_delay
+        self.close_error = close_error
+        self.close_release = close_release
+        self.runtimes: list[SlowCloseEnvRuntime] = []
+
+    def build_runtime(self, spec: AgentSpec) -> RuntimeSession:
+        import os
+
+        delay = self.close_delay if not self.runtimes else 0
+        close_error = self.close_error if not self.runtimes else None
+        close_release = self.close_release if not self.runtimes else None
+        runtime = SlowCloseEnvRuntime(
+            os.environ["MODEL_TOKEN"],
+            close_delay=delay,
+            close_error=close_error,
+            close_release=close_release,
+        )
+        self.runtimes.append(runtime)
+        return runtime
+
+
 def test_orka_runtime_build_is_deferred_until_turn_env_is_available(monkeypatch):
     monkeypatch.delenv("MODEL_TOKEN", raising=False)
     factory = EnvFactory()
@@ -1019,6 +1095,283 @@ def test_orka_runtime_session_cache_is_bounded_and_closes_evicted_runtime(monkey
         assert factory.runtimes[1].exited == 0
 
     assert factory.runtimes[1].exited == 1
+
+
+def test_orka_capacity_eviction_cleanup_survives_turn_deadline_and_blocks_new_runtime(monkeypatch):
+    monkeypatch.delenv("MODEL_TOKEN", raising=False)
+    close_release = threading.Event()
+    capacity_wait_started = threading.Event()
+    original_asyncio_wait = asyncio.wait
+
+    async def observed_asyncio_wait(fs, *, timeout=None, return_when=asyncio.ALL_COMPLETED):
+        waitables = tuple(fs)
+        if return_when == asyncio.FIRST_COMPLETED and any(
+            isinstance(item, asyncio.Task) and item.get_name() == "agentkit-orka-runtime-close" for item in waitables
+        ):
+            capacity_wait_started.set()
+        return await original_asyncio_wait(waitables, timeout=timeout, return_when=return_when)
+
+    monkeypatch.setattr(orka_module.asyncio, "wait", observed_asyncio_wait)
+    factory = SlowFirstCloseEnvFactory(close_release=close_release)
+    app = create_orka_app(_spec(), factory, auth_token=AUTH["authorization"].removeprefix("Bearer "), max_runtime_sessions=1)
+
+    with TestClient(app) as client:
+        try:
+            first_id = _create_turn(
+                client,
+                turnID="turn-session-one",
+                runtimeSessionID="runtime-session-one",
+                correlationID="corr-one",
+                input={"prompt": "one", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "one-token"}]},
+            )
+            first_frames = _frames(client.get(f"/v1/turns/{first_id}/events", headers=AUTH).text)
+            assert first_frames[-1]["type"] == "TurnCompleted"
+
+            second_deadline = (datetime.now(UTC) + timedelta(milliseconds=500)).isoformat().replace("+00:00", "Z")
+            second_id = _create_turn(
+                client,
+                turnID="turn-session-two",
+                runtimeSessionID="runtime-session-two",
+                correlationID="corr-two",
+                deadline=second_deadline,
+                input={"prompt": "two", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "two-token"}]},
+            )
+            second_frames = _frames(client.get(f"/v1/turns/{second_id}/events", headers=AUTH).text)
+            assert second_frames[-1]["type"] == "TurnFailed"
+            assert second_frames[-1]["failed"]["reason"] == "DeadlineExceeded"
+
+            third_deadline = (datetime.now(UTC) + timedelta(milliseconds=500)).isoformat().replace("+00:00", "Z")
+            third_id = _create_turn(
+                client,
+                turnID="turn-session-three",
+                runtimeSessionID="runtime-session-three",
+                correlationID="corr-three",
+                deadline=third_deadline,
+                input={"prompt": "three", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "three-token"}]},
+            )
+            third_frames = _frames(client.get(f"/v1/turns/{third_id}/events", headers=AUTH).text)
+            assert third_frames[-1]["type"] == "TurnFailed"
+            assert third_frames[-1]["failed"]["reason"] == "DeadlineExceeded"
+            assert len(factory.runtimes) == 1
+
+            capacity_wait_started.clear()
+            fourth_id = _create_turn(
+                client,
+                turnID="turn-session-four",
+                runtimeSessionID="runtime-session-four",
+                correlationID="corr-four",
+                input={"prompt": "four", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "four-token"}]},
+            )
+            assert capacity_wait_started.wait(timeout=2)
+            close_release.set()
+            fourth_frames = _frames(client.get(f"/v1/turns/{fourth_id}/events", headers=AUTH).text)
+            assert fourth_frames[-1]["type"] == "TurnCompleted"
+        finally:
+            close_release.set()
+        assert factory.runtimes[0].close_finished.wait(timeout=2)
+
+    assert len(factory.runtimes) == 2
+    assert factory.runtimes[0].close_calls == 1
+    assert factory.runtimes[0].close_cancelled == 0
+    assert factory.runtimes[0].close_completed == 1
+    assert factory.runtimes[1].close_calls == 1
+    assert factory.runtimes[1].close_completed == 1
+
+
+def test_orka_env_replacement_cleanup_survives_turn_cancellation(monkeypatch):
+    monkeypatch.delenv("MODEL_TOKEN", raising=False)
+    close_release = threading.Event()
+    factory = SlowFirstCloseEnvFactory(close_release=close_release)
+    app = create_orka_app(_spec(), factory, auth_token=AUTH["authorization"].removeprefix("Bearer "), max_runtime_sessions=2)
+
+    with TestClient(app) as client:
+        try:
+            first_id = _create_turn(
+                client,
+                turnID="turn-env-one",
+                runtimeSessionID="runtime-session-rotating",
+                correlationID="corr-one",
+                input={"prompt": "one", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "one-token"}]},
+            )
+            first_frames = _frames(client.get(f"/v1/turns/{first_id}/events", headers=AUTH).text)
+            assert first_frames[-1]["type"] == "TurnCompleted"
+
+            second_id = _create_turn(
+                client,
+                turnID="turn-env-two",
+                runtimeSessionID="runtime-session-rotating",
+                correlationID="corr-two",
+                input={"prompt": "two", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "two-token"}]},
+            )
+            assert factory.runtimes[0].close_started.wait(timeout=2)
+            cancel = client.post(
+                f"/v1/turns/{second_id}/cancel",
+                json=_cancel_payload(
+                    turnID=second_id,
+                    runtimeSessionID="runtime-session-rotating",
+                    correlationID="corr-two",
+                ),
+                headers=AUTH,
+            )
+            second_frames = _frames(client.get(f"/v1/turns/{second_id}/events", headers=AUTH).text)
+
+            assert cancel.status_code == 202
+            assert second_frames[-1]["type"] == "TurnCancelled"
+            assert not factory.runtimes[0].close_finished.is_set()
+
+            third_deadline = (datetime.now(UTC) + timedelta(milliseconds=500)).isoformat().replace("+00:00", "Z")
+            third_id = _create_turn(
+                client,
+                turnID="turn-env-three",
+                runtimeSessionID="runtime-session-rotating",
+                correlationID="corr-three",
+                deadline=third_deadline,
+                input={"prompt": "three", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "two-token"}]},
+            )
+            third_frames = _frames(client.get(f"/v1/turns/{third_id}/events", headers=AUTH).text)
+            assert third_frames[-1]["type"] == "TurnFailed"
+            assert third_frames[-1]["failed"]["reason"] == "DeadlineExceeded"
+            assert len(factory.runtimes) == 1
+        finally:
+            close_release.set()
+        assert factory.runtimes[0].close_finished.wait(timeout=2)
+
+        fourth_id = _create_turn(
+            client,
+            turnID="turn-env-four",
+            runtimeSessionID="runtime-session-rotating",
+            correlationID="corr-four",
+            input={"prompt": "four", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "two-token"}]},
+        )
+        fourth_frames = _frames(client.get(f"/v1/turns/{fourth_id}/events", headers=AUTH).text)
+        assert fourth_frames[-1]["type"] == "TurnCompleted"
+
+    assert len(factory.runtimes) == 2
+    assert factory.runtimes[0].close_calls == 1
+    assert factory.runtimes[0].close_cancelled == 0
+    assert factory.runtimes[0].close_completed == 1
+    assert factory.runtimes[0].close_finished.is_set()
+    assert factory.runtimes[1].close_calls == 1
+    assert factory.runtimes[1].close_completed == 1
+
+
+def test_orka_capacity_eviction_close_failure_fails_uncancelled_turn_without_double_close(monkeypatch):
+    monkeypatch.delenv("MODEL_TOKEN", raising=False)
+    factory = SlowFirstCloseEnvFactory(close_delay=0, close_error=RuntimeError("runtime close failed"))
+    app = create_orka_app(_spec(), factory, auth_token=AUTH["authorization"].removeprefix("Bearer "), max_runtime_sessions=1)
+
+    with pytest.raises(AgentRunError, match="runtime cleanup failed"):
+        with TestClient(app) as client:
+            first_id = _create_turn(
+                client,
+                turnID="turn-close-failure-one",
+                runtimeSessionID="runtime-session-one",
+                correlationID="corr-one",
+                input={"prompt": "one", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "one-token"}]},
+            )
+            first_frames = _frames(client.get(f"/v1/turns/{first_id}/events", headers=AUTH).text)
+            assert first_frames[-1]["type"] == "TurnCompleted"
+
+            second_id = _create_turn(
+                client,
+                turnID="turn-close-failure-two",
+                runtimeSessionID="runtime-session-two",
+                correlationID="corr-two",
+                input={"prompt": "two", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "two-token"}]},
+            )
+            second_frames = _frames(client.get(f"/v1/turns/{second_id}/events", headers=AUTH).text)
+
+            assert second_frames[-1]["type"] == "TurnFailed"
+            assert second_frames[-1]["failed"] == {
+                "reason": "RuntimeCloseFailed",
+                "message": "runtime cleanup failed; restart required before opening another runtime session",
+                "retryable": False,
+            }
+
+            third_id = _create_turn(
+                client,
+                turnID="turn-after-close-failure",
+                runtimeSessionID="runtime-session-three",
+                correlationID="corr-three",
+                input={"prompt": "three", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "three-token"}]},
+            )
+            third_frames = _frames(client.get(f"/v1/turns/{third_id}/events", headers=AUTH).text)
+            assert third_frames[-1]["type"] == "TurnFailed"
+            assert third_frames[-1]["failed"] == {
+                "reason": "RuntimeCloseFailed",
+                "message": "runtime cleanup failed; restart required before opening another runtime session",
+                "retryable": False,
+            }
+            assert len(factory.runtimes) == 1
+
+    assert len(factory.runtimes) == 1
+    assert factory.runtimes[0].close_calls == 1
+    assert factory.runtimes[0].close_failed == 1
+    assert factory.runtimes[0].close_completed == 0
+
+
+def test_orka_shutdown_closes_active_runtime_after_orphaned_close_failure(monkeypatch):
+    monkeypatch.delenv("MODEL_TOKEN", raising=False)
+    factory = SlowFirstCloseEnvFactory(close_delay=1.0, close_error=RuntimeError("orphaned close failed"))
+    app = create_orka_app(_spec(), factory, auth_token=AUTH["authorization"].removeprefix("Bearer "), max_runtime_sessions=2)
+
+    with pytest.raises(AgentRunError, match="runtime cleanup failed"):
+        with TestClient(app) as client:
+            first_id = _create_turn(
+                client,
+                turnID="turn-orphan-failure-one",
+                runtimeSessionID="runtime-session-one",
+                correlationID="corr-one",
+                input={"prompt": "one", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "one-token"}]},
+            )
+            first_frames = _frames(client.get(f"/v1/turns/{first_id}/events", headers=AUTH).text)
+            assert first_frames[-1]["type"] == "TurnCompleted"
+
+            second_id = _create_turn(
+                client,
+                turnID="turn-orphan-failure-two",
+                runtimeSessionID="runtime-session-two",
+                correlationID="corr-two",
+                input={"prompt": "two", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "two-token"}]},
+            )
+            second_frames = _frames(client.get(f"/v1/turns/{second_id}/events", headers=AUTH).text)
+            assert second_frames[-1]["type"] == "TurnCompleted"
+
+            short_deadline = (datetime.now(UTC) + timedelta(milliseconds=500)).isoformat().replace("+00:00", "Z")
+            third_id = _create_turn(
+                client,
+                turnID="turn-orphan-failure-three",
+                runtimeSessionID="runtime-session-three",
+                correlationID="corr-three",
+                deadline=short_deadline,
+                input={"prompt": "three", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "three-token"}]},
+            )
+            third_frames = _frames(client.get(f"/v1/turns/{third_id}/events", headers=AUTH).text)
+            assert third_frames[-1]["type"] == "TurnFailed"
+            assert third_frames[-1]["failed"]["reason"] == "DeadlineExceeded"
+            assert factory.runtimes[0].close_finished.wait(timeout=2)
+
+            fourth_id = _create_turn(
+                client,
+                turnID="turn-after-orphan-failure",
+                runtimeSessionID="runtime-session-four",
+                correlationID="corr-four",
+                input={"prompt": "four", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "four-token"}]},
+            )
+            fourth_frames = _frames(client.get(f"/v1/turns/{fourth_id}/events", headers=AUTH).text)
+            assert fourth_frames[-1]["type"] == "TurnFailed"
+            assert fourth_frames[-1]["failed"] == {
+                "reason": "RuntimeCloseFailed",
+                "message": "runtime cleanup failed; restart required before opening another runtime session",
+                "retryable": False,
+            }
+            assert len(factory.runtimes) == 2
+
+    assert len(factory.runtimes) == 2
+    assert factory.runtimes[0].close_calls == 1
+    assert factory.runtimes[0].close_failed == 1
+    assert factory.runtimes[1].close_calls == 1
+    assert factory.runtimes[1].close_completed == 1
 
 
 def test_orka_required_env_must_be_supplied_per_turn_or_process(monkeypatch):
