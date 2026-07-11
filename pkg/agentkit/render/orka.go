@@ -8,7 +8,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/url"
 	"strings"
+	"unicode"
 
 	"github.com/goccy/go-yaml"
 )
@@ -66,6 +68,22 @@ type agentRuntimeCaps struct {
 	SupportsRuntimeSessions bool     `yaml:"supportsRuntimeSessions"`
 }
 
+const invalidExternalEndpointMessage = "--external-endpoint must be an absolute http(s) URL with a host and no userinfo, query, fragment, or whitespace"
+
+func validateExternalEndpoint(endpoint string) error {
+	if (!strings.HasPrefix(endpoint, "http://") && !strings.HasPrefix(endpoint, "https://")) ||
+		strings.IndexFunc(endpoint, unicode.IsSpace) >= 0 || strings.ContainsAny(endpoint, "@?#") {
+		return errors.New(invalidExternalEndpointMessage)
+	}
+	parsed, err := url.Parse(endpoint)
+	if err != nil || !parsed.IsAbs() || parsed.Opaque != "" || parsed.Hostname() == "" || parsed.User != nil ||
+		parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.RawFragment != "" ||
+		(parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return errors.New(invalidExternalEndpointMessage)
+	}
+	return nil
+}
+
 // OrkaAgentRuntime renders a core.orka.ai AgentRuntime manifest for an
 // AgentKit image that exposes the observed-mode orka.harness.v1 protocol.
 func OrkaAgentRuntime(opts OrkaAgentRuntimeOptions) ([]byte, error) {
@@ -76,9 +94,12 @@ func OrkaAgentRuntime(opts OrkaAgentRuntimeOptions) ([]byte, error) {
 	if strings.TrimSpace(opts.Image) != "" {
 		return nil, errors.New("the current Orka AgentRuntime CRD supports external endpoints only; deploy the image with AGENTKIT_PROTOCOL=orka and AGENTKIT_AUTH_TOKEN from the bearer token Secret, then pass --external-endpoint")
 	}
-	endpoint := strings.TrimSpace(opts.ExternalEndpoint)
+	endpoint := opts.ExternalEndpoint
 	if endpoint == "" {
 		return nil, errors.New("--external-endpoint is required for the current Orka AgentRuntime CRD")
+	}
+	if err := validateExternalEndpoint(endpoint); err != nil {
+		return nil, err
 	}
 	authSecretName := strings.TrimSpace(opts.AuthSecretName)
 	if authSecretName == "" {
