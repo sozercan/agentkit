@@ -832,8 +832,9 @@ def test_build_mcp_skills_provider_uses_pinned_streamable_http_factory(monkeypat
         return FakeTransport()
 
     class FakeClientSession:
-        def __init__(self, read, write):
+        def __init__(self, read, write, *, read_timeout_seconds):
             calls["session_args"] = (read, write)
+            calls["session_timeout"] = read_timeout_seconds
 
         async def __aenter__(self):
             return self
@@ -850,6 +851,7 @@ def test_build_mcp_skills_provider_uses_pinned_streamable_http_factory(monkeypat
     monkeypatch.setattr(streamable_mod, "streamablehttp_client", fake_streamablehttp_client)
     monkeypatch.setattr(session_mod, "ClientSession", FakeClientSession)
     monkeypatch.setenv("TOOLBOX_ENDPOINT", "https://example.test/toolboxes/t/mcp")
+    monkeypatch.setenv("AGENTKIT_MCP_TIMEOUT", "7")
     spec = AgentSpec.model_validate({
         "abiVersion": "v0",
         "metadata": {"name": "x"},
@@ -870,6 +872,7 @@ def test_build_mcp_skills_provider_uses_pinned_streamable_http_factory(monkeypat
     assert "httpx_client_factory" in calls
     assert "http_client" not in calls
     assert calls["initialized"] is True
+    assert calls["session_timeout"].total_seconds() == 7
 
 
 

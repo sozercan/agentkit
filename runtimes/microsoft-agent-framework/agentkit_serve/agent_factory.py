@@ -13,6 +13,7 @@ import inspect
 import os
 import time
 from contextlib import AbstractAsyncContextManager, AsyncExitStack
+from datetime import timedelta
 from types import TracebackType
 from urllib.parse import urlsplit
 
@@ -569,10 +570,11 @@ class MAFRuntime:
         from mcp.client.streamable_http import streamablehttp_client
 
         url = resolve_tool_url(tool)
+        timeout = _remote_mcp_timeout()
         http_client_factory = same_origin_mcp_httpx_client_factory(
             tool,
             url,
-            timeout=_remote_mcp_timeout(),
+            timeout=timeout,
         )
         # This compatibility API creates the AsyncClient from the factory inside
         # its own async context. Owning the transport context on our stack also
@@ -580,7 +582,13 @@ class MAFRuntime:
         read, write, _ = await self.stack.enter_async_context(
             streamablehttp_client(url=url, httpx_client_factory=http_client_factory)
         )
-        session = await self.stack.enter_async_context(ClientSession(read, write))
+        session = await self.stack.enter_async_context(
+            ClientSession(
+                read,
+                write,
+                read_timeout_seconds=timedelta(seconds=timeout),
+            )
+        )
         await session.initialize()
         return SkillsProvider(MCPSkillsSource(client=session))
 

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from unittest import mock
 
 import pytest
+from mcp import McpError
 
 from agentkit_serve import agent_factory
 from agentkit_serve_common.config import AgentSpec, ToolSpec
@@ -244,6 +246,109 @@ def test_stdio_mcp_timeout_defaults_to_120_seconds_and_honors_override(
     else:
         monkeypatch.setenv("AGENTKIT_MCP_TIMEOUT", raw)
     assert agent_factory.build_tool(tool).request_timeout == expected
+
+
+def test_mcp_skills_initialize_timeout_closes_live_transport(monkeypatch):
+    request_bodies: list[bytes] = []
+    active_writers: set[asyncio.StreamWriter] = set()
+    handler_tasks: set[asyncio.Task[None]] = set()
+    accepted = asyncio.Event()
+    disconnected = asyncio.Event()
+
+    async def handle_client(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        handler_tasks.add(task)
+        active_writers.add(writer)
+        try:
+            header_bytes = await reader.readuntil(b"\r\n\r\n")
+            headers = header_bytes.decode("ascii").split("\r\n")
+            content_length = next(
+                int(line.split(":", 1)[1].strip())
+                for line in headers
+                if line.lower().startswith("content-length:")
+            )
+            request_bodies.append(await reader.readexactly(content_length))
+            writer.write(
+                b"HTTP/1.1 202 Accepted\r\n"
+                b"Content-Length: 0\r\n"
+                b"Connection: keep-alive\r\n"
+                b"\r\n"
+            )
+            await writer.drain()
+            accepted.set()
+            await reader.read()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            active_writers.discard(writer)
+            handler_tasks.discard(task)
+            disconnected.set()
+
+    async def exercise() -> None:
+        server = await asyncio.start_server(handle_client, "127.0.0.1", 0)
+        assert server.sockets
+        port = server.sockets[0].getsockname()[1]
+        monkeypatch.setenv("AGENTKIT_MCP_TIMEOUT", "1")
+        monkeypatch.setenv("TOOLBOX_ENDPOINT", f"http://127.0.0.1:{port}/mcp")
+        spec = AgentSpec.model_validate(
+            {
+                "abiVersion": "v0",
+                "metadata": {"name": "mcp-skills-timeout"},
+                "model": {
+                    "provider": "openai-compatible",
+                    "baseURL": "https://api.openai.com/v1",
+                    "name": "gpt-4o-mini",
+                },
+                "instructions": "Be helpful.",
+                "tools": [
+                    {
+                        "name": "toolbox",
+                        "type": "mcp",
+                        "transport": "streamable-http",
+                        "urlEnv": "TOOLBOX_ENDPOINT",
+                    }
+                ],
+                "context": {
+                    "providers": [
+                        {
+                            "type": "skills",
+                            "source": "mcp",
+                            "toolRef": "toolbox",
+                        }
+                    ]
+                },
+                "expose": {"openai": True, "port": 8080},
+            }
+        )
+        runtime = agent_factory.MAFRuntime(spec)
+
+        try:
+            with pytest.raises(McpError, match="Timed out while waiting for response"):
+                await asyncio.wait_for(runtime.__aenter__(), timeout=3)
+
+            await asyncio.wait_for(accepted.wait(), timeout=1)
+            await asyncio.wait_for(disconnected.wait(), timeout=1)
+            assert runtime.agent is None
+            assert not active_writers
+            assert json.loads(request_bodies[0])["method"] == "initialize"
+        finally:
+            server.close()
+            for writer in tuple(active_writers):
+                writer.close()
+            if active_writers:
+                await asyncio.gather(
+                    *(writer.wait_closed() for writer in tuple(active_writers)),
+                    return_exceptions=True,
+                )
+            if handler_tasks:
+                await asyncio.gather(*tuple(handler_tasks), return_exceptions=True)
+            await server.wait_closed()
+
+    asyncio.run(exercise())
 
 
 def test_runtime_owns_remote_mcp_http_client_and_closes_it_after_agent(monkeypatch):
