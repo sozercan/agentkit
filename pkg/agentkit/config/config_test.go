@@ -1250,8 +1250,24 @@ func TestValidateAcceptsBrokeredToolsWithMatchingDigest(t *testing.T) {
 	}
 }
 
+func TestValidateAcceptsHarmlessBrokeredDescriptions(t *testing.T) {
+	for _, description := range []string{"Read basic telemetry", "Count model tokens", "Count model tokens 100", "Count model tokens: 1,000."} {
+		cfg := validMinimalConfig()
+		cfg.BrokeredTools = []BrokeredTool{{
+			Name:          safeLookupToolName,
+			Description:   description,
+			BrokeredClass: BrokeredClassRead,
+			Parameters:    map[string]any{jsonSchemaTypeKey: jsonSchemaTypeObject},
+		}}
+
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("description %q should be accepted: %v", description, err)
+		}
+	}
+}
+
 func TestValidateRejectsUnsafeBrokeredDescriptions(t *testing.T) {
-	for _, description := range []string{"contains sk-secret", "execution at https://tool.default", "Bearer token required", "execution at tool.default.svc.cluster.local"} {
+	for _, description := range []string{"contains sk-secret", "execution at https://tool.default", "Bearer token required", "Basic Zm9vOmJhcg==", "Basic=dXNlcjpwYXNz", "Basic user:pass", "Basic alice: pass1", "alice:pass is the Basic credential", "Use Basic credential abc123", "Use Basic `dXNlcjpwYXNz`", "Use HTTP Basic value dXNlcjpwYXNz", "Use HTTP Basic value=dXNlcjpwYXNz", "Use HTTP-Basic value dXNlcjpwYXNz", "token=abc123", `{"token":"abc123"}`, `'access_token'=abc123`, "token.value=abc123", "token[value]=abc123", "Use --token abc123", "access token abc123", "token abc123", "token 123", "token abc", "token ABCDEF", `"token" "abc123"`, "model token abc123", `input token "abc123"`, `token "abcdef"`, `"token" "ABCDEF"`, `token "abc"`, `input token '123'`, "token.value abc123", "token[value] abc123", "request.token abc123", "request/token abc123", "request-token abc123", "requesttoken abc123", `token used: 'abc'`, "Use abc123 as model [token]", "Count requests. Use model token 123", "Finished counting. Model token 123", `Finished "counting." Model token 123`, "Count model tokens 123456789012345678901234567890", "Read {auth}", "Read (header)", "Read [REDACTED_AUTH_HEADER]", "execution at tool.default.svc.cluster.local"} {
 		cfg := validMinimalConfig()
 		cfg.BrokeredTools = []BrokeredTool{{
 			Name:          safeLookupToolName,
@@ -1304,7 +1320,7 @@ func TestValidateRejectsPrivateKeyBrokeredNamesAndStrings(t *testing.T) {
 }
 
 func TestValidateRejectsUnsafeBrokeredSchemaStringValues(t *testing.T) {
-	for _, value := range []string{"see https://internal-tool", "Bearer abc", "Bearer: abc", "Bearer=abc", "authorization header", "tool.default.svc.cluster.local", "example ghp_not_real", "AWS key AKIAEXAMPLE"} {
+	for _, value := range []string{"see https://internal-tool", "Bearer abc", "Bearer: abc", "Bearer=abc", "authorization header", "token=abc123", "tool.default.svc.cluster.local", "example ghp_not_real", "AWS key AKIAEXAMPLE"} {
 		cfg := validMinimalConfig()
 		cfg.BrokeredTools = []BrokeredTool{{
 			Name:          safeLookupToolName,
@@ -1325,7 +1341,7 @@ func TestValidateRejectsUnsafeBrokeredSchemaStringValues(t *testing.T) {
 }
 
 func TestValidateRejectsCommonCredentialBrokeredParameterNames(t *testing.T) {
-	for _, field := range []string{"authentication", "authConfig", "clientSecret", "dbPassword", "passphrase", "pwd", "apiKey", credentialHeaderAPIKey, "baseUrl", "callbackURL", "apiEndpoint", "sessionCookie", "cookies"} {
+	for _, field := range []string{brokeredAuthenticationWord, "authConfig", "clientSecret", "dbPassword", "passphrase", "pwd", "apiKey", credentialHeaderAPIKey, "baseUrl", "callbackURL", "apiEndpoint", "sessionCookie", "cookies"} {
 		cfg := validMinimalConfig()
 		cfg.BrokeredTools = []BrokeredTool{{
 			Name:          safeLookupToolName,
@@ -1346,7 +1362,7 @@ func TestValidateRejectsCommonCredentialBrokeredParameterNames(t *testing.T) {
 }
 
 func TestValidateRejectsCommonCredentialBrokeredRequiredNames(t *testing.T) {
-	for _, field := range []string{"authentication", "authConfig", "clientSecret", "dbPassword", "passphrase", "pwd", "apiKey", credentialHeaderAPIKey, "baseUrl", "callbackURL", "apiEndpoint", "sessionCookie", "cookies"} {
+	for _, field := range []string{brokeredAuthenticationWord, "authConfig", "clientSecret", "dbPassword", "passphrase", "pwd", "apiKey", credentialHeaderAPIKey, "baseUrl", "callbackURL", "apiEndpoint", "sessionCookie", "cookies"} {
 		cfg := validMinimalConfig()
 		cfg.BrokeredTools = []BrokeredTool{{
 			Name:          safeLookupToolName,
@@ -1385,7 +1401,7 @@ func TestValidateAcceptsHarmlessBrokeredAuthorField(t *testing.T) {
 }
 
 func TestValidateRejectsUnsafeBrokeredToolSchema(t *testing.T) {
-	for _, unsafeName := range []string{"token", "authHeader", "authorizationHeader", "httpHeaders", "accessKey", "clientSecretValue", "tokenValue", "apiSecretKey", brokeredUnsafeCookieKey, "subscriptionKey", "xFunctionsKey"} {
+	for _, unsafeName := range []string{brokeredTokenWord, "access_token", "authHeader", "authorizationHeader", "httpHeaders", "accessKey", "clientSecretValue", "tokenValue", "apiSecretKey", brokeredUnsafeCookieKey, "subscriptionKey", "xFunctionsKey"} {
 		cfg := validMinimalConfig()
 		cfg.BrokeredTools = []BrokeredTool{{
 			Name:          safeLookupToolName,
