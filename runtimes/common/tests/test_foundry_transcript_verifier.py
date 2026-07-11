@@ -35,6 +35,8 @@ def _write_transcript(tmp_path: Path) -> Path:
                 }
             ],
         }
+        if initial_response.get("agent_session_id") is not None:
+            continuation_request["agent_session_id"] = initial_response["agent_session_id"]
         continuation_response = client.post("/responses", json=continuation_request).json()
 
     files = {
@@ -149,3 +151,36 @@ def test_verify_brokered_transcript_accepts_agentkit_generated_call_id(tmp_path)
 
     assert summary["call_id"].startswith("call_")
     assert summary["arguments"] == {"probe": True}
+
+
+def test_verify_brokered_transcript_requires_returned_agent_session_id_on_continuation(tmp_path):
+    verifier = _load_verifier()
+    transcript = _write_transcript(tmp_path)
+    initial = json.loads((transcript / "02-initial-response.json").read_text(encoding="utf-8"))
+    initial["agent_session_id"] = "gateway-session"
+    (transcript / "02-initial-response.json").write_text(json.dumps(initial), encoding="utf-8")
+    continuation = json.loads((transcript / "03-continuation-request.json").read_text(encoding="utf-8"))
+    continuation.pop("agent_session_id", None)
+    (transcript / "03-continuation-request.json").write_text(json.dumps(continuation), encoding="utf-8")
+
+    try:
+        verifier.verify_transcript(transcript)
+    except ValueError as exc:
+        assert "agent_session_id" in str(exc)
+    else:  # pragma: no cover - assertion path.
+        raise AssertionError("expected a missing continuation agent_session_id to fail")
+
+
+def test_verify_brokered_transcript_rejects_archived_continuation_proof(tmp_path):
+    verifier = _load_verifier()
+    transcript = _write_transcript(tmp_path)
+    continuation = json.loads((transcript / "03-continuation-request.json").read_text(encoding="utf-8"))
+    continuation["brokered_continuation_proof"] = "proof-must-not-be-archived"
+    (transcript / "03-continuation-request.json").write_text(json.dumps(continuation), encoding="utf-8")
+
+    try:
+        verifier.verify_transcript(transcript)
+    except ValueError as exc:
+        assert "continuation proof" in str(exc)
+    else:  # pragma: no cover - assertion path.
+        raise AssertionError("expected an archived continuation proof to fail")
