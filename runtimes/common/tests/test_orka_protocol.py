@@ -18,6 +18,7 @@ from agentkit_serve_common.orka import ORKA_HARNESS_VERSION, create_orka_app
 from agentkit_serve_common.runtime import (
     BrokeredToolCall,
     BrokeredToolDefinition,
+    BrokeredToolResult,
     OfflineEchoRuntimeFactory,
     RunResult,
     RuntimeSession,
@@ -440,16 +441,49 @@ def test_orka_protected_endpoints_require_bearer_token():
     assert cancel.status_code == 401
 
 
-def test_orka_rejects_turn_ids_that_do_not_fit_route_path():
+@pytest.mark.parametrize("turn_id", ["", " ", ".", "..", " turn", "turn ", "turn/one", r"turn\one"])
+def test_orka_rejects_turn_ids_that_are_not_trimmed_single_path_segments(turn_id: str):
     app = create_orka_app(_spec(), EchoFactory(), auth_token="test-token")
 
     with TestClient(app) as client:
-        slash = client.post("/v1/turns", json=_start_payload(turnID="bad/id"), headers=AUTH)
-        query = client.post("/v1/turns", json=_start_payload(turnID="bad?id"), headers=AUTH)
+        response = client.post("/v1/turns", json=_start_payload(turnID=turn_id), headers=AUTH)
 
-    assert slash.status_code == 400
-    assert query.status_code == 400
-    assert "URL-safe" in slash.text
+    assert response.status_code == 400
+    assert "turnID" in response.text
+
+
+@pytest.mark.parametrize(
+    ("turn_id", "escaped_turn_id"),
+    [
+        pytest.param("turn:one", "turn:one", id="colon"),
+        pytest.param("turn one", "turn%20one", id="space"),
+        pytest.param("türn-雪", "t%C3%BCrn-%E9%9B%AA", id="unicode"),
+        pytest.param("turn$&+=@", "turn$&+=@", id="orka-path-safe-reserved"),
+        pytest.param("turn,one", "turn%2Cone", id="escaped-reserved"),
+        pytest.param("turn?one", "turn%3Fone", id="query-delimiter"),
+        pytest.param("\x1cturn\x1c", "%1Cturn%1C", id="go-non-space-control"),
+        pytest.param("t" * 1024, "t" * 1024, id="long-segment"),
+    ],
+)
+def test_orka_accepts_and_path_escapes_valid_turn_segments_exactly_like_orka(turn_id: str, escaped_turn_id: str):
+    app = create_orka_app(_spec(), EchoFactory(), auth_token=AUTH["authorization"].removeprefix("Bearer "))
+
+    with TestClient(app) as client:
+        response = client.post("/v1/turns", json=_start_payload(turnID=turn_id), headers=AUTH)
+        if response.status_code == 202:
+            event_stream_path = response.json()["eventStreamPath"]
+            events = client.get(event_stream_path, headers=AUTH)
+        else:
+            event_stream_path = ""
+            events = None
+
+    assert response.status_code == 202, response.text
+    assert event_stream_path == f"/v1/turns/{escaped_turn_id}/events"
+    assert events is not None
+    assert events.status_code == 200
+    frames = _frames(events.text)
+    assert frames[0]["turnID"] == turn_id
+    assert frames[-1]["type"] == "TurnCompleted"
 
 
 def test_orka_cancel_accepts_contract_request_and_produces_cancelled_terminal_frame():
@@ -1054,6 +1088,7 @@ def test_orka_brokered_start_validates_safe_read_tool_schemas():
 class CapturingBrokeredRuntime:
     def __init__(self) -> None:
         self.tools: list[BrokeredToolDefinition] = []
+        self.results: list[BrokeredToolResult] = []
 
     async def __aenter__(self) -> RuntimeSession:
         return self
@@ -1079,6 +1114,7 @@ class CapturingBrokeredRuntime:
                 brokered_class="read",
             )
         )
+        self.results.append(result)
         return RunResult(text=f"captured {result.output}")
 
 
@@ -1091,6 +1127,111 @@ class CapturingBrokeredFactory:
 
     def build_runtime(self, spec: AgentSpec) -> RuntimeSession:
         return self.runtime
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        pytest.param({"answer": "ok"}, id="object"),
+        pytest.param([], id="array"),
+        pytest.param("", id="string"),
+        pytest.param(0, id="number"),
+        pytest.param(False, id="boolean"),
+        pytest.param(None, id="null"),
+    ],
+)
+def test_orka_brokered_tool_result_preserves_any_json_output_value(output: Any):
+    factory = CapturingBrokeredFactory()
+    app = create_orka_app(
+        _spec(), factory, AUTH["authorization"].removeprefix("Bearer "), enable_brokered_read=True
+    )
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(client, toolExecutionMode="brokered", input=_brokered_input())
+        _wait_for_event_type(client, turn_id, "ToolCallRequested")
+        continuation = _continue_payload(turnID=turn_id)
+        continuation["toolResults"][0]["output"] = output
+        response = client.post(f"/v1/turns/{turn_id}/continue", json=continuation, headers=AUTH)
+        if response.status_code == 202:
+            frames = _frames(client.get(f"/v1/turns/{turn_id}/events", headers=AUTH).text)
+        else:
+            frames = []
+
+    assert response.status_code == 202, response.text
+    assert len(factory.runtime.results) == 1
+    assert type(factory.runtime.results[0].output) is type(output)
+    assert factory.runtime.results[0].output == output
+    assert frames[2]["type"] == "ToolResultReceived"
+    assert type(frames[2]["content"]) is type(output)
+    assert frames[2]["content"] == output
+
+
+@pytest.mark.parametrize(
+    ("include_output", "expected_output_present"),
+    [
+        pytest.param(False, False, id="absent"),
+        pytest.param(True, True, id="explicit-null"),
+    ],
+)
+def test_orka_brokered_tool_result_distinguishes_absent_output_from_explicit_null(
+    include_output: bool, expected_output_present: bool
+):
+    factory = CapturingBrokeredFactory()
+    app = create_orka_app(
+        _spec(), factory, AUTH["authorization"].removeprefix("Bearer "), enable_brokered_read=True
+    )
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(client, toolExecutionMode="brokered", input=_brokered_input())
+        _wait_for_event_type(client, turn_id, "ToolCallRequested")
+        continuation = _continue_payload(turnID=turn_id)
+        if include_output:
+            continuation["toolResults"][0]["output"] = None
+        else:
+            continuation["toolResults"][0].pop("output")
+            continuation["toolResults"][0]["error"] = {
+                "code": "NoOutput",
+                "message": "tool completed without output",
+                "retryable": False,
+            }
+        response = client.post(f"/v1/turns/{turn_id}/continue", json=continuation, headers=AUTH)
+        if response.status_code == 202:
+            frames = _frames(client.get(f"/v1/turns/{turn_id}/events", headers=AUTH).text)
+        else:
+            frames = []
+
+    assert response.status_code == 202, response.text
+    assert len(factory.runtime.results) == 1
+    result = factory.runtime.results[0]
+    assert result.output is None
+    assert result.output_present is expected_output_present
+    assert frames[2]["type"] == "ToolResultReceived"
+    if include_output:
+        assert "content" in frames[2]
+        assert frames[2]["content"] is None
+    else:
+        assert "content" not in frames[2]
+        assert frames[2]["error"] == {
+            "code": "NoOutput",
+            "message": "tool completed without output",
+            "retryable": False,
+        }
+
+
+def test_orka_brokered_continue_rejects_absent_output_without_error():
+    app = create_orka_app(
+        _spec(), OfflineEchoRuntimeFactory(), AUTH["authorization"].removeprefix("Bearer "), enable_brokered_read=True
+    )
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(client, toolExecutionMode="brokered", input=_brokered_input())
+        _wait_for_event_type(client, turn_id, "ToolCallRequested")
+        continuation = _continue_payload(turnID=turn_id)
+        continuation["toolResults"][0].pop("output")
+        response = client.post(f"/v1/turns/{turn_id}/continue", json=continuation, headers=AUTH)
+
+    assert response.status_code == 400
+    assert "output or error is required" in response.text
 
 
 def test_orka_brokered_runtime_receives_only_safe_tool_definition_fields():

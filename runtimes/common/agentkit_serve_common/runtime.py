@@ -20,6 +20,7 @@ from .conversation import RunRequest
 
 OFFLINE_ORKA_ECHO_ENV = "AGENTKIT_ORKA_OFFLINE_ECHO"
 OFFLINE_ORKA_DELEGATE_AGENT_ENV = "AGENTKIT_ORKA_OFFLINE_DELEGATE_AGENT"
+_BROKERED_TOOL_OUTPUT_ABSENT = object()
 
 
 def offline_orka_echo_enabled() -> bool:
@@ -92,14 +93,33 @@ class BrokeredToolCall:
     brokered_class: Literal["read", "write", "coordination"]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class BrokeredToolResult:
-    """Result returned by Orka after policy, approval, and tool execution."""
+    """Result returned by Orka after policy, approval, and tool execution.
+
+    ``output_present`` mirrors Go ``json.RawMessage`` presence semantics so an
+    omitted output remains distinct from a present JSON ``null`` value.
+    """
 
     tool_call_id: str
     approved: bool
-    output: Mapping[str, Any] | None = None
-    error: Mapping[str, Any] | None = None
+    output: Any
+    error: Mapping[str, Any] | None
+    output_present: bool
+
+    def __init__(
+        self,
+        tool_call_id: str,
+        approved: bool,
+        output: Any = _BROKERED_TOOL_OUTPUT_ABSENT,
+        error: Mapping[str, Any] | None = None,
+    ) -> None:
+        output_present = output is not _BROKERED_TOOL_OUTPUT_ABSENT
+        object.__setattr__(self, "tool_call_id", tool_call_id)
+        object.__setattr__(self, "approved", approved)
+        object.__setattr__(self, "output", None if not output_present else output)
+        object.__setattr__(self, "error", error)
+        object.__setattr__(self, "output_present", output_present)
 
 
 @runtime_checkable

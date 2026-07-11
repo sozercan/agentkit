@@ -17,6 +17,7 @@ from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Awaitable, Callable, Mapping
+from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
@@ -53,8 +54,16 @@ _DEFAULT_MAX_TERMINAL_TURNS = 256
 _DEFAULT_MAX_RUNTIME_SESSIONS = 64
 _MAX_TERMINAL_TURNS_ENV = "AGENTKIT_ORKA_MAX_TERMINAL_TURNS"
 _MAX_RUNTIME_SESSIONS_ENV = "AGENTKIT_ORKA_MAX_RUNTIME_SESSIONS"
-_TURN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_JSON_VALUE_ABSENT = object()
+# Go net/url.PathEscape leaves these reserved bytes unescaped in a path segment.
+_ORKA_PATH_SEGMENT_SAFE = "$&+-.:=@_~"
+# Mirrors Go strings.TrimSpace/unicode.IsSpace (which excludes U+001C-U+001F).
+_ORKA_TRIM_SPACE_CHARS = (
+    "\t\n\v\f\r \x85\xa0\u1680"
+    "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+    "\u2028\u2029\u202f\u205f\u3000"
+)
 
 
 @dataclass
@@ -95,7 +104,7 @@ class TurnEvent:
     created_at: str = field(default_factory=_now_iso)
     severity: str = "info"
     summary: str = ""
-    content: Mapping[str, Any] | None = None
+    content: Any = _JSON_VALUE_ABSENT
     content_text: str = ""
     completed: Mapping[str, Any] | None = None
     failed: Mapping[str, Any] | None = None
@@ -110,7 +119,7 @@ class TurnEvent:
         return self.type in _TERMINAL_TYPES
 
     def as_frame(self) -> dict[str, Any]:
-        return {
+        frame = {
             "version": ORKA_HARNESS_VERSION,
             "type": self.type,
             "runtimeSessionID": self.runtime_session_id,
@@ -120,7 +129,6 @@ class TurnEvent:
             "createdAt": self.created_at,
             "severity": self.severity,
             "summary": self.summary,
-            "content": dict(self.content or {}),
             "contentText": self.content_text,
             "toolName": self.tool_name,
             "toolCallID": self.tool_call_id,
@@ -130,6 +138,9 @@ class TurnEvent:
             "error": dict(self.error) if self.error is not None else None,
             "metadata": dict(self.metadata),
         }
+        if self.content is not _JSON_VALUE_ABSENT:
+            frame["content"] = self.content
+        return frame
 
 
 @dataclass
@@ -175,7 +186,7 @@ class TurnState:
         *,
         severity: str = "info",
         summary: str = "",
-        content: Mapping[str, Any] | None = None,
+        content: Any = _JSON_VALUE_ABSENT,
         content_text: str = "",
         completed: Mapping[str, Any] | None = None,
         failed: Mapping[str, Any] | None = None,
@@ -383,13 +394,18 @@ def _required_string(data: Mapping[str, Any], field_name: str) -> str:
 
 
 def _turn_id_from_payload(data: Mapping[str, Any]) -> str:
-    turn_id = _required_string(data, "turnID")
-    if not _TURN_ID_RE.fullmatch(turn_id):
+    value = data.get("turnID")
+    if not isinstance(value, str):
+        raise HTTPException(status_code=400, detail="turnID is required")
+    trimmed = value.strip(_ORKA_TRIM_SPACE_CHARS)
+    if not trimmed:
+        raise HTTPException(status_code=400, detail="turnID is required")
+    if value != trimmed or value in {".", ".."} or "/" in value or "\\" in value:
         raise HTTPException(
             status_code=400,
-            detail="turnID must be URL-safe: letters, numbers, '.', '_', or '-'",
+            detail="turnID must be a single safe path segment without surrounding whitespace",
         )
-    return turn_id
+    return value
 
 
 def _mapping_of_strings(data: Any, *, field_name: str) -> dict[str, str]:
@@ -675,7 +691,7 @@ def start_turn_response(turn: TurnState) -> dict[str, Any]:
         "runtimeSessionID": turn.runtime_session_id,
         "turnID": turn.turn_id,
         "correlationID": turn.correlation_id,
-        "eventStreamPath": f"/v1/turns/{turn.turn_id}/events",
+        "eventStreamPath": f"/v1/turns/{quote(turn.turn_id, safe=_ORKA_PATH_SEGMENT_SAFE)}/events",
     }
 
 
@@ -748,7 +764,7 @@ class OrkaToolBroker:
         await self.state.append(
             "ToolResultReceived",
             summary="tool result received",
-            content=dict(result.output or {}),
+            content=result.output if result.output_present else _JSON_VALUE_ABSENT,
             error=dict(result.error) if result.error is not None else None,
             tool_name=call.name,
             tool_call_id=call.tool_call_id,
@@ -1082,26 +1098,25 @@ def create_orka_app(
             approved = raw_result.get("approved", False)
             if not isinstance(approved, bool):
                 raise HTTPException(status_code=400, detail=f"toolResults[{idx}].approved must be a boolean")
+            output_present = "output" in raw_result
             output_value = raw_result.get("output")
             error_value = raw_result.get("error")
-            if not approved and output_value is not None:
+            if not approved and output_present:
                 raise HTTPException(status_code=400, detail=f"toolResults[{idx}].output is not allowed when approved is false")
-            if output_value is None and error_value is None:
+            if not output_present and error_value is None:
                 if approved:
                     raise HTTPException(status_code=400, detail=f"toolResults[{idx}] output or error is required")
                 error_value = {"code": "ToolCallDenied", "message": "tool call was not approved", "retryable": False}
-            if output_value is not None and not isinstance(output_value, dict):
-                raise HTTPException(status_code=400, detail=f"toolResults[{idx}].output must be an object")
             if error_value is not None and not isinstance(error_value, dict):
                 raise HTTPException(status_code=400, detail=f"toolResults[{idx}].error must be an object")
-            results.append(
-                BrokeredToolResult(
-                    tool_call_id=tool_call_id,
-                    approved=approved,
-                    output=dict(output_value) if output_value is not None else None,
-                    error=dict(error_value) if error_value is not None else None,
-                )
-            )
+            result_kwargs: dict[str, Any] = {
+                "tool_call_id": tool_call_id,
+                "approved": approved,
+                "error": dict(error_value) if error_value is not None else None,
+            }
+            if output_present:
+                result_kwargs["output"] = output_value
+            results.append(BrokeredToolResult(**result_kwargs))
         async with state.condition:
             if state.terminal_event is not None:
                 known_done = all(
