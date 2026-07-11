@@ -90,7 +90,7 @@ func loadLocalAgentkitfile(ctx context.Context, c client.Client, opts map[string
 		name += " from " + filename
 	}
 	state := llb.Local(localNameDockerfile,
-		llb.IncludePatterns([]string{filename}),
+		llb.FollowPaths([]string{filename}),
 		llb.SessionID(c.BuildOpts().SessionID),
 		llb.SharedKeyHint(defaultAgentkitfileName),
 		dockerui.WithInternalName(name),

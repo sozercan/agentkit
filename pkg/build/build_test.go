@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -97,6 +98,7 @@ type fakeBuildClient struct {
 
 	mu             sync.Mutex
 	expected       []expectedSolve
+	definitions    []*pb.Definition
 	sources        [][]string
 	operationNames [][]string
 }
@@ -114,6 +116,7 @@ func (c *fakeBuildClient) Solve(_ context.Context, req client.SolveRequest) (*cl
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.definitions = append(c.definitions, req.Definition)
 	c.sources = append(c.sources, sources)
 	c.operationNames = append(c.operationNames, names)
 	index := len(c.sources) - 1
@@ -153,6 +156,15 @@ func (c *fakeBuildClient) solveSources() [][]string {
 		out[i] = append([]string(nil), c.sources[i]...)
 	}
 	return out
+}
+
+func (c *fakeBuildClient) solveDefinition(index int) *pb.Definition {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if index < 0 || index >= len(c.definitions) {
+		return nil
+	}
+	return c.definitions[index]
 }
 
 func definitionSources(def *pb.Definition) ([]string, error) {
@@ -219,6 +231,36 @@ func hasSourcePrefix(sources []string, prefix string) bool {
 	return false
 }
 
+func assertLocalSourceFollowsPath(t *testing.T, def *pb.Definition, sourcePrefix, wantPath string) {
+	t.Helper()
+	if def == nil {
+		t.Fatal("solve definition is nil")
+	}
+	for _, dt := range def.Def {
+		var op pb.Op
+		if err := op.Unmarshal(dt); err != nil {
+			t.Fatalf("unmarshal solve op: %v", err)
+		}
+		source := op.GetSource()
+		if source == nil || !strings.HasPrefix(source.Identifier, sourcePrefix) {
+			continue
+		}
+
+		var followPaths []string
+		if err := json.Unmarshal([]byte(source.Attrs[pb.AttrFollowPaths]), &followPaths); err != nil {
+			t.Fatalf("decode %s for %s: %v", pb.AttrFollowPaths, source.Identifier, err)
+		}
+		if len(followPaths) != 1 || followPaths[0] != wantPath {
+			t.Fatalf("%s = %v, want [%q]", pb.AttrFollowPaths, followPaths, wantPath)
+		}
+		if include := source.Attrs[pb.AttrIncludePatterns]; include != "" {
+			t.Fatalf("%s = %q, want empty when using BuildKit follow-path filtering", pb.AttrIncludePatterns, include)
+		}
+		return
+	}
+	t.Fatalf("definition has no source with prefix %q", sourcePrefix)
+}
+
 func fileBackedAgentkitfile(path string) []byte {
 	return []byte(fmt.Sprintf(`apiVersion: v1alpha1
 kind: Agent
@@ -257,6 +299,42 @@ func inlineAgentkitfileWithRuntime(runtime string) []byte {
 		"kind: Agent\nruntime: "+runtime+"\n",
 		1,
 	))
+}
+
+func TestLoadLocalAgentkitfileFollowsSymlinkPath(t *testing.T) {
+	const filename = "configs/agentkitfile-link.yaml"
+	configRef := &memoryReference{files: map[string][]byte{filename: inlineAgentkitfile()}}
+	c := &fakeBuildClient{
+		opts: client.BuildOpts{Opts: map[string]string{}},
+		expected: []expectedSolve{
+			{sourcePrefix: localDockerfileSourcePrefix, ref: configRef},
+		},
+	}
+
+	if _, err := loadLocalAgentkitfile(context.Background(), c, c.opts.Opts, filename); err != nil {
+		t.Fatalf("loadLocalAgentkitfile() error = %v", err)
+	}
+	assertLocalSourceFollowsPath(t, c.solveDefinition(0), localDockerfileSourcePrefix, filename)
+}
+
+func TestLocalContextReaderFollowsInstructionSymlinkPath(t *testing.T) {
+	const filename = "prompts/current.md"
+	contextRef := &memoryReference{files: map[string][]byte{filename: []byte(filePrompt)}}
+	c := &fakeBuildClient{
+		opts: client.BuildOpts{Opts: map[string]string{}},
+		expected: []expectedSolve{
+			{sourcePrefix: "local://context", ref: contextRef},
+		},
+	}
+
+	dt, err := (localContextReader{client: c}).ReadFile(context.Background(), filename)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if got := string(dt); got != filePrompt {
+		t.Fatalf("ReadFile() = %q, want %q", got, filePrompt)
+	}
+	assertLocalSourceFollowsPath(t, c.solveDefinition(0), "local://context", filename)
 }
 
 func TestBuildRejectsTargetRuntimeMismatchBeforeImageSolve(t *testing.T) {

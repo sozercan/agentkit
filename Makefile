@@ -30,8 +30,9 @@ ifneq ($(strip $(BUILDER)),)
 BUILDER_FLAG := --builder $(BUILDER)
 endif
 
-# The runtime adapter image (agentkit-serve) is linux/amd64 (its uv base is
-# amd64-only), so the test agent is built for the same platform.
+# PLATFORM keeps the runtime adapter, generated agent image, and local run on
+# one target architecture. linux/amd64 remains the compatibility default;
+# override it (for example, PLATFORM=linux/arm64) for native ARM builds.
 PLATFORM ?= linux/amd64
 
 # RUNTIME selects which runtime adapter the test-agent targets: `pydantic-ai`
@@ -88,20 +89,23 @@ build-agentkit:
 # keeps the context small).
 .PHONY: build-serve
 build-serve:
-	docker buildx build . -f runtimes/pydantic-ai/Dockerfile -t agentkit-serve:$(TAG) --load
+	docker buildx build . -f runtimes/pydantic-ai/Dockerfile \
+		--platform $(PLATFORM) -t agentkit-serve:$(TAG) --load
 
 # Build the Microsoft Agent Framework runtime adapter (agentkit-serve-maf) image.
 # This is the LLB base used when an agentkitfile selects
 # `runtime: microsoft-agent-framework` (alias `maf`).
 .PHONY: build-serve-maf
 build-serve-maf:
-	docker buildx build . -f runtimes/microsoft-agent-framework/Dockerfile -t agentkit-serve-maf:$(TAG) --load
+	docker buildx build . -f runtimes/microsoft-agent-framework/Dockerfile \
+		--platform $(PLATFORM) -t agentkit-serve-maf:$(TAG) --load
 
 # Build the LangGraph runtime adapter (agentkit-serve-langgraph) image.
 # This is the LLB base used when an agentkitfile selects `runtime: langgraph`.
 .PHONY: build-serve-langgraph
 build-serve-langgraph:
-	docker buildx build . -f runtimes/langgraph/Dockerfile -t agentkit-serve-langgraph:$(TAG) --load
+	docker buildx build . -f runtimes/langgraph/Dockerfile \
+		--platform $(PLATFORM) -t agentkit-serve-langgraph:$(TAG) --load
 
 # Build a test agent against the LOCAL frontend (BUILDKIT_SYNTAX) and the LOCAL
 # adapter (--build-arg adapter). The runtime, fixture, adapter image, and output

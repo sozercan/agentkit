@@ -24,7 +24,7 @@ type localContextReader struct {
 
 func (r localContextReader) ReadFile(ctx context.Context, path string) ([]byte, error) {
 	state := llb.Local(localNameContext,
-		llb.IncludePatterns([]string{path}),
+		llb.FollowPaths([]string{path}),
 		llb.SessionID(r.client.BuildOpts().SessionID),
 		llb.SharedKeyHint("agentkit-instructions"),
 		dockerui.WithInternalName("load instructions "+path),
