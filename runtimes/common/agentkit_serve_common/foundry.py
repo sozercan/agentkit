@@ -210,9 +210,11 @@ def _message_to_prompt(message: Any) -> str:
 
 
 def _session_id_from_request(request: Request) -> str | None:
-    # Foundry hosted agents may pass the session as a query parameter to the
-    # container and expose it as x-agent-session-id externally. The AgentKit
-    # header keeps local standalone validation provider-neutral.
+    # The hosted sandbox identity is authoritative when present. Query and
+    # header carriers remain ordered compatibility fallbacks for local use.
+    value = os.environ.get(_FOUNDRY_SESSION_ENV)
+    if value and value.strip():
+        return value.strip()
     for name in ("agent_session_id", "session_id"):
         value = request.query_params.get(name)
         if value and value.strip():
@@ -221,9 +223,6 @@ def _session_id_from_request(request: Request) -> str | None:
         value = request.headers.get(name)
         if value and value.strip():
             return value.strip()
-    value = os.environ.get(_FOUNDRY_SESSION_ENV)
-    if value and value.strip():
-        return value.strip()
     return None
 
 

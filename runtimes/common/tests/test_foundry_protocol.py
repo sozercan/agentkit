@@ -266,6 +266,63 @@ def test_foundry_protocol_forwards_session_header_and_query_param():
     assert factory.runtime.requests[1].session_id == "session-2"
 
 
+def test_foundry_invocations_prefers_hosted_session_identity_over_caller_fields(monkeypatch):
+    monkeypatch.setenv("FOUNDRY_AGENT_SESSION_ID", "hosted-session")
+    factory = EchoFactory()
+    app = create_foundry_app(_spec(), factory)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/invocations?agent_session_id=query-session",
+            headers={
+                "x-agent-session-id": "gateway-header-session",
+                "x-agentkit-session-id": "compatibility-header-session",
+            },
+            json={"message": "hello"},
+        )
+
+    assert response.status_code == 200
+    assert factory.runtime.requests[0].session_id == "hosted-session"
+
+
+def test_foundry_invocations_preserves_local_query_and_header_fallback(monkeypatch):
+    monkeypatch.delenv("FOUNDRY_AGENT_SESSION_ID", raising=False)
+    factory = EchoFactory()
+    app = create_foundry_app(_spec(), factory)
+
+    with TestClient(app) as client:
+        query_response = client.post(
+            "/invocations?session_id=query-session",
+            headers={
+                "x-agent-session-id": "gateway-header-session",
+                "x-agentkit-session-id": "compatibility-header-session",
+            },
+            json={"message": "query"},
+        )
+        gateway_header_response = client.post(
+            "/invocations",
+            headers={
+                "x-agent-session-id": "gateway-header-session",
+                "x-agentkit-session-id": "compatibility-header-session",
+            },
+            json={"message": "gateway header"},
+        )
+        compatibility_header_response = client.post(
+            "/invocations",
+            headers={"x-agentkit-session-id": "compatibility-header-session"},
+            json={"message": "compatibility header"},
+        )
+
+    assert query_response.status_code == 200
+    assert gateway_header_response.status_code == 200
+    assert compatibility_header_response.status_code == 200
+    assert [request.session_id for request in factory.runtime.requests] == [
+        "query-session",
+        "gateway-header-session",
+        "compatibility-header-session",
+    ]
+
+
 def test_foundry_responses_prefers_body_session_id_over_local_query_and_header(monkeypatch):
     monkeypatch.delenv("FOUNDRY_AGENT_SESSION_ID", raising=False)
     factory = EchoFactory()
