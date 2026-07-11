@@ -47,12 +47,12 @@ class BrokeredChatModelLoop:
         tools: Sequence[BrokeredToolDefinition],
         *,
         http_client: httpx.AsyncClient | None = None,
-        max_output_chars: int = 64_000,
+        max_output_bytes: int = 64 * 1024,
     ) -> None:
         self.spec = spec
         self.tools = list(tools)
         self.http_client = http_client
-        self.max_output_chars = max_output_chars
+        self.max_output_bytes = max_output_bytes
         self.tools_by_name = {tool.name: tool for tool in self.tools}
 
     async def start(self, request: RunRequest, *, call_id: str) -> ModelLoopFinal | ModelLoopToolRequest:
@@ -80,6 +80,7 @@ class BrokeredChatModelLoop:
             raise AgentRunError(f"model requested unknown brokered tool {name!r}", status=400, code="unknown_brokered_tool")
         raw_arguments = function.get("arguments", "{}")
         arguments = _parse_arguments(raw_arguments)
+        _validate_json_unicode(arguments)
         argument_text = json.dumps(arguments, separators=(",", ":"), sort_keys=True)
         assistant_message = {
             "role": "assistant",
@@ -95,7 +96,17 @@ class BrokeredChatModelLoop:
         return ModelLoopToolRequest(name=name, arguments=arguments, messages=[*messages, assistant_message], usage=usage)
 
     async def resume(self, messages: Sequence[Mapping[str, Any]], *, call_id: str, output: str) -> ModelLoopFinal:
-        if len(output) > self.max_output_chars:
+        if len(output) > self.max_output_bytes:
+            raise AgentRunError("brokered tool output is too large for model resume", status=413, code="brokered_output_too_large")
+        try:
+            output_bytes = output.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise AgentRunError(
+                "brokered tool output must contain valid Unicode",
+                status=400,
+                code="InvalidToolOutput",
+            ) from exc
+        if len(output_bytes) > self.max_output_bytes:
             raise AgentRunError("brokered tool output is too large for model resume", status=413, code="brokered_output_too_large")
         resumed = [dict(message) for message in messages]
         resumed.append({"role": "tool", "tool_call_id": call_id, "content": output})
@@ -104,6 +115,17 @@ class BrokeredChatModelLoop:
         if message.get("tool_calls"):
             raise AgentRunError("model requested another brokered tool after resume", status=400, code="tool_loop_limit_exceeded")
         return ModelLoopFinal(text=_message_text(message), usage=_usage(data))
+
+    async def validate_credentials(self) -> None:
+        await self._auth_headers()
+
+    def validate_static_credentials(self) -> None:
+        if self.spec.model.auth is not None:
+            return
+        try:
+            resolve_api_key(self.spec)
+        except AgentBuildError as exc:
+            raise _model_auth_missing_error() from exc
 
     def _initial_messages(self, request: RunRequest) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
@@ -136,39 +158,59 @@ class BrokeredChatModelLoop:
         if tools:
             payload["tools"] = list(tools)
             payload["tool_choice"] = "auto"
+        headers = await self._auth_headers()
         client = self.http_client
         close_client = False
         if client is None:
-            headers: dict[str, str] = {}
-            try:
-                auth = self.spec.model.auth
-                if auth is not None and auth.type == "workload-identity-token":
-                    token = os.environ.get("AGENTKIT_MODEL_WORKLOAD_IDENTITY_TOKEN")
-                    if not token:
-                        token = await asyncio.to_thread(resolve_workload_identity_token, auth.audience or "")
-                    headers["Authorization"] = f"Bearer {token}"
-                else:
-                    api_key = resolve_api_key(self.spec)
-                    if api_key != NO_AUTH_API_KEY:
-                        headers["Authorization"] = f"Bearer {api_key}"
-            except AgentBuildError as exc:
-                raise AgentRunError(str(exc), status=400, code="ModelAuthMissing") from exc
             client = httpx.AsyncClient(headers=headers, timeout=60)
             close_client = True
         try:
-            response = await client.post(_chat_completions_url(self.spec.model.base_url), json=payload)
+            response = await client.post(
+                _chat_completions_url(self.spec.model.base_url),
+                json=payload,
+                headers=headers or None,
+            )
             response.raise_for_status()
-            data = response.json()
         except httpx.HTTPStatusError as exc:
-            raise AgentRunError(str(exc), status=exc.response.status_code, code="ModelHTTPError") from exc
-        except Exception as exc:  # noqa: BLE001 - normalize transport/model failures.
-            raise AgentRunError(str(exc), status=502, code=exc.__class__.__name__) from exc
+            raise _normalized_model_http_error(exc.response.status_code) from exc
+        except Exception as exc:  # noqa: BLE001 - normalize transport/model failures without leaking request URLs.
+            raise AgentRunError(
+                "model service request failed",
+                status=502,
+                code="ModelUpstreamError",
+            ) from exc
         finally:
             if close_client:
                 await client.aclose()
+        try:
+            data = response.json()
+        except Exception as exc:  # noqa: BLE001 - normalize decoder failures without exposing response internals.
+            raise AgentRunError(
+                "model service returned an invalid JSON response",
+                status=502,
+                code="InvalidModelResponse",
+            ) from exc
         if not isinstance(data, dict):
             raise AgentRunError("model response must be a JSON object", status=502, code="InvalidModelResponse")
+        _validate_json_unicode(data)
         return data
+
+    async def _auth_headers(self) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        try:
+            auth = self.spec.model.auth
+            if auth is not None and auth.type == "workload-identity-token":
+                token = os.environ.get("AGENTKIT_MODEL_WORKLOAD_IDENTITY_TOKEN")
+                if not token:
+                    token = await asyncio.to_thread(resolve_workload_identity_token, auth.audience or "")
+                headers["Authorization"] = f"Bearer {token}"
+            else:
+                api_key = resolve_api_key(self.spec)
+                if api_key != NO_AUTH_API_KEY:
+                    headers["Authorization"] = f"Bearer {api_key}"
+        except AgentBuildError as exc:
+            raise _model_auth_missing_error() from exc
+        return headers
 
 
 def _chat_completions_url(base_url: str) -> str:
@@ -176,6 +218,55 @@ def _chat_completions_url(base_url: str) -> str:
     if root.endswith("/chat/completions"):
         return root
     return f"{root}/chat/completions"
+
+
+def _normalized_model_http_error(status_code: int) -> AgentRunError:
+    if status_code in {401, 403}:
+        return AgentRunError(
+            "model service rejected configured credentials",
+            status=503,
+            code="ModelAuthRejected",
+        )
+    if status_code == 429 or status_code >= 500:
+        return AgentRunError(
+            "model service is unavailable",
+            status=503,
+            code="ModelUnavailable",
+        )
+    return AgentRunError(
+        "model service request failed",
+        status=502,
+        code="ModelUpstreamError",
+    )
+
+
+def _validate_json_unicode(value: Any) -> None:
+    pending = [iter((value,))]
+    while pending:
+        try:
+            current = next(pending[-1])
+        except StopIteration:
+            pending.pop()
+            continue
+        if isinstance(current, str):
+            if any(0xD800 <= ord(char) <= 0xDFFF for char in current):
+                raise AgentRunError(
+                    "model service returned an invalid JSON response",
+                    status=502,
+                    code="InvalidModelResponse",
+                )
+        elif isinstance(current, Mapping):
+            pending.append(iter(item for pair in current.items() for item in pair))
+        elif isinstance(current, (list, tuple)):
+            pending.append(iter(current))
+
+
+def _model_auth_missing_error() -> AgentRunError:
+    return AgentRunError(
+        "model authentication is not configured",
+        status=503,
+        code="ModelAuthMissing",
+    )
 
 
 def _choice_message(data: Mapping[str, Any]) -> Mapping[str, Any]:
