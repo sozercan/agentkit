@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -76,6 +77,22 @@ func TestNewImageConfigUsesEffectiveAgentContract(t *testing.T) {
 	}
 	if got := img.Config.Labels[testTeamLabel]; got != testTeamValue {
 		t.Fatalf("custom label = %q, want %s", got, testTeamValue)
+	}
+}
+
+func TestNewImageConfigPreservesTargetPlatformIdentity(t *testing.T) {
+	platform := &specs.Platform{
+		Architecture: "arm",
+		OS:           "windows",
+		OSVersion:    "10.0.20348.2113",
+		OSFeatures:   []string{"win32k"},
+		Variant:      "v7",
+	}
+
+	img := NewImageConfig(imageAgent(runtimes.MAF, 0), platform)
+
+	if !reflect.DeepEqual(img.Platform, *platform) {
+		t.Fatalf("Platform = %#v, want full target platform %#v", img.Platform, *platform)
 	}
 }
 

@@ -23,10 +23,7 @@ const (
 // loopback by default, and exposes the serve port.
 func NewImageConfig(agent effective.Agent, platform *specs.Platform) *specs.Image {
 	img := &specs.Image{
-		Platform: specs.Platform{
-			Architecture: platform.Architecture,
-			OS:           utils.PlatformLinux,
-		},
+		Platform: *platform,
 	}
 	img.RootFS.Type = "layers"
 
