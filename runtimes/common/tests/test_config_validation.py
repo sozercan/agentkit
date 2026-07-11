@@ -6,6 +6,7 @@ from copy import deepcopy
 import pytest
 import yaml
 
+from _brokered_description_cases import HARMLESS_BROKERED_DESCRIPTIONS, UNSAFE_BROKERED_DESCRIPTIONS
 from agentkit_serve_common.config import ConfigError, load, load_or_exit, validate_required_env
 
 
@@ -479,7 +480,33 @@ def test_load_accepts_static_brokered_tools_with_matching_digest(tmp_path):
     assert spec.brokered_tools[0].schema_digest == digest
 
 
-@pytest.mark.parametrize("description", ["contains sk-secret", "execution at https://tool.default", "Bearer token required"])
+@pytest.mark.parametrize(
+    "description",
+    HARMLESS_BROKERED_DESCRIPTIONS,
+)
+def test_load_accepts_harmless_brokered_tool_descriptions(tmp_path, description: str):
+    spec_dict = deepcopy(_BASE_SPEC)
+    spec_dict.update(
+        tools=[],
+        brokeredTools=[
+            {
+                "name": "safe_lookup",
+                "description": description,
+                "brokeredClass": "read",
+                "parameters": {"type": "object"},
+            }
+        ],
+    )
+
+    spec = load(_write_spec(tmp_path, spec_dict))
+
+    assert spec.brokered_tools[0].description == description
+
+
+@pytest.mark.parametrize(
+    "description",
+    UNSAFE_BROKERED_DESCRIPTIONS,
+)
 def test_load_rejects_unsafe_brokered_tool_descriptions(tmp_path, description: str):
     msg = _invalid_message(
         tmp_path,
@@ -538,7 +565,21 @@ def test_load_rejects_unsafe_brokered_parameter_names(tmp_path, unsafe_name: str
     assert "not safe" in msg
 
 
-@pytest.mark.parametrize("value", ["see https://internal-tool", "Bearer abc", "authorization header", "Cookie: session=abc", "x-api-key: abc", "api_key=abc", "x_api_key: abc", "format password", "enter passphrase"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "see https://internal-tool",
+        "Bearer abc",
+        "authorization header",
+        "token=abc123",
+        "Cookie: session=abc",
+        "x-api-key: abc",
+        "api_key=abc",
+        "x_api_key: abc",
+        "format password",
+        "enter passphrase",
+    ],
+)
 def test_load_rejects_unsafe_brokered_schema_string_values(tmp_path, value: str):
     msg = _invalid_message(
         tmp_path,

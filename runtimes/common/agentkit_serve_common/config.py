@@ -8,6 +8,8 @@ the *baked* file: ``instructions`` is already a fully-resolved scalar string and
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import math
@@ -53,6 +55,62 @@ _CREDENTIAL_HEADER_NAMES = {
 }
 _BROKERED_CLASSES = {"read", "write", "coordination"}
 _BROKERED_SCHEMA_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_BROKERED_BASIC_VALUE_RE = re.compile(
+    r"(?:^|[^A-Za-z0-9_ſK])"
+    r"[bB][aA][sSſ][iI][cC]"
+    r"[^A-Za-z0-9_ſK]+?([A-Za-z0-9+/ſK]+={0,2})"
+)
+_BROKERED_BASE64_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
+)
+_BROKERED_GO_WHITESPACE = frozenset(
+    "\t\n\v\f\r \u0085\u00a0\u1680"
+    "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+    "\u2028\u2029\u202f\u205f\u3000"
+)
+# Go 1.26's unicode.Version is 15.0. Python 3.14 uses Unicode 16 and lowercases
+# these newly assigned capitals, while Go deliberately leaves them unchanged.
+_BROKERED_GO15_LOWER_IDENTITY_OVERRIDES = frozenset(
+    {"\u1c89", "\ua7cb", "\ua7cc", "\ua7da", "\ua7dc"}
+    | {chr(codepoint) for codepoint in range(0x10D50, 0x10D66)}
+)
+_HARMLESS_BROKERED_TOKEN_COUNT_INTENTS = frozenset(
+    {
+        "count",
+        "counting",
+        "counts",
+        "measure",
+        "measures",
+        "measuring",
+        "report",
+        "reporting",
+        "reports",
+        "track",
+        "tracking",
+    }
+)
+_HARMLESS_BROKERED_TOKEN_QUALIFIERS = frozenset(
+    {"completion", "context", "count", "counting", "counts", "input", "model", "output", "prompt", "usage"}
+)
+_HARMLESS_BROKERED_TOKEN_WORDS = frozenset(
+    {"tokenization", "tokenize", "tokenized", "tokenizer", "tokenizers", "tokenizing"}
+)
+_BROKERED_CREDENTIAL_TOKEN_WORDS = frozenset(
+    {
+        "accesstoken",
+        "apitoken",
+        "authtoken",
+        "authenticationtoken",
+        "authorizationtoken",
+        "bearertoken",
+        "credentialtoken",
+        "identitytoken",
+        "oauthtoken",
+        "refreshtoken",
+        "secrettoken",
+        "sessiontoken",
+    }
+)
 _MAX_BROKERED_SCHEMA_BYTES = 64 * 1024
 _UNSAFE_BROKERED_FIELD_NAMES = {
     "auth",
@@ -110,17 +168,284 @@ def _contains_secret_prefix(value: str) -> bool:
     return any(prefix in value for prefix in _SECRET_VALUE_PREFIXES)
 
 
-def _unsafe_brokered_text(value: str) -> bool:
-    lowered = value.lower()
-    normalized = re.sub(r"[^a-z0-9]", "", lowered)
+def _normalize_brokered_key(value: str) -> str:
+    return "".join(
+        char.lower()
+        for char in value
+        if "a" <= char <= "z" or "A" <= char <= "Z" or "0" <= char <= "9"
+    )
+
+
+def _go_lower(value: str) -> str:
+    """Match Go's rune-by-rune strings.ToLower behavior for validator parity."""
+
+    lowered: list[str] = []
+    for char in value:
+        if char == "\u0130":
+            # Python expands this to ``i`` + COMBINING DOT; Go's simple rune
+            # mapping produces one ASCII ``i``.
+            lowered.append("i")
+        elif char in _BROKERED_GO15_LOWER_IDENTITY_OVERRIDES:
+            lowered.append(char)
+        else:
+            lowered.append(char.lower())
+    return "".join(lowered)
+
+
+def _is_brokered_word_char(value: str) -> bool:
     return (
-        (_looks_like_secret_literal(value) or _contains_secret_prefix(value))
+        "a" <= value <= "z"
+        or "A" <= value <= "Z"
+        or "0" <= value <= "9"
+        or value == "_"
+    )
+
+
+def _contains_brokered_word(value: str, word: str) -> bool:
+    start = 0
+    while True:
+        index = value.find(word, start)
+        if index < 0:
+            return False
+        after = index + len(word)
+        before_ok = index == 0 or not _is_brokered_word_char(value[index - 1])
+        after_ok = after == len(value) or not _is_brokered_word_char(value[after])
+        if before_ok and after_ok:
+            return True
+        start = after
+
+
+def _split_brokered_fields(value: str) -> list[str]:
+    """Match Go strings.Fields for cross-language validator parity."""
+
+    fields: list[str] = []
+    field_start: int | None = None
+    for index, char in enumerate(value):
+        if char in _BROKERED_GO_WHITESPACE:
+            if field_start is not None:
+                fields.append(value[field_start:index])
+                field_start = None
+        elif field_start is None:
+            field_start = index
+    if field_start is not None:
+        fields.append(value[field_start:])
+    return fields
+
+
+def _decode_brokered_basic_value(value: str) -> bool:
+    start = 0
+    while start < len(value) and value[start] not in _BROKERED_BASE64_CHARS:
+        start += 1
+    end = len(value)
+    while end > start and value[end - 1] not in _BROKERED_BASE64_CHARS:
+        end -= 1
+    encoded = value[start:end]
+    if not encoded:
+        return False
+
+    candidates = [encoded]
+    if "=" not in encoded:
+        candidates.append(encoded + "=" * (-len(encoded) % 4))
+    for candidate in candidates:
+        try:
+            decoded = base64.b64decode(candidate, validate=True)
+        except (ValueError, binascii.Error):
+            continue
+        if b":" in decoded:
+            return True
+    return False
+
+
+def _is_brokered_basic_value(value: str) -> bool:
+    plain = value.strip("\"'`()[]{}<>,;.")
+    separator = plain.find(":")
+    if 0 < separator < len(plain) - 1:
+        return True
+    if _decode_brokered_basic_value(value):
+        return True
+    return any(
+        char in ":=" and _decode_brokered_basic_value(value[index + 1 :])
+        for index, char in enumerate(value)
+    )
+
+
+def _contains_brokered_basic_auth_reference(value: str) -> bool:
+    lowered = _go_lower(value)
+    if not _contains_brokered_word(lowered, "basic"):
+        return False
+    if any(
+        _contains_brokered_word(lowered, word)
+        for word in ("auth", "authentication", "authorization")
+    ):
+        return True
+    if any(_is_brokered_basic_value(match.group(1)) for match in _BROKERED_BASIC_VALUE_RE.finditer(value)):
+        return True
+
+    fields = _split_brokered_fields(value)
+    if any(_is_brokered_basic_value(field) for field in fields):
+        return True
+    for index, field in enumerate(fields):
+        if not _contains_brokered_word(_go_lower(field), "basic"):
+            continue
+        candidates = fields[index + 1 :]
+        for candidate_index, candidate in enumerate(candidates):
+            if _is_brokered_basic_value(candidate):
+                return True
+            plain = candidate.strip("\"'`()[]{}<>,;.")
+            if plain.endswith(":") and candidate_index + 1 < len(candidates):
+                return True
+            if any(char in candidate for char in ".!?;"):
+                break
+    return False
+
+
+def _has_brokered_structured_key_shape(value: str) -> bool:
+    return (
+        value.lstrip("\"'`([{<").startswith("-")
+        or any(char in value for char in "_/.[]{}()<>\"'`")
+        or value != _go_lower(value)
+    )
+
+
+def _ends_brokered_sentence(value: str) -> bool:
+    value = value.rstrip("\"'`)]}>,")
+    return bool(value) and value[-1] in ".!?;"
+
+
+def _is_harmless_brokered_token_count_intent(value: str) -> bool:
+    return value in _HARMLESS_BROKERED_TOKEN_COUNT_INTENTS
+
+
+def _has_adjacent_brokered_token_count_intent(fields: list[str], token_index: int) -> bool:
+    if (
+        token_index > 0
+        and not _ends_brokered_sentence(fields[token_index - 1])
+        and _is_harmless_brokered_token_count_intent(_normalize_brokered_key(fields[token_index - 1]))
+    ):
+        return True
+    return (
+        token_index > 1
+        and not _ends_brokered_sentence(fields[token_index - 2])
+        and _is_harmless_brokered_token_count_intent(_normalize_brokered_key(fields[token_index - 2]))
+    )
+
+
+def _is_harmless_brokered_token_qualifier(value: str) -> bool:
+    return value in _HARMLESS_BROKERED_TOKEN_QUALIFIERS
+
+
+def _is_brokered_numeric_count(value: str) -> bool:
+    wrapped = value.lstrip("([{<")
+    if wrapped and wrapped[0] in "\"'`":
+        return False
+    value = value.strip("\"'`()[]{}<>,;:.")
+    if not value:
+        return False
+    parts = value.split(",")
+    digits = 0
+    for index, part in enumerate(parts):
+        if (
+            not part
+            or index == 0
+            and len(parts) > 1
+            and len(part) > 3
+            or index > 0
+            and len(part) != 3
+        ):
+            return False
+        for char in part:
+            if not "0" <= char <= "9":
+                return False
+            digits += 1
+            if digits > 20:
+                return False
+    return digits > 0
+
+
+def _is_harmless_brokered_token_use(fields: list[str], index: int, previous: str) -> bool:
+    if (
+        _has_brokered_structured_key_shape(fields[index])
+        or not _is_harmless_brokered_token_qualifier(previous)
+        or not _has_adjacent_brokered_token_count_intent(fields, index)
+    ):
+        return False
+    if index + 1 == len(fields):
+        return True
+    return index + 2 == len(fields) and _is_brokered_numeric_count(fields[index + 1])
+
+
+def _is_harmless_brokered_token_count_assignment(value: str, separator: int) -> bool:
+    if value[separator] != ":":
+        return False
+    left_fields = _split_brokered_fields(value[:separator])
+    right_fields = _split_brokered_fields(value[separator + 1 :])
+    if len(left_fields) < 2 or len(right_fields) != 1:
+        return False
+    key = _normalize_brokered_key(left_fields[-1])
+    if key not in {"token", "tokens"}:
+        return False
+    qualifier = _normalize_brokered_key(left_fields[-2])
+    return (
+        _is_harmless_brokered_token_qualifier(qualifier)
+        and _has_adjacent_brokered_token_count_intent(left_fields, len(left_fields) - 1)
+        and _is_brokered_numeric_count(right_fields[0])
+    )
+
+
+def _contains_brokered_credential_assignment(value: str) -> bool:
+    for separator, char in enumerate(value):
+        if char not in ":=":
+            continue
+        if _is_harmless_brokered_token_count_assignment(value, separator):
+            continue
+        fields = _split_brokered_fields(value[:separator])
+        if fields and _unsafe_brokered_key(fields[-1]) is not None:
+            return True
+    return False
+
+
+def _is_harmless_brokered_token_word(value: str) -> bool:
+    return value in _HARMLESS_BROKERED_TOKEN_WORDS
+
+
+def _contains_brokered_credential_reference(value: str) -> bool:
+    fields = _split_brokered_fields(value)
+    previous = ""
+    for index, field in enumerate(fields):
+        normalized = _normalize_brokered_key(field)
+        if not normalized:
+            continue
+        if normalized in {"token", "tokens"}:
+            if not _is_harmless_brokered_token_use(fields, index, _normalize_brokered_key(previous)):
+                return True
+            previous = field
+            continue
+        if "token" in normalized and not _is_harmless_brokered_token_word(normalized):
+            return True
+        if _has_brokered_structured_key_shape(field) and _unsafe_brokered_key(field) is not None:
+            return True
+        if normalized in _BROKERED_CREDENTIAL_TOKEN_WORDS:
+            return True
+        previous = field
+    return False
+
+
+def _unsafe_brokered_description(value: str) -> bool:
+    # Keep this in lockstep with Go's hasUnsafeBrokeredDescription. Descriptions
+    # allow harmless prose about basic telemetry and token counts, but not values.
+    lowered = _go_lower(value)
+    normalized = _normalize_brokered_key(lowered)
+    return (
+        _contains_secret_prefix(value)
         or "://" in value
-        or re.search(r"\bbearer\b", lowered) is not None
-        or re.search(r"\bbasic\b", lowered) is not None
+        or _contains_brokered_word(lowered, "bearer")
+        or _contains_brokered_word(lowered, "credential")
+        or _contains_brokered_word(lowered, "credentials")
+        or _contains_brokered_basic_auth_reference(value)
+        or _contains_brokered_credential_assignment(value)
+        or _contains_brokered_credential_reference(value)
         or "authorization" in lowered
         or "secret" in lowered
-        or "token" in lowered
         or "password" in lowered
         or "passphrase" in lowered
         or "pwd" in lowered
@@ -142,6 +467,18 @@ def _unsafe_brokered_text(value: str) -> bool:
         or "key material" in lowered
         or ".svc" in lowered
         or "cluster.local" in lowered
+    )
+
+
+def _unsafe_brokered_text(value: str) -> bool:
+    # Arbitrary schema strings stay stricter, matching Go's hasUnsafeBrokeredText.
+    # The delegated description check uses _contains_secret_prefix, which
+    # subsumes the older startswith-only _looks_like_secret_literal guard.
+    lowered = _go_lower(value)
+    return (
+        _unsafe_brokered_description(value)
+        or _contains_brokered_word(lowered, "basic")
+        or "token" in lowered
     )
 
 
@@ -219,7 +556,7 @@ def brokered_tool_schema_digest(
 
 
 def _unsafe_brokered_key(value: str) -> str | None:
-    normalized = re.sub(r"[^A-Za-z0-9]", "", value).lower()
+    normalized = _normalize_brokered_key(value)
     if normalized in _UNSAFE_BROKERED_FIELD_NAMES:
         return value
     auth_like = (normalized.startswith("auth") and not normalized.startswith("author")) or normalized.endswith("auth")
@@ -701,7 +1038,7 @@ class BrokeredToolSpec(_Strict):
     @field_validator("description")
     @classmethod
     def _safe_description(cls, value: str) -> str:
-        if _unsafe_brokered_text(value):
+        if _unsafe_brokered_description(value):
             raise ValueError("brokered tool description must not contain URLs or secret-like material")
         return value
 
