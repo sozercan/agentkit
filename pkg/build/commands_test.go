@@ -56,6 +56,77 @@ func makeAdapterDryRunCommand(target string) *exec.Cmd {
 	}
 }
 
+func TestRunTestAgentIsHostReachableAndCapturesCurlToken(t *testing.T) {
+	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatalf("resolve repository root: %v", err)
+	}
+	tempDir := t.TempDir()
+	binDir := filepath.Join(tempDir, "bin")
+	if err := os.Mkdir(binDir, 0o755); err != nil {
+		t.Fatalf("create fake bin directory: %v", err)
+	}
+	commandLog := filepath.Join(tempDir, "commands.log")
+
+	writeCommandStub(t, binDir, "docker", `
+{
+  printf 'docker'
+  for arg in "$@"; do printf '\t%s' "$arg"; done
+  printf '\n'
+} >>"${COMMAND_LOG}"
+`)
+
+	const modelKey = "model-key-must-not-appear"
+	const localToken = "command-capture-token"
+	cmd := exec.Command(
+		"make",
+		"--no-print-directory",
+		"run-test-agent",
+		"PLATFORM=linux/arm64",
+		"TAG=command-capture",
+		"LOCAL_AUTH_TOKEN="+localToken,
+	)
+	cmd.Dir = repoRoot
+	cmd.Env = replaceEnvironment(os.Environ(), map[string]string{
+		"COMMAND_LOG":    commandLog,
+		"MAKEFLAGS":      "",
+		"OPENAI_API_KEY": modelKey,
+		"PATH":           binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+	})
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run-test-agent command capture failed: %v\n%s", err, out)
+	}
+	logBytes, err := os.ReadFile(commandLog)
+	if err != nil {
+		t.Fatalf("read command log: %v", err)
+	}
+	command := string(logBytes)
+	for _, want := range []string{
+		"\t-p\t127.0.0.1:8080:8080\t",
+		"\t-e\tAGENTKIT_BIND=0.0.0.0\t",
+		"\t-e\tAGENTKIT_AUTH_TOKEN=" + localToken + "\t",
+		"\t-e\tOPENAI_API_KEY\t",
+		"\thello-agent:command-capture\n",
+	} {
+		if !strings.Contains(command, want) {
+			t.Fatalf("captured docker command = %q, want substring %q", command, want)
+		}
+	}
+	combined := string(out) + command
+	if strings.Contains(combined, modelKey) {
+		t.Fatalf("run-test-agent output leaked model key: %q", combined)
+	}
+	for _, want := range []string{
+		"Authorization: Bearer " + localToken,
+		"http://127.0.0.1:8080/v1/models",
+	} {
+		if !strings.Contains(string(out), want) {
+			t.Fatalf("run-test-agent output = %q, want substring %q", out, want)
+		}
+	}
+}
+
 func TestLiveCopilotScriptForwardsDetectedPlatformToAdapterBuild(t *testing.T) {
 	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {

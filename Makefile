@@ -35,6 +35,11 @@ endif
 # override it (for example, PLATFORM=linux/arm64) for native ARM builds.
 PLATFORM ?= linux/amd64
 
+# The local run target binds the service across the container namespace, which
+# requires bearer auth. Override this non-production token when desired, e.g.
+# `make run-test-agent LOCAL_AUTH_TOKEN=my-local-token`.
+LOCAL_AUTH_TOKEN ?= agentkit-local-dev-token
+
 # RUNTIME selects which runtime adapter the test-agent targets: `pydantic-ai`
 # (default), Microsoft Agent Framework (`maf` alias or canonical name), or
 # LangGraph (`langgraph`). build-test-agent derives the adapter image, fixture,
@@ -120,8 +125,17 @@ build-test-agent:
 		--platform $(PLATFORM) \
 		-t $(AGENT_IMAGE) --load --provenance=false
 
-# Run the built test agent. Expects OPENAI_API_KEY in the environment; the agent
-# binds 127.0.0.1 inside the container and serves the OpenAI /v1 façade on :8080.
+# Run the built test agent. Expects OPENAI_API_KEY in the environment and forwards
+# it by name so its value never appears in the command line. The service must bind
+# 0.0.0.0 inside the container to cross the container network namespace, while the
+# published host socket remains loopback-only. The expanded curl command records
+# the configurable local bearer token required by that non-loopback container bind.
 .PHONY: run-test-agent
 run-test-agent:
-	docker run --rm --platform $(PLATFORM) -p 127.0.0.1:8080:8080 -e OPENAI_API_KEY=$$OPENAI_API_KEY $(AGENT_IMAGE)
+	@printf '%s\n' 'curl -fsS -H "Authorization: Bearer $(LOCAL_AUTH_TOKEN)" http://127.0.0.1:8080/v1/models'
+	docker run --rm --platform $(PLATFORM) \
+		-p 127.0.0.1:8080:8080 \
+		-e AGENTKIT_BIND=0.0.0.0 \
+		-e AGENTKIT_AUTH_TOKEN="$(LOCAL_AUTH_TOKEN)" \
+		-e OPENAI_API_KEY \
+		$(AGENT_IMAGE)
