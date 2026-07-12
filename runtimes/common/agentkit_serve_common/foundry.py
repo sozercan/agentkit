@@ -452,14 +452,17 @@ class _FoundryResponseStateStore:
             return
         try:
             data = json.loads(self.state_file.read_text(encoding="utf-8"))
-            states = data.get("states", {}) if isinstance(data, Mapping) else {}
+            if not isinstance(data, Mapping):
+                raise ValueError("Foundry response state file root must be an object")
+            states = data.get("states", {})
             if not isinstance(states, Mapping):
                 raise ValueError("Foundry response state file states must be an object")
-            self._states = {str(response_id): _state_from_payload(state) for response_id, state in states.items() if isinstance(state, Mapping)}
+            if not all(isinstance(state, Mapping) for state in states.values()):
+                raise ValueError("Foundry response state entries must be objects")
+            self._states = {str(response_id): _state_from_payload(state) for response_id, state in states.items()}
             self.purge_expired()
         except (OSError, json.JSONDecodeError, ValueError) as exc:
-            logger.warning("ignoring invalid Foundry response state file %s: %s", self.state_file, exc)
-            self._states = {}
+            raise RuntimeError(f"invalid Foundry response state file {self.state_file}: {exc}") from exc
 
     def _persist(self) -> None:
         if self.state_file is None:
@@ -610,8 +613,7 @@ def _json_object_from_output(output: Any) -> dict[str, Any]:
         unexpected = set(parsed) - {"approved", "error"}
         if unexpected:
             raise ValueError("denied function_call_output.output contains unsupported fields")
-        error = parsed.get("error", {})
-        if error is not None and not isinstance(error, dict):
+        if "error" not in parsed or not isinstance(parsed["error"], dict):
             raise ValueError("denied function_call_output.output.error must be an object")
     _reject_nonfinite_json_values(parsed, path="function_call_output.output")
     return json.loads(json.dumps(parsed, allow_nan=False, separators=(",", ":"), sort_keys=True))
@@ -1393,8 +1395,19 @@ async def _handle_brokered_continuation(
     call = state.pending_calls.get(call_id)
     if call is None:
         return _error("unknown function_call_output call_id", status=400, code="unknown_call_id")
+    raw_output = item.get("output")
+    if isinstance(raw_output, str):
+        try:
+            if len(raw_output) > max_output_bytes or len(raw_output.encode("utf-8")) > max_output_bytes:
+                return _error(
+                    "brokered function_call_output is too large",
+                    status=413,
+                    code="brokered_output_too_large",
+                )
+        except UnicodeEncodeError as exc:
+            return _error(str(exc), status=400, code="invalid_function_call_output")
     try:
-        parsed_output = _json_object_from_output(item.get("output"))
+        parsed_output = _json_object_from_output(raw_output)
     except ValueError as exc:
         return _error(str(exc), status=400, code="invalid_function_call_output")
     output_json = _canonical_output_json(parsed_output)
@@ -1431,6 +1444,7 @@ async def _handle_brokered_continuation(
         return _error("previous response is not pending a tool result", status=409, code="response_not_pending")
 
     state.accepted_outputs[call_id] = output_json
+    state.expires_at = time.time() + store.ttl_seconds
     store.save(state)
     if state.model_messages is not None and model_loop is not None:
         state.status = "resuming"

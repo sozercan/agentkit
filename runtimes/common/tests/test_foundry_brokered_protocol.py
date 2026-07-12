@@ -921,6 +921,35 @@ def test_foundry_brokered_rejects_oversized_function_call_output_before_state_ch
     assert accepted.status_code == 200, accepted.text
 
 
+def test_foundry_brokered_rejects_oversized_raw_output_before_json_parsing(monkeypatch):
+    app = _app(max_brokered_output_bytes=64)
+
+    def fail_if_parsed(_output: Any) -> dict[str, Any]:
+        raise AssertionError("oversized raw output must be rejected before JSON parsing")
+
+    monkeypatch.setattr(foundry_module, "_json_object_from_output", fail_if_parsed)
+    with TestClient(app) as client:
+        initial = _start(client)
+        call = _call(initial)
+        response = client.post(
+            "/responses",
+            headers=CONTINUATION_AUTH,
+            json={
+                "previous_response_id": initial["id"],
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": call["call_id"],
+                        "output": '{"approved":true,"output":{"blob":"' + ("x" * 128) + '"}}',
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "brokered_output_too_large"
+
+
 def test_foundry_brokered_continuation_accepts_matching_tool_output_and_completes():
     app = _app()
 
@@ -939,6 +968,34 @@ def test_foundry_brokered_continuation_accepts_matching_tool_output_and_complete
     assert final["id"].startswith("caresp_")
     assert final["id"] != initial["id"]
     assert _message_text(final) == 'Brokered tool conformance_read completed with output: {"success":true}'
+
+
+def test_foundry_brokered_accepting_continuation_refreshes_state_expiry(monkeypatch):
+    stores: list[Any] = []
+    original_store = foundry_module._FoundryResponseStateStore
+
+    def capture_store(*args: Any, **kwargs: Any) -> Any:
+        store = original_store(*args, **kwargs)
+        stores.append(store)
+        return store
+
+    monkeypatch.setattr(foundry_module, "_FoundryResponseStateStore", capture_store)
+    app = _app(state_ttl_seconds=60)
+
+    with TestClient(app) as client:
+        initial = _start(client)
+        call = _call(initial)
+        state = stores[0].get(initial["id"])
+        state.expires_at = time.time() + 1
+        stores[0].save(state)
+        response = client.post(
+            "/responses",
+            headers=CONTINUATION_AUTH,
+            json=_continuation(initial["id"], call["call_id"], {"approved": True, "output": {"ok": True}}),
+        )
+
+    assert response.status_code == 200, response.text
+    assert state.expires_at > time.time() + 50
 
 
 def test_foundry_brokered_rejects_function_call_output_without_orka_continuation_auth():
@@ -1596,6 +1653,23 @@ def test_foundry_brokered_rejects_approved_continuation_without_object_output(pa
     assert response.json()["error"]["code"] == "invalid_function_call_output"
 
 
+@pytest.mark.parametrize("payload", [{"approved": False}, {"approved": False, "error": None}])
+def test_foundry_brokered_rejects_denied_continuation_without_error_object(payload: dict[str, Any]):
+    app = _app()
+
+    with TestClient(app) as client:
+        initial = _start(client)
+        call = _call(initial)
+        response = client.post(
+            "/responses",
+            headers=CONTINUATION_AUTH,
+            json=_continuation(initial["id"], call["call_id"], payload),
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_function_call_output"
+
+
 def test_foundry_brokered_model_loop_rejects_oversized_output_before_resume_or_state_change(tmp_path):
     state_file = tmp_path / "responses-state.json"
     spec = _spec(tool_name="check-network-telemetry")
@@ -1643,18 +1717,15 @@ def test_foundry_brokered_model_loop_rejects_oversized_output_before_resume_or_s
     assert len(fake.requests) == 1
 
 
-def test_foundry_brokered_invalid_file_state_starts_with_empty_store(tmp_path):
+@pytest.mark.parametrize("raw_state", ["{not valid json", "[]"])
+def test_foundry_brokered_invalid_file_state_fails_startup_without_overwriting(tmp_path, raw_state: str):
     state_file = tmp_path / "responses-state.json"
-    state_file.write_text("{not valid json", encoding="utf-8")
-    app = _app(response_state_file=state_file)
+    state_file.write_text(raw_state, encoding="utf-8")
 
-    with TestClient(app) as client:
-        response = client.get("/readiness")
-        initial = client.post("/responses", json={"input": "conformance_read"})
+    with pytest.raises(RuntimeError, match="invalid Foundry response state file"):
+        _app(response_state_file=state_file)
 
-    assert response.status_code == 200
-    assert initial.status_code == 200, initial.text
-    assert _call(initial.json())["name"] == "conformance_read"
+    assert state_file.read_text(encoding="utf-8") == raw_state
 
 
 def test_foundry_brokered_file_state_is_written_with_private_permissions(tmp_path):
