@@ -68,6 +68,15 @@ def test_foundry_brokered_conformance_script_uses_private_file_umask():
     assert "umask 077" in lines[:5]
 
 
+def test_foundry_brokered_conformance_script_keeps_sensitive_headers_out_of_curl_argv():
+    script = Path(__file__).parents[3] / "deploy" / "foundry" / "scripts" / "foundry_brokered_conformance.sh"
+    text = script.read_text(encoding="utf-8")
+
+    assert text.count("--config -") == 2
+    assert '-H "Authorization: Bearer ${token}"' not in text
+    assert '-H "x-agentkit-brokered-continuation-proof:' not in text
+
+
 def test_verify_brokered_transcript_rejects_old_response_ids(tmp_path):
     verifier = _load_verifier()
     transcript = _write_transcript(tmp_path)

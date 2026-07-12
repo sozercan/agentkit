@@ -36,6 +36,17 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
+write_curl_header() {
+  local header="$1"
+  if [[ "$header" == *$'\r'* || "$header" == *$'\n'* ]]; then
+    echo "refusing curl header containing a newline" >&2
+    return 1
+  fi
+  header="${header//\\/\\\\}"
+  header="${header//\"/\\\"}"
+  printf 'header = "%s"\n' "$header"
+}
+
 : "${AGENT_RESPONSES_ENDPOINT:?set AGENT_RESPONSES_ENDPOINT to the deployed /responses URL}"
 
 prompt="${1:-conformance_read}"
@@ -70,11 +81,13 @@ import os
 print(json.dumps({"input": os.environ["PROMPT"]}, separators=(",", ":")))
 PY
 
-curl -fsS \
-  -H "Authorization: Bearer ${token}" \
+initial_curl_config="$(write_curl_header "Authorization: Bearer ${token}")"
+printf '%s\n' "$initial_curl_config" | curl -fsS \
+  --config - \
   -H 'content-type: application/json' \
   "$AGENT_RESPONSES_ENDPOINT" \
   -d "@$initial_request" >"$initial_response"
+unset initial_curl_config
 
 read -r response_id call_id < <(EXPECTED_TOOL_NAME="$expected_tool_name" EXPECTED_ARGUMENTS="$expected_arguments" EXPECTED_CALL_ID="$expected_call_id" EXPECTED_CALL_ID_PREFIX="$expected_call_id_prefix" python3 - "$initial_response" <<'PY'
 import json
@@ -123,15 +136,18 @@ print(json.dumps({
 }, separators=(",", ":")))
 PY
 
-continuation_headers=(-H "Authorization: Bearer ${token}" -H 'content-type: application/json')
-if [[ -n "${AGENTKIT_CONTINUATION_PROOF:-}" ]]; then
-  continuation_headers+=(-H "x-agentkit-brokered-continuation-proof: ${AGENTKIT_CONTINUATION_PROOF}")
-fi
-
-curl -fsS \
-  "${continuation_headers[@]}" \
+continuation_curl_config="$({
+  write_curl_header "Authorization: Bearer ${token}"
+  if [[ -n "${AGENTKIT_CONTINUATION_PROOF:-}" ]]; then
+    write_curl_header "x-agentkit-brokered-continuation-proof: ${AGENTKIT_CONTINUATION_PROOF}"
+  fi
+})"
+printf '%s\n' "$continuation_curl_config" | curl -fsS \
+  --config - \
+  -H 'content-type: application/json' \
   "$AGENT_RESPONSES_ENDPOINT" \
   -d "@$continuation_request" >"$continuation_response"
+unset continuation_curl_config
 
 verifier_args=(
   "$transcript_dir"

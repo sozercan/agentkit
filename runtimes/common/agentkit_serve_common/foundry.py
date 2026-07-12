@@ -604,8 +604,7 @@ def _json_object_from_output(output: Any) -> dict[str, Any]:
         unexpected = set(parsed) - {"approved", "output"}
         if unexpected:
             raise ValueError("approved function_call_output.output contains unsupported fields")
-        tool_output = parsed.get("output", {})
-        if tool_output is not None and not isinstance(tool_output, dict):
+        if "output" not in parsed or not isinstance(parsed["output"], dict):
             raise ValueError("approved function_call_output.output.output must be an object")
     else:
         unexpected = set(parsed) - {"approved", "error"}
@@ -1422,6 +1421,12 @@ async def _handle_brokered_continuation(
             status=409,
             code="conflicting_duplicate_continuation",
         )
+    if state.model_messages is not None and model_loop is None:
+        return _error(
+            "brokered model-loop continuation is unavailable for this pending response",
+            status=503,
+            code="brokered_model_loop_unavailable",
+        )
     if state.status != "pending":
         return _error("previous response is not pending a tool result", status=409, code="response_not_pending")
 
@@ -1612,7 +1617,9 @@ def create_foundry_app(
         if brokered_tools and isinstance(previous_response_id, str) and previous_response_id:
             try:
                 previous_state = response_states.get(previous_response_id)
-            except (KeyError, _StateExpired):
+            except _StateExpired:
+                return _error("previous_response_id state has expired", status=410, code="response_state_expired")
+            except KeyError:
                 previous_state = None
             if previous_state is not None and previous_state.status in {"pending", "resuming"}:
                 return _error(

@@ -1153,6 +1153,39 @@ func TestBrokeredToolSchemaDigestMatchesPythonCanonicalJSON(t *testing.T) {
 	}
 }
 
+func TestBrokeredToolSchemaDigestPreservesIntegralJSONNumberDecimals(t *testing.T) {
+	decimalTool := BrokeredTool{
+		Name:          "numeric-tool",
+		Description:   brokeredSafeDescription,
+		BrokeredClass: BrokeredClassRead,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey: jsonSchemaTypeObject,
+			jsonSchemaPropertiesKey: map[string]any{
+				"id": map[string]any{jsonSchemaDefaultKey: json.Number("9007199254740995.0")},
+			},
+		},
+	}
+	integerTool := decimalTool
+	integerTool.Parameters = map[string]any{
+		jsonSchemaTypeKey: jsonSchemaTypeObject,
+		jsonSchemaPropertiesKey: map[string]any{
+			"id": map[string]any{jsonSchemaDefaultKey: int64(9007199254740995)},
+		},
+	}
+
+	decimalDigest, err := BrokeredToolSchemaDigest(decimalTool)
+	if err != nil {
+		t.Fatalf("decimal digest error: %v", err)
+	}
+	integerDigest, err := BrokeredToolSchemaDigest(integerTool)
+	if err != nil {
+		t.Fatalf("integer digest error: %v", err)
+	}
+	if decimalDigest != integerDigest {
+		t.Fatalf("integral decimal digest = %s, integer digest = %s", decimalDigest, integerDigest)
+	}
+}
+
 func TestCanonicalJSONStringMatchesPythonForUnicodeLineSeparators(t *testing.T) {
 	value := "line\u2028paragraph\u2029literal\\u2028"
 

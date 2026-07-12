@@ -1119,6 +1119,43 @@ def test_foundry_brokered_file_state_survives_restart_for_model_loop_continuatio
     assert second_fake.requests[0]["messages"][-1]["tool_call_id"] == call["call_id"]
 
 
+def test_foundry_brokered_rejects_persisted_model_loop_continuation_when_loop_is_disabled(tmp_path):
+    state_file = tmp_path / "foundry-model-state.json"
+    spec = _spec(tool_name="check-network-telemetry")
+    fake = _FakeChatTransport(
+        [
+            _chat_response(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_model",
+                            "type": "function",
+                            "function": {"name": "check-network-telemetry", "arguments": "{}"},
+                        }
+                    ],
+                }
+            )
+        ]
+    )
+    with TestClient(_model_loop_app(spec, fake, response_state_file=state_file)) as client:
+        initial = client.post("/responses", json={"input": "check-network-telemetry"}).json()
+        call = _call(initial)
+
+    persisted_before = state_file.read_bytes()
+    with TestClient(_app(spec, response_state_file=state_file, brokered_model_loop_enabled=False)) as client:
+        response = client.post(
+            "/responses",
+            headers=CONTINUATION_AUTH,
+            json=_continuation(initial["id"], call["call_id"], {"approved": True, "output": {"ok": True}}),
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "brokered_model_loop_unavailable"
+    assert state_file.read_bytes() == persisted_before
+
+
 def test_foundry_brokered_rejects_expired_response_state():
     app = _app(state_ttl_seconds=0)
 
@@ -1134,6 +1171,21 @@ def test_foundry_brokered_rejects_expired_response_state():
 
     assert resp.status_code == 410
     assert resp.json()["error"]["code"] == "response_state_expired"
+
+
+def test_foundry_brokered_rejects_normal_followup_to_expired_pending_response():
+    app = _app(state_ttl_seconds=0)
+
+    with TestClient(app) as client:
+        initial = _start(client)
+        time.sleep(0.01)
+        response = client.post(
+            "/responses",
+            json={"previous_response_id": initial["id"], "input": "next question"},
+        )
+
+    assert response.status_code == 410
+    assert response.json()["error"]["code"] == "response_state_expired"
 
 
 def test_foundry_brokered_refuses_to_synthesize_nonliteral_write_arguments():
@@ -1525,6 +1577,23 @@ def test_foundry_brokered_model_loop_rejects_noncanonical_denied_output_before_r
     assert denied.json()["error"]["code"] == "invalid_function_call_output"
     assert state_file.read_bytes() == persisted_before
     assert len(fake.requests) == 1
+
+
+@pytest.mark.parametrize("payload", [{"approved": True}, {"approved": True, "output": None}])
+def test_foundry_brokered_rejects_approved_continuation_without_object_output(payload: dict[str, Any]):
+    app = _app()
+
+    with TestClient(app) as client:
+        initial = _start(client)
+        call = _call(initial)
+        response = client.post(
+            "/responses",
+            headers=CONTINUATION_AUTH,
+            json=_continuation(initial["id"], call["call_id"], payload),
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_function_call_output"
 
 
 def test_foundry_brokered_model_loop_rejects_oversized_output_before_resume_or_state_change(tmp_path):
