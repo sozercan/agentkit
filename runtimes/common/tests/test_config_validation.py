@@ -799,6 +799,7 @@ def test_load_rejects_malformed_nested_brokered_json_schema(tmp_path, bad_child:
     [
         {"type": "object", "properties": {"site": {"type": None}}},
         {"type": "object", "properties": {"n": {"type": "integer", "default": "1"}}},
+        {"type": "object", "properties": {"n": {"type": "integer", "default": 9007199254740993.0}}},
         {"type": "object", "properties": {"site": {"type": "string", "enum": [0, "ok"]}}},
     ],
 )

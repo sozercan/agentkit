@@ -494,6 +494,7 @@ func TestValidateRejectsInvalidBrokeredSchemaTypeValuesAndDefaults(t *testing.T)
 	cases := []map[string]any{
 		{jsonSchemaTypeKey: jsonSchemaTypeObject, jsonSchemaPropertiesKey: map[string]any{brokeredSiteField: map[string]any{jsonSchemaTypeKey: nil}}},
 		{jsonSchemaTypeKey: jsonSchemaTypeObject, jsonSchemaPropertiesKey: map[string]any{"n": map[string]any{jsonSchemaTypeKey: jsonSchemaTypeInteger, jsonSchemaDefaultKey: "1"}}},
+		{jsonSchemaTypeKey: jsonSchemaTypeObject, jsonSchemaPropertiesKey: map[string]any{"n": map[string]any{jsonSchemaTypeKey: jsonSchemaTypeInteger, jsonSchemaDefaultKey: 9007199254740993.0}}},
 		{jsonSchemaTypeKey: jsonSchemaTypeObject, jsonSchemaPropertiesKey: map[string]any{brokeredSiteField: map[string]any{jsonSchemaTypeKey: jsonSchemaTypeString, jsonSchemaEnumKey: []any{0, "ok"}}}},
 	}
 	for _, schema := range cases {
@@ -553,6 +554,51 @@ func TestValidateAcceptsLargeBrokeredIntegerConstraintsWithoutInt64Narrowing(t *
 	cfg.BrokeredTools[0].Parameters["minProperties"] = 1.5
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must be a non-negative integer") {
 		t.Fatalf("fractional JSON Schema constraint should fail validation, got: %v", err)
+	}
+}
+
+func TestValidatePreservesLargeIntegerSchemaValuesBeforeTypeChecking(t *testing.T) {
+	cfg := validMinimalConfig()
+	cfg.BrokeredTools = []BrokeredTool{{
+		Name:          safeLookupToolName,
+		Description:   brokeredSafeDescription,
+		BrokeredClass: BrokeredClassRead,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey: jsonSchemaTypeObject,
+			jsonSchemaPropertiesKey: map[string]any{
+				"n": map[string]any{
+					jsonSchemaTypeKey:    jsonSchemaTypeInteger,
+					jsonSchemaDefaultKey: int64(9007199254740993),
+					jsonSchemaEnumKey:    []any{int64(9007199254740993)},
+				},
+			},
+		},
+	}}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("large integer schema values should validate without float normalization: %v", err)
+	}
+}
+
+func TestValidateMeasuresBrokeredSchemaSizeWithCanonicalJSON(t *testing.T) {
+	cfg := validMinimalConfig()
+	cfg.BrokeredTools = []BrokeredTool{{
+		Name:          safeLookupToolName,
+		Description:   brokeredSafeDescription,
+		BrokeredClass: BrokeredClassRead,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey:            jsonSchemaTypeObject,
+			brokeredDigestDescriptionKey: strings.Repeat("<", 11_000),
+		},
+	}}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("canonical schema below the byte limit should validate despite json.Marshal HTML escaping: %v", err)
+	}
+
+	cfg.BrokeredTools[0].Parameters[brokeredDigestDescriptionKey] = strings.Repeat("a", 64*1024)
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "schema is too large") {
+		t.Fatalf("canonical schema above the byte limit should fail validation, got: %v", err)
 	}
 }
 

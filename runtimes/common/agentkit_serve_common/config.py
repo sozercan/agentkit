@@ -54,6 +54,7 @@ _CREDENTIAL_HEADER_NAMES = {
 _BROKERED_CLASSES = {"read", "write", "coordination"}
 _BROKERED_SCHEMA_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _MAX_BROKERED_SCHEMA_BYTES = 64 * 1024
+_MAX_EXACT_JSON_FLOAT_INTEGER = (1 << 53) - 1
 _UNSAFE_BROKERED_FIELD_NAMES = {
     "auth",
     "authorization",
@@ -623,7 +624,10 @@ def _value_matches_schema_type(value: Any, schema_type: str) -> bool:
         return isinstance(value, bool)
     if schema_type == "integer":
         return (isinstance(value, int) and not isinstance(value, bool)) or (
-            isinstance(value, float) and math.isfinite(value) and value.is_integer()
+            isinstance(value, float)
+            and math.isfinite(value)
+            and value.is_integer()
+            and abs(value) <= _MAX_EXACT_JSON_FLOAT_INTEGER
         )
     if schema_type == "number":
         return isinstance(value, (int, float)) and not isinstance(value, bool)
@@ -707,6 +711,7 @@ class BrokeredToolSpec(_Strict):
     def _valid_json_schema(cls, value: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(value, dict):
             raise ValueError("brokered tool parameters must be a JSON Schema object")
+        _validate_schema_value_constraints(value, path="brokeredTools[].parameters")
         try:
             encoded = _canonical_json(value)
         except (TypeError, ValueError) as exc:

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	pathpkg "path"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -55,6 +56,7 @@ const (
 	brokeredDigestNumberKey        = "\u0000agentkit_json_number"
 	brokeredUnsafeCookieKey        = "cookie"
 	credentialHeaderAPIKey         = "api-key"
+	maxExactJSONFloatInteger       = float64(1<<53 - 1)
 )
 
 // Validate reports every problem with the config at once via errors.Join (plan
@@ -248,25 +250,66 @@ func validateBrokeredToolParameters(add func(string, ...any), path string, param
 		add("%s must be a JSON Schema object", path)
 		return
 	}
-	encoded, err := json.Marshal(parameters)
+	if _, err := json.Marshal(parameters); err != nil {
+		add("%s must be JSON serializable: %v", path, err)
+		return
+	}
+	normalized, ok := normalizeJSONContainers(parameters).(map[string]any)
+	if !ok {
+		add("%s must be a JSON Schema object", path)
+		return
+	}
+	canonical, err := canonicalJSON(normalized)
 	if err != nil {
 		add("%s must be JSON serializable: %v", path, err)
 		return
 	}
-	if len(encoded) > 64*1024 {
+	if len(canonical) > 64*1024 {
 		add("%s schema is too large", path)
 	}
-	var schema map[string]any
-	if err := json.Unmarshal(encoded, &schema); err != nil {
-		add("%s must be a JSON Schema object", path)
-		return
-	}
+	schema := normalized
 	validateJSONSchemaSubset(add, path, schema)
 	if typ, _ := schema[jsonSchemaTypeKey].(string); typ != jsonSchemaTypeObject {
 		add("%s must set type: object", path)
 	}
 	rejectUnsafeBrokeredSchemaKeys(add, path, schema)
 	validateBrokeredSchemaValueConstraints(add, path, schema)
+}
+
+func normalizeJSONContainers(value any) any {
+	if value == nil {
+		return nil
+	}
+	rv := reflect.ValueOf(value)
+	for rv.Kind() == reflect.Interface || rv.Kind() == reflect.Pointer {
+		if rv.IsNil() {
+			return nil
+		}
+		rv = rv.Elem()
+	}
+	switch rv.Kind() {
+	case reflect.Map:
+		if rv.Type().Key().Kind() != reflect.String {
+			return value
+		}
+		out := make(map[string]any, rv.Len())
+		iter := rv.MapRange()
+		for iter.Next() {
+			out[iter.Key().String()] = normalizeJSONContainers(iter.Value().Interface())
+		}
+		return out
+	case reflect.Slice, reflect.Array:
+		if rv.Type().Elem().Kind() == reflect.Uint8 {
+			return value
+		}
+		out := make([]any, rv.Len())
+		for i := 0; i < rv.Len(); i++ {
+			out[i] = normalizeJSONContainers(rv.Index(i).Interface())
+		}
+		return out
+	default:
+		return rv.Interface()
+	}
 }
 
 func hasAnySchemaKey(schema map[string]any, keys ...string) bool {
@@ -355,18 +398,66 @@ func validateJSONSchemaSubset(add func(string, ...any), path string, schema map[
 	}
 	for _, key := range []string{jsonSchemaMinimumKey, jsonSchemaMaximumKey, "exclusiveMinimum", "exclusiveMaximum"} {
 		if value, ok := schema[key]; ok {
-			if _, ok := value.(float64); !ok {
+			if !isFiniteJSONNumber(value) {
 				add("%s.%s must be a number", path, key)
 			}
 		}
 	}
 	for _, key := range []string{"minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties"} {
 		if value, ok := schema[key]; ok {
-			number, ok := value.(float64)
-			if !ok || math.IsNaN(number) || math.IsInf(number, 0) || number < 0 || math.Trunc(number) != number {
+			if !isNonNegativeJSONInteger(value) {
 				add("%s.%s must be a non-negative integer", path, key)
 			}
 		}
+	}
+}
+
+func isFiniteJSONNumber(value any) bool {
+	switch typed := value.(type) {
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return true
+	case float32:
+		return !math.IsNaN(float64(typed)) && !math.IsInf(float64(typed), 0)
+	case float64:
+		return !math.IsNaN(typed) && !math.IsInf(typed, 0)
+	case json.Number:
+		number, err := typed.Float64()
+		return err == nil && !math.IsNaN(number) && !math.IsInf(number, 0)
+	default:
+		return false
+	}
+}
+
+func isNonNegativeJSONInteger(value any) bool {
+	switch typed := value.(type) {
+	case int:
+		return typed >= 0
+	case int8:
+		return typed >= 0
+	case int16:
+		return typed >= 0
+	case int32:
+		return typed >= 0
+	case int64:
+		return typed >= 0
+	case uint, uint8, uint16, uint32, uint64:
+		return true
+	case float32:
+		number := float64(typed)
+		return !math.IsNaN(number) && !math.IsInf(number, 0) && number >= 0 && math.Trunc(number) == number
+	case float64:
+		return !math.IsNaN(typed) && !math.IsInf(typed, 0) && typed >= 0 && math.Trunc(typed) == typed
+	case json.Number:
+		if integer, err := strconv.ParseInt(typed.String(), 10, 64); err == nil {
+			return integer >= 0
+		}
+		if _, err := strconv.ParseUint(typed.String(), 10, 64); err == nil {
+			return true
+		}
+		number, err := typed.Float64()
+		return err == nil && !math.IsNaN(number) && !math.IsInf(number, 0) && number >= 0 && math.Trunc(number) == number
+	default:
+		return false
 	}
 }
 
@@ -511,7 +602,7 @@ func matchesSchemaType(value any, schemaType string) bool {
 		case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
 			return true
 		case float64:
-			return typed == math.Trunc(typed)
+			return !math.IsNaN(typed) && !math.IsInf(typed, 0) && typed == math.Trunc(typed) && math.Abs(typed) <= maxExactJSONFloatInteger
 		case json.Number:
 			_, err := typed.Int64()
 			return err == nil
