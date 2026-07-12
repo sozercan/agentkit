@@ -589,6 +589,15 @@ def _reject_output_constant(raw: str) -> None:
     raise ValueError(f"function_call_output.output contains non-finite number {raw}")
 
 
+def _reject_duplicate_output_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f"function_call_output.output contains duplicate key {key!r}")
+        out[key] = value
+    return out
+
+
 def _json_object_from_output(output: Any) -> dict[str, Any]:
     if not isinstance(output, str):
         raise ValueError("function_call_output.output must be a JSON object string")
@@ -597,6 +606,7 @@ def _json_object_from_output(output: Any) -> dict[str, Any]:
             output,
             parse_float=_parse_output_float,
             parse_constant=_reject_output_constant,
+            object_pairs_hook=_reject_duplicate_output_keys,
         )
     except json.JSONDecodeError as exc:
         raise ValueError("function_call_output.output must be a JSON object string") from exc
