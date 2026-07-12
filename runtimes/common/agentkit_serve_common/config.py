@@ -185,6 +185,12 @@ def _canonical_json(value: Any) -> str:
     raise TypeError(f"unsupported JSON value {type(value).__name__}")
 
 
+def _parse_canonical_int(value: str) -> int | float:
+    if value == "-0":
+        return -0.0
+    return int(value)
+
+
 def brokered_tool_schema_digest(
     *,
     name: str,
@@ -718,7 +724,7 @@ class BrokeredToolSpec(_Strict):
             raise ValueError("brokered tool parameters must be JSON serializable") from exc
         if len(encoded.encode("utf-8")) > _MAX_BROKERED_SCHEMA_BYTES:
             raise ValueError("brokered tool parameters schema is too large")
-        cloned = json.loads(encoded)
+        cloned = json.loads(encoded, parse_int=_parse_canonical_int)
         if cloned.get("type") != "object":
             raise ValueError("brokered tool parameters schema must set type: object")
         _validate_json_schema_subset(cloned, path="brokeredTools[].parameters")

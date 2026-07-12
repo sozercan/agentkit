@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import math
 from copy import deepcopy
 
 import pytest
 import yaml
 
-from agentkit_serve_common.config import ConfigError, load, load_or_exit, validate_required_env
+from agentkit_serve_common.config import ConfigError, brokered_tool_schema_digest, load, load_or_exit, validate_required_env
 
 
 _BASE_SPEC = {
@@ -848,6 +849,38 @@ def test_load_accepts_integral_float_values_for_integer_brokered_schema(tmp_path
     assert properties["withDefault"]["default"] == 1.0
     assert properties["withConst"]["const"] == 2.0
     assert properties["withEnum"]["enum"] == [3.0]
+
+
+def test_load_preserves_negative_zero_for_brokered_schema_digest(tmp_path):
+    parameters = {
+        "type": "object",
+        "properties": {"offset": {"type": "number", "default": -0.0}},
+    }
+    spec_dict = deepcopy(_BASE_SPEC)
+    spec_dict.update(
+        tools=[],
+        brokeredTools=[
+            {
+                "name": "negative_zero",
+                "description": "preserve negative zero",
+                "brokeredClass": "read",
+                "parameters": parameters,
+                "schemaDigest": brokered_tool_schema_digest(
+                    name="negative_zero",
+                    description="preserve negative zero",
+                    brokered_class="read",
+                    parameters=parameters,
+                ),
+            }
+        ],
+    )
+
+    spec = load(_write_spec(tmp_path, spec_dict))
+
+    default = spec.brokered_tools[0].parameters["properties"]["offset"]["default"]
+    assert isinstance(default, float)
+    assert default == 0.0
+    assert math.copysign(1.0, default) == -1.0
 
 
 def test_load_accepts_integral_float_integer_schema_constraints(tmp_path):
