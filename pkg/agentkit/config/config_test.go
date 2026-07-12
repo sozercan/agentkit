@@ -534,6 +534,28 @@ func TestValidateRejectsEmptyBrokeredSchemaEnums(t *testing.T) {
 	}
 }
 
+func TestValidateAcceptsLargeBrokeredIntegerConstraintsWithoutInt64Narrowing(t *testing.T) {
+	cfg := validMinimalConfig()
+	cfg.BrokeredTools = []BrokeredTool{{
+		Name:          safeLookupToolName,
+		Description:   brokeredSafeDescription,
+		BrokeredClass: BrokeredClassRead,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey: jsonSchemaTypeObject,
+			"minProperties":   1e19,
+		},
+	}}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("large integral JSON Schema constraint should validate: %v", err)
+	}
+
+	cfg.BrokeredTools[0].Parameters["minProperties"] = 1.5
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must be a non-negative integer") {
+		t.Fatalf("fractional JSON Schema constraint should fail validation, got: %v", err)
+	}
+}
+
 func TestValidateRejectsInvalidRemoteMCPToolShapes(t *testing.T) {
 	cases := map[string]string{ //nolint:gosec // test YAML uses credential-looking field names/invalid examples, not real secrets
 		"missing type": `tools:

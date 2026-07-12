@@ -1166,6 +1166,32 @@ def _model_loop_app(spec: AgentSpec, fake: _FakeChatTransport, **kwargs: Any):
     return _app(spec, brokered_model_loop_enabled=True, brokered_model_http_client=client, **kwargs)
 
 
+@pytest.mark.parametrize(
+    "usage",
+    [
+        {"prompt_tokens": {"unexpected": 1}},
+        {"completion_tokens": "not-a-number"},
+        {"total_tokens": 1.5},
+    ],
+)
+def test_foundry_brokered_model_loop_normalizes_malformed_usage(usage: dict[str, Any]):
+    fake = _FakeChatTransport(
+        [
+            {
+                "choices": [{"message": {"role": "assistant", "content": "done"}}],
+                "usage": usage,
+            }
+        ]
+    )
+    app = _model_loop_app(_spec(tool_name="check-network-telemetry"), fake)
+
+    with TestClient(app) as client:
+        response = client.post("/responses", json={"input": "check-network-telemetry"})
+
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "InvalidModelResponse"
+
+
 def test_foundry_brokered_model_loop_emits_model_requested_tool_and_resumes_to_final_answer():
     spec = _spec(tool_name="check-network-telemetry")
     spec.brokered_tools[0].parameters["required"] = ["site"]

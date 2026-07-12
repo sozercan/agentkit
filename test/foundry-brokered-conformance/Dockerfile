@@ -13,7 +13,10 @@ COPY runtimes/common /tmp/agentkit-serve-common
 RUN cd /tmp/agentkit-serve-common \
     && pip install --no-cache-dir '.[foundry-conformance]' \
     && cd /opt/agentkit \
-    && rm -rf /tmp/agentkit-serve-common
+    && rm -rf /tmp/agentkit-serve-common \
+    && useradd --uid 1000 --create-home --shell /usr/sbin/nologin agentkit \
+    && chown -R 1000:1000 /opt/agentkit
 
 EXPOSE 8088
+USER 1000
 ENTRYPOINT ["agentkit-foundry-conformance", "--host", "0.0.0.0", "--port", "8088"]

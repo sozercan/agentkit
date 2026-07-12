@@ -363,7 +363,7 @@ func validateJSONSchemaSubset(add func(string, ...any), path string, schema map[
 	for _, key := range []string{"minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties"} {
 		if value, ok := schema[key]; ok {
 			number, ok := value.(float64)
-			if !ok || number < 0 || number != float64(int64(number)) {
+			if !ok || math.IsNaN(number) || math.IsInf(number, 0) || number < 0 || math.Trunc(number) != number {
 				add("%s.%s must be a non-negative integer", path, key)
 			}
 		}
