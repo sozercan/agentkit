@@ -11,6 +11,8 @@ import httpx
 import pytest
 
 from agentkit_serve_common import foundry as foundry_module
+from agentkit_serve_common import foundry_model_loop as foundry_model_loop_module
+from agentkit_serve_common.adapter_support import NO_AUTH_API_KEY
 from agentkit_serve_common.config import AgentSpec
 from agentkit_serve_common.conversation import RunRequest
 from agentkit_serve_common.foundry import create_foundry_app
@@ -1217,6 +1219,35 @@ def _chat_response(message: dict[str, Any], *, prompt_tokens: int = 1, completio
 def _model_loop_app(spec: AgentSpec, fake: _FakeChatTransport, **kwargs: Any):
     client = httpx.AsyncClient(transport=httpx.MockTransport(fake.handler))
     return _app(spec, brokered_model_loop_enabled=True, brokered_model_http_client=client, **kwargs)
+
+
+def test_foundry_brokered_model_loop_sends_placeholder_api_key_when_auth_is_omitted(monkeypatch):
+    captured_headers: dict[str, str] = {}
+
+    class FakeClient:
+        def __init__(self, *, headers: dict[str, str], timeout: int) -> None:
+            assert timeout == 60
+            captured_headers.update(headers)
+
+        async def post(self, url: str, *, json: dict[str, Any]) -> httpx.Response:
+            request = httpx.Request("POST", url, json=json)
+            return httpx.Response(
+                200,
+                request=request,
+                json=_chat_response({"role": "assistant", "content": "done"}),
+            )
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(foundry_model_loop_module.httpx, "AsyncClient", FakeClient)
+    app = _app(_spec(tool_name="check-network-telemetry"), brokered_model_loop_enabled=True)
+
+    with TestClient(app) as client:
+        response = client.post("/responses", json={"input": "check-network-telemetry"})
+
+    assert response.status_code == 200, response.text
+    assert captured_headers["Authorization"] == f"Bearer {NO_AUTH_API_KEY}"
 
 
 @pytest.mark.parametrize(

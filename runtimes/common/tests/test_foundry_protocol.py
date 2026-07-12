@@ -276,8 +276,13 @@ def test_foundry_protocol_uses_platform_session_env_fallback(monkeypatch):
     assert factory.runtime.requests[0].session_id == "platform-session"
 
 
-def test_foundry_brokered_cli_dry_run_loads_static_brokered_agent(tmp_path, capsys):
-    from agentkit_serve_common.foundry_brokered_cli import main
+def test_foundry_brokered_cli_dry_run_loads_static_brokered_agent(tmp_path, capsys, monkeypatch):
+    from agentkit_serve_common import foundry_brokered_cli
+
+    def fail_if_app_is_constructed(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("dry-run must not construct the Foundry app or open response state")
+
+    monkeypatch.setattr(foundry_brokered_cli, "create_foundry_app", fail_if_app_is_constructed)
 
     config = tmp_path / "agent.yaml"
     config.write_text(
@@ -306,7 +311,7 @@ expose:
         encoding="utf-8",
     )
 
-    assert main(["--config", str(config), "--dry-run"]) == 0
+    assert foundry_brokered_cli.main(["--config", str(config), "--dry-run"]) == 0
 
     output = capsys.readouterr().out
     assert '"agent": "brokered-cli"' in output

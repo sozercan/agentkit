@@ -19,7 +19,7 @@ from typing import Any, Mapping, Sequence
 
 import httpx
 
-from .adapter_support import AgentBuildError, NO_AUTH_API_KEY, resolve_api_key, resolve_workload_identity_token
+from .adapter_support import AgentBuildError, resolve_api_key, resolve_workload_identity_token
 from .config import AgentSpec
 from .conversation import FORWARDED_ROLES, RunRequest
 from .runtime import AgentRunError, BrokeredToolDefinition
@@ -150,8 +150,7 @@ class BrokeredChatModelLoop:
                     headers["Authorization"] = f"Bearer {token}"
                 else:
                     api_key = resolve_api_key(self.spec)
-                    if api_key != NO_AUTH_API_KEY:
-                        headers["Authorization"] = f"Bearer {api_key}"
+                    headers["Authorization"] = f"Bearer {api_key}"
             except AgentBuildError as exc:
                 raise AgentRunError(str(exc), status=400, code="ModelAuthMissing") from exc
             client = httpx.AsyncClient(headers=headers, timeout=60)

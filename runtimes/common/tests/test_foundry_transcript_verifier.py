@@ -61,6 +61,13 @@ def test_verify_brokered_transcript_accepts_conformance_loop(tmp_path):
     assert "success" in summary["final_text"]
 
 
+def test_foundry_brokered_conformance_script_uses_private_file_umask():
+    script = Path(__file__).parents[3] / "deploy" / "foundry" / "scripts" / "foundry_brokered_conformance.sh"
+    lines = script.read_text(encoding="utf-8").splitlines()
+
+    assert "umask 077" in lines[:5]
+
+
 def test_verify_brokered_transcript_rejects_old_response_ids(tmp_path):
     verifier = _load_verifier()
     transcript = _write_transcript(tmp_path)

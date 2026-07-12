@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"math"
 	"math/big"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -256,7 +257,62 @@ func copyAny(v any) any {
 	case json.Number:
 		return yamlNumber(expandJSONNumber(typed.String()))
 	default:
-		return typed
+		return copyReflectedJSON(typed)
+	}
+}
+
+func copyReflectedJSON(value any) any {
+	if value == nil {
+		return nil
+	}
+	rv := reflect.ValueOf(value)
+	for rv.Kind() == reflect.Interface || rv.Kind() == reflect.Pointer {
+		if rv.IsNil() {
+			return nil
+		}
+		rv = rv.Elem()
+	}
+	if number, ok := rv.Interface().(json.Number); ok {
+		return yamlNumber(expandJSONNumber(number.String()))
+	}
+	switch rv.Kind() {
+	case reflect.Map:
+		if rv.IsNil() {
+			return nil
+		}
+		if rv.Type().Key().Kind() != reflect.String {
+			return value
+		}
+		out := make(map[string]any, rv.Len())
+		iter := rv.MapRange()
+		for iter.Next() {
+			out[iter.Key().String()] = copyAny(iter.Value().Interface())
+		}
+		return out
+	case reflect.Slice:
+		if rv.IsNil() {
+			return nil
+		}
+		if rv.Type().Elem().Kind() == reflect.Uint8 {
+			return value
+		}
+		out := make([]any, rv.Len())
+		for i := 0; i < rv.Len(); i++ {
+			out[i] = copyAny(rv.Index(i).Interface())
+		}
+		return out
+	case reflect.Array:
+		out := make([]any, rv.Len())
+		for i := 0; i < rv.Len(); i++ {
+			out[i] = copyAny(rv.Index(i).Interface())
+		}
+		return out
+	case reflect.Float32:
+		return yamlFloat(rv.Float(), 32)
+	case reflect.Float64:
+		return yamlFloat(rv.Float(), 64)
+	default:
+		return rv.Interface()
 	}
 }
 
