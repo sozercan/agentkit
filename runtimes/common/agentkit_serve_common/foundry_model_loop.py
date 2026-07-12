@@ -198,15 +198,14 @@ def _message_text(message: Mapping[str, Any]) -> str:
 
 
 def _parse_arguments(raw: Any) -> dict[str, Any]:
-    if isinstance(raw, str):
-        try:
-            parsed = json.loads(raw or "{}", parse_float=_parse_json_float, parse_constant=_reject_json_constant)
-        except AgentRunError:
-            raise
-        except json.JSONDecodeError as exc:
-            raise AgentRunError("model tool arguments must be valid JSON", status=400, code="InvalidToolArguments") from exc
-    else:
-        parsed = raw
+    if not isinstance(raw, str):
+        raise AgentRunError("model tool arguments must be a JSON object string", status=400, code="InvalidToolArguments")
+    try:
+        parsed = json.loads(raw or "{}", parse_float=_parse_json_float, parse_constant=_reject_json_constant)
+    except AgentRunError:
+        raise
+    except json.JSONDecodeError as exc:
+        raise AgentRunError("model tool arguments must be valid JSON", status=400, code="InvalidToolArguments") from exc
     if not isinstance(parsed, dict):
         raise AgentRunError("model tool arguments must be a JSON object", status=400, code="InvalidToolArguments")
     return parsed

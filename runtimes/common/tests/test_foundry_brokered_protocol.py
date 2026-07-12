@@ -1711,6 +1711,36 @@ def test_foundry_brokered_model_loop_rejects_unknown_model_tool_request():
     assert response.json()["error"]["code"] == "unknown_brokered_tool"
 
 
+def test_foundry_brokered_model_loop_rejects_object_valued_tool_arguments():
+    fake = _FakeChatTransport(
+        [
+            _chat_response(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_model",
+                            "type": "function",
+                            "function": {
+                                "name": "check-network-telemetry",
+                                "arguments": {"id": 9007199254740993.0},
+                            },
+                        }
+                    ],
+                }
+            )
+        ]
+    )
+    app = _model_loop_app(_spec(tool_name="check-network-telemetry"), fake)
+
+    with TestClient(app) as client:
+        response = client.post("/responses", json={"input": "check-network-telemetry"})
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "InvalidToolArguments"
+
+
 def test_foundry_brokered_model_loop_validates_schema_valued_additional_properties():
     spec = _spec(tool_name="flex-tool")
     spec.brokered_tools[0].parameters = {

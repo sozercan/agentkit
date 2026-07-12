@@ -850,6 +850,36 @@ def test_load_accepts_integral_float_values_for_integer_brokered_schema(tmp_path
     assert properties["withEnum"]["enum"] == [3.0]
 
 
+def test_load_accepts_integral_float_integer_schema_constraints(tmp_path):
+    spec_dict = deepcopy(_BASE_SPEC)
+    spec_dict.update(
+        tools=[],
+        brokeredTools=[
+            {
+                "name": "integer_constraints",
+                "description": "integer schema constraints",
+                "brokeredClass": "read",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "values": {
+                            "type": "array",
+                            "minItems": 1.0,
+                            "maxItems": 2.0,
+                        }
+                    },
+                },
+            }
+        ],
+    )
+
+    spec = load(_write_spec(tmp_path, spec_dict))
+
+    values = spec.brokered_tools[0].parameters["properties"]["values"]
+    assert values["minItems"] == 1
+    assert values["maxItems"] == 2
+
+
 def test_load_rejects_unknown_brokered_class_and_malformed_schema(tmp_path):
     unknown_class = _invalid_message(
         tmp_path,
