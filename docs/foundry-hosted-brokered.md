@@ -226,7 +226,7 @@ It returns the deterministic `conformance_read` function call on the first
 Local runnable entrypoint check:
 
 ```sh
-uv run --directory runtimes/common --extra dev agentkit-foundry-conformance --dry-run
+uv run --directory runtimes/common --extra dev --extra foundry-conformance agentkit-foundry-conformance --dry-run
 ```
 
 Container entrypoint example for the A0 spike image:
@@ -262,7 +262,7 @@ deploy/foundry/scripts/local_brokered_conformance_container.sh \
 Local proof:
 
 ```sh
-uv run --directory runtimes/common --extra dev pytest -q tests/test_foundry_conformance.py
+uv run --directory runtimes/common --extra dev --extra foundry-conformance pytest -q tests/test_foundry_conformance.py
 ```
 
 Live direct-endpoint proof after deployment:
@@ -295,6 +295,7 @@ Local proof for this production adapter path:
 ```sh
 docker build . -f test/foundry-brokered-agentkit/Dockerfile -t agentkit-foundry-brokered:local
 docker run --rm \
+  -e AGENTKIT_AUTH_TOKEN=local-dummy-token \
   -e AGENTKIT_FOUNDRY_BROKERED_CONTINUATION_PROOF=local-dev-proof \
   -p 127.0.0.1:18092:8088 \
   agentkit-foundry-brokered:local

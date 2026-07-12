@@ -45,6 +45,7 @@ const (
 	jsonSchemaTypeArray            = "array"
 	jsonSchemaTypeBoolean          = "boolean"
 	jsonSchemaTypeNull             = "null"
+	jsonSchemaEnumKey              = "enum"
 	jsonSchemaDefaultKey           = "default"
 	jsonSchemaRequiredKey          = "required"
 	jsonSchemaDependentRequiredKey = "dependentRequired"
@@ -326,9 +327,12 @@ func validateJSONSchemaSubset(add func(string, ...any), path string, schema map[
 			}
 		}
 	}
-	if enumValue, ok := schema["enum"]; ok {
-		if _, ok := enumValue.([]any); !ok {
+	if enumValue, ok := schema[jsonSchemaEnumKey]; ok {
+		items, ok := enumValue.([]any)
+		if !ok {
 			add("%s.enum must be an array", path)
+		} else if len(items) == 0 {
+			add("%s.enum must contain at least one value", path)
 		}
 	}
 	if _, ok := schema["pattern"]; ok {
@@ -343,7 +347,7 @@ func validateJSONSchemaSubset(add func(string, ...any), path string, schema map[
 			add("%s.additionalProperties must be a boolean or object", path)
 		}
 	}
-	if hasAnySchemaKey(schema, "enum", "const", "default") && hasAnySchemaKey(schema, jsonSchemaMinimumKey, "maximum", "exclusiveMinimum", "exclusiveMaximum", "minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties", "pattern") {
+	if hasAnySchemaKey(schema, jsonSchemaEnumKey, "const", "default") && hasAnySchemaKey(schema, jsonSchemaMinimumKey, "maximum", "exclusiveMinimum", "exclusiveMaximum", "minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties", "pattern") {
 		add("%s combines enum/const/default with constraints unsupported by deterministic brokered synthesis", path)
 	}
 	if _, ok := schema["multipleOf"]; ok {
@@ -414,7 +418,7 @@ func validateBrokeredSchemaValueConstraints(add func(string, ...any), path strin
 				add("%s.%s must match the declared JSON Schema type", path, keyword)
 			}
 		}
-		if enum, exists := schema["enum"]; exists {
+		if enum, exists := schema[jsonSchemaEnumKey]; exists {
 			items, ok := enum.([]any)
 			if !ok {
 				add("%s.enum must be an array", path)

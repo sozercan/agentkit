@@ -8,7 +8,11 @@ ENV PORT=8088 \
 
 WORKDIR /opt/agentkit
 COPY runtimes/common /tmp/agentkit-serve-common
-RUN pip install --no-cache-dir /tmp/agentkit-serve-common \
+# Keep the Azure Responses SDK out of generic runtime images; this dedicated
+# conformance fixture opts into it explicitly.
+RUN cd /tmp/agentkit-serve-common \
+    && pip install --no-cache-dir '.[foundry-conformance]' \
+    && cd /opt/agentkit \
     && rm -rf /tmp/agentkit-serve-common
 
 EXPOSE 8088

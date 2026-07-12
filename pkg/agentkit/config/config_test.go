@@ -494,7 +494,7 @@ func TestValidateRejectsInvalidBrokeredSchemaTypeValuesAndDefaults(t *testing.T)
 	cases := []map[string]any{
 		{jsonSchemaTypeKey: jsonSchemaTypeObject, jsonSchemaPropertiesKey: map[string]any{brokeredSiteField: map[string]any{jsonSchemaTypeKey: nil}}},
 		{jsonSchemaTypeKey: jsonSchemaTypeObject, jsonSchemaPropertiesKey: map[string]any{"n": map[string]any{jsonSchemaTypeKey: jsonSchemaTypeInteger, jsonSchemaDefaultKey: "1"}}},
-		{jsonSchemaTypeKey: jsonSchemaTypeObject, jsonSchemaPropertiesKey: map[string]any{brokeredSiteField: map[string]any{jsonSchemaTypeKey: jsonSchemaTypeString, "enum": []any{0, "ok"}}}},
+		{jsonSchemaTypeKey: jsonSchemaTypeObject, jsonSchemaPropertiesKey: map[string]any{brokeredSiteField: map[string]any{jsonSchemaTypeKey: jsonSchemaTypeString, jsonSchemaEnumKey: []any{0, "ok"}}}},
 	}
 	for _, schema := range cases {
 		cfg := validMinimalConfig()
@@ -506,6 +506,30 @@ func TestValidateRejectsInvalidBrokeredSchemaTypeValuesAndDefaults(t *testing.T)
 		}}
 		if err := cfg.Validate(); err == nil {
 			t.Fatalf("expected invalid schema rejection for %#v", schema)
+		}
+	}
+}
+
+func TestValidateRejectsEmptyBrokeredSchemaEnums(t *testing.T) {
+	cases := []map[string]any{
+		{jsonSchemaTypeKey: jsonSchemaTypeObject, jsonSchemaEnumKey: []any{}},
+		{
+			jsonSchemaTypeKey: jsonSchemaTypeObject,
+			jsonSchemaPropertiesKey: map[string]any{
+				brokeredSiteField: map[string]any{jsonSchemaTypeKey: jsonSchemaTypeString, jsonSchemaEnumKey: []any{}},
+			},
+		},
+	}
+	for _, schema := range cases {
+		cfg := validMinimalConfig()
+		cfg.BrokeredTools = []BrokeredTool{{
+			Name:          safeLookupToolName,
+			Description:   brokeredSafeDescription,
+			BrokeredClass: BrokeredClassRead,
+			Parameters:    schema,
+		}}
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "enum must contain at least one value") {
+			t.Fatalf("expected empty enum rejection for %#v, got: %v", schema, err)
 		}
 	}
 }

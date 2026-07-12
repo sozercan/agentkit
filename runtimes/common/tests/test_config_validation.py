@@ -750,6 +750,31 @@ def test_load_rejects_explicit_null_brokered_json_schema_keywords(tmp_path, bad_
     assert "brokeredTools.0.parameters" in msg
 
 
+@pytest.mark.parametrize(
+    "bad_parameters",
+    [
+        {"type": "object", "enum": []},
+        {"type": "object", "properties": {"site": {"type": "string", "enum": []}}},
+    ],
+)
+def test_load_rejects_empty_brokered_json_schema_enums(tmp_path, bad_parameters: dict):
+    msg = _invalid_message(
+        tmp_path,
+        lambda spec: spec.update(
+            tools=[],
+            brokeredTools=[
+                {
+                    "name": "safe_lookup",
+                    "description": "safe schema",
+                    "brokeredClass": "read",
+                    "parameters": bad_parameters,
+                }
+            ],
+        ),
+    )
+    assert "enum must contain at least one value" in msg
+
+
 @pytest.mark.parametrize("bad_child", [{"type": 123}, {"type": "strnig"}, {"items": "bad"}, {"items": [{"type": "number"}]}, {"multipleOf": 2}, {"uniqueItems": True}, {"minLength": -1}])
 def test_load_rejects_malformed_nested_brokered_json_schema(tmp_path, bad_child: dict):
     msg = _invalid_message(

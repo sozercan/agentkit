@@ -1,9 +1,22 @@
 from __future__ import annotations
 
 import json
+import tomllib
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 from agentkit_serve_common.foundry_conformance import create_foundry_conformance_app
+
+
+def test_foundry_conformance_sdk_dependency_is_optional():
+    project = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    sdk_dependency = "azure-ai-agentserver-responses"
+
+    assert not any(dependency.startswith(sdk_dependency) for dependency in project["dependencies"])
+    assert any(
+        dependency.startswith(sdk_dependency)
+        for dependency in project["optional-dependencies"]["foundry-conformance"]
+    )
 
 
 def _function_output(previous_response_id: str | None, call_id: str = "call_conformance_1") -> dict:

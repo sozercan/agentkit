@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 try:  # Prefer the official hosted Responses SDK ID format/state-compatible prefix.
     from azure.ai.agentserver.responses._id_generator import IdGenerator as _AzureResponsesIdGenerator
-except Exception:  # pragma: no cover - dependency is declared; fallback is for source-tree imports only.
+except Exception:  # pragma: no cover - the SDK is optional outside conformance installs.
     _AzureResponsesIdGenerator = None
 
 _DEFAULT_STATE_TTL_SECONDS = 15 * 60

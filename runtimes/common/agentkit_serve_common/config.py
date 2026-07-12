@@ -317,8 +317,12 @@ def _validate_json_schema_subset(schema: Any, *, path: str) -> None:
         for key, value in dependent_required.items():
             if not isinstance(key, str) or not isinstance(value, list) or not all(isinstance(item, str) for item in value):
                 raise ValueError(f"{path}.dependentRequired values must be string arrays")
-    if "enum" in schema and not isinstance(schema["enum"], list):
-        raise ValueError(f"{path}.enum must be an array")
+    if "enum" in schema:
+        enum_values = schema["enum"]
+        if not isinstance(enum_values, list):
+            raise ValueError(f"{path}.enum must be an array")
+        if not enum_values:
+            raise ValueError(f"{path}.enum must contain at least one value")
     if "pattern" in schema:
         raise ValueError(f"{path}.pattern is not supported for deterministic brokered tool schemas")
     if "additionalProperties" in schema:

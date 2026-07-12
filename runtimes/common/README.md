@@ -80,6 +80,9 @@ Azure Responses SDK app for Phase A0 hosted brokered smokes. It serves
 `function_call`, and completes after a matching `function_call_output`
 continuation.
 
+Install the optional `foundry-conformance` extra when using this SDK-backed
+entrypoint; normal runtime adapter images install the common package without it.
+
 ```sh
-agentkit-foundry-conformance --host 0.0.0.0 --port 8088
+uv run --extra foundry-conformance agentkit-foundry-conformance --host 0.0.0.0 --port 8088
 ```
