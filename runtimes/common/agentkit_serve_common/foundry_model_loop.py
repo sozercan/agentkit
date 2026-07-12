@@ -47,12 +47,12 @@ class BrokeredChatModelLoop:
         tools: Sequence[BrokeredToolDefinition],
         *,
         http_client: httpx.AsyncClient | None = None,
-        max_output_chars: int = 64_000,
+        max_output_bytes: int = 64 * 1024,
     ) -> None:
         self.spec = spec
         self.tools = list(tools)
         self.http_client = http_client
-        self.max_output_chars = max_output_chars
+        self.max_output_bytes = max_output_bytes
         self.tools_by_name = {tool.name: tool for tool in self.tools}
 
     async def start(self, request: RunRequest, *, call_id: str) -> ModelLoopFinal | ModelLoopToolRequest:
@@ -95,7 +95,7 @@ class BrokeredChatModelLoop:
         return ModelLoopToolRequest(name=name, arguments=arguments, messages=[*messages, assistant_message], usage=usage)
 
     async def resume(self, messages: Sequence[Mapping[str, Any]], *, call_id: str, output: str) -> ModelLoopFinal:
-        if len(output) > self.max_output_chars:
+        if len(output.encode("utf-8")) > self.max_output_bytes:
             raise AgentRunError("brokered tool output is too large for model resume", status=413, code="brokered_output_too_large")
         resumed = [dict(message) for message in messages]
         resumed.append({"role": "tool", "tool_call_id": call_id, "content": output})

@@ -49,11 +49,13 @@ except Exception:  # pragma: no cover - the SDK is optional outside conformance 
 _DEFAULT_STATE_TTL_SECONDS = 15 * 60
 _DEFAULT_MAX_PENDING_RESPONSES = 128
 _DEFAULT_MAX_ARGUMENT_BYTES = 8192
+_DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024
 _MAX_SYNTHETIC_ARRAY_ITEMS = 32
 _MAX_SYNTHETIC_STRING_LENGTH = 4096
 _STATE_TTL_ENV = "AGENTKIT_FOUNDRY_RESPONSE_STATE_TTL_SECONDS"
 _MAX_PENDING_ENV = "AGENTKIT_FOUNDRY_RESPONSE_STATE_MAX_PENDING"
 _MAX_ARGUMENT_BYTES_ENV = "AGENTKIT_FOUNDRY_BROKERED_MAX_ARGUMENT_BYTES"
+_MAX_OUTPUT_BYTES_ENV = "AGENTKIT_FOUNDRY_BROKERED_MAX_OUTPUT_BYTES"
 _CONTINUATION_PROOF_ENV = "AGENTKIT_FOUNDRY_BROKERED_CONTINUATION_PROOF"
 _CONTINUATION_PROOF_HEADER = "x-agentkit-brokered-continuation-proof"
 _MODEL_LOOP_ENV = "AGENTKIT_FOUNDRY_BROKERED_MODEL_LOOP"
@@ -486,7 +488,8 @@ class _FoundryResponseStateStore:
 
 def _state_ttl_seconds(value: float | None = None) -> float:
     if value is not None:
-        return max(float(value), 0.0)
+        parsed = float(value)
+        return max(parsed, 0.0) if math.isfinite(parsed) else float(_DEFAULT_STATE_TTL_SECONDS)
     raw = os.environ.get(_STATE_TTL_ENV)
     if not raw:
         return float(_DEFAULT_STATE_TTL_SECONDS)
@@ -494,7 +497,7 @@ def _state_ttl_seconds(value: float | None = None) -> float:
         parsed = float(raw)
     except ValueError:
         return float(_DEFAULT_STATE_TTL_SECONDS)
-    return max(parsed, 0.0)
+    return max(parsed, 0.0) if math.isfinite(parsed) else float(_DEFAULT_STATE_TTL_SECONDS)
 
 
 def _positive_int_setting(value: int | None, *, env_name: str, default: int) -> int:
@@ -516,6 +519,10 @@ def _max_pending_responses(value: int | None = None) -> int:
 
 def _max_argument_bytes(value: int | None = None) -> int:
     return _positive_int_setting(value, env_name=_MAX_ARGUMENT_BYTES_ENV, default=_DEFAULT_MAX_ARGUMENT_BYTES)
+
+
+def _max_output_bytes(value: int | None = None) -> int:
+    return _positive_int_setting(value, env_name=_MAX_OUTPUT_BYTES_ENV, default=_DEFAULT_MAX_OUTPUT_BYTES)
 
 
 def _brokered_model_loop_enabled(value: bool | None = None) -> bool:
@@ -1145,6 +1152,7 @@ async def _handle_brokered_continuation(
     input_value: Any,
     continuation_proof: str | None,
     request: Request,
+    max_output_bytes: int,
     model_loop: BrokeredChatModelLoop | None = None,
 ) -> JSONResponse:
     if not continuation_proof:
@@ -1198,6 +1206,13 @@ async def _handle_brokered_continuation(
     except ValueError as exc:
         return _error(str(exc), status=400, code="invalid_function_call_output")
     output_json = _canonical_output_json(parsed_output)
+    output_size = len(output_json.encode("utf-8"))
+    if output_size > max_output_bytes:
+        return _error(
+            "brokered function_call_output is too large",
+            status=413,
+            code="brokered_output_too_large",
+        )
 
     existing_output = state.accepted_outputs.get(call_id)
     if existing_output is not None:
@@ -1272,6 +1287,7 @@ def create_foundry_app(
     brokered_continuation_proof: str | None = None,
     max_pending_responses: int | None = None,
     max_brokered_argument_bytes: int | None = None,
+    max_brokered_output_bytes: int | None = None,
     brokered_model_loop_enabled: bool | None = None,
     brokered_model_http_client: Any | None = None,
     response_state_file: str | Path | None = None,
@@ -1281,13 +1297,19 @@ def create_foundry_app(
     runtime = None if brokered_tools else factory.build_runtime(spec)
     continuation_proof = brokered_continuation_proof or os.environ.get(_CONTINUATION_PROOF_ENV) or None
     max_argument_bytes = _max_argument_bytes(max_brokered_argument_bytes)
+    max_output_bytes = _max_output_bytes(max_brokered_output_bytes)
     response_states = _FoundryResponseStateStore(
         ttl_seconds=_state_ttl_seconds(state_ttl_seconds),
         max_entries=_max_pending_responses(max_pending_responses),
         state_file=_response_state_file(response_state_file) if brokered_tools else None,
     )
     model_loop = (
-        BrokeredChatModelLoop(spec, brokered_tools, http_client=brokered_model_http_client)
+        BrokeredChatModelLoop(
+            spec,
+            brokered_tools,
+            http_client=brokered_model_http_client,
+            max_output_bytes=max_output_bytes,
+        )
         if brokered_tools and _brokered_model_loop_enabled(brokered_model_loop_enabled)
         else None
     )
@@ -1391,6 +1413,7 @@ def create_foundry_app(
                 input_value=data["input"],
                 continuation_proof=continuation_proof,
                 request=request,
+                max_output_bytes=max_output_bytes,
                 model_loop=model_loop,
             )
         if brokered_tools and isinstance(previous_response_id, str) and previous_response_id:

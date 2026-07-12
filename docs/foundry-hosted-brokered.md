@@ -184,8 +184,11 @@ safely with `unknown_previous_response_id`. Pending state expires after
 continuations fail with `response_state_expired`. The store is bounded by
 `AGENTKIT_FOUNDRY_RESPONSE_STATE_MAX_PENDING` (default: 128), and generated
 brokered arguments are bounded by `AGENTKIT_FOUNDRY_BROKERED_MAX_ARGUMENT_BYTES`
-(default: 8192) before state is accepted. A platform-managed state backend is
-still required before treating multi-replica production as fully supported.
+(default: 8192) before state is accepted. Brokered continuation outputs are
+bounded by `AGENTKIT_FOUNDRY_BROKERED_MAX_OUTPUT_BYTES` (default: 65536) before
+they are persisted, replayed, embedded in deterministic responses, or sent back
+through the model loop. A platform-managed state backend is still required
+before treating multi-replica production as fully supported.
 
 ## Streaming
 
@@ -207,6 +210,7 @@ smokes deterministic while making streaming support an explicit future step.
 - `brokered_tool_selection_required`: name exactly one configured brokered tool in deterministic mode when multiple schemas or any non-conformance single schema are configured.
 - `brokered_response_state_full`: too many uncontinued brokered responses are pending. Completed entries are evicted before this error is returned.
 - `brokered_arguments_too_large`: generated brokered call arguments exceeded the configured pending-state byte budget.
+- `brokered_output_too_large`: a brokered `function_call_output` exceeded the configured output byte budget.
 - `unknown_call_id`: the output did not match the pending function call.
 - `conflicting_duplicate_continuation`: the same `call_id` was already completed
   with different output.

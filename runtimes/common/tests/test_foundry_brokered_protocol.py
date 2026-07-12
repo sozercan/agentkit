@@ -178,6 +178,29 @@ def test_foundry_brokered_initial_response_emits_static_function_call_without_di
     assert factory.runtime.run_requests == []
 
 
+@pytest.mark.parametrize("ttl_seconds", [float("nan"), float("inf"), float("-inf")])
+def test_foundry_brokered_nonfinite_explicit_state_ttl_uses_default(ttl_seconds: float):
+    app = _app(state_ttl_seconds=ttl_seconds)
+
+    with TestClient(app) as client:
+        readiness = client.get("/readiness")
+
+    assert readiness.status_code == 200
+    assert readiness.json()["foundryResponses"]["stateTtlSeconds"] == 900.0
+
+
+@pytest.mark.parametrize("raw_ttl", ["nan", "inf", "-inf"])
+def test_foundry_brokered_nonfinite_state_ttl_env_uses_default(monkeypatch, raw_ttl: str):
+    monkeypatch.setenv("AGENTKIT_FOUNDRY_RESPONSE_STATE_TTL_SECONDS", raw_ttl)
+    app = _app()
+
+    with TestClient(app) as client:
+        readiness = client.get("/readiness")
+
+    assert readiness.status_code == 200
+    assert readiness.json()["foundryResponses"]["stateTtlSeconds"] == 900.0
+
+
 def test_foundry_brokered_deterministic_arguments_reject_unsafe_prompt_text():
     spec = _spec(tool_name="check-network-telemetry")
     spec.brokered_tools[0].parameters = {
@@ -643,6 +666,39 @@ def test_foundry_brokered_rejects_nonfinite_function_call_output_values():
     assert response.json()["error"]["code"] == "invalid_function_call_output"
 
 
+def test_foundry_brokered_rejects_oversized_function_call_output_before_state_change(tmp_path):
+    state_file = tmp_path / "responses-state.json"
+    app = _app(response_state_file=state_file, max_brokered_output_bytes=128)
+
+    with TestClient(app) as client:
+        initial = _start(client)
+        call = _call(initial)
+        persisted_before = state_file.read_bytes()
+        oversized = client.post(
+            "/responses",
+            headers=CONTINUATION_AUTH,
+            json=_continuation(
+                initial["id"],
+                call["call_id"],
+                {"approved": True, "output": {"blob": "x" * 256}},
+            ),
+        )
+        persisted_after_rejection = state_file.read_bytes()
+        accepted = client.post(
+            "/responses",
+            headers=CONTINUATION_AUTH,
+            json=_continuation(initial["id"], call["call_id"], {"approved": True, "output": {"ok": True}}),
+        )
+
+    assert oversized.status_code == 413
+    assert oversized.json()["error"] == {
+        "message": "brokered function_call_output is too large",
+        "code": "brokered_output_too_large",
+    }
+    assert persisted_after_rejection == persisted_before
+    assert accepted.status_code == 200, accepted.text
+
+
 def test_foundry_brokered_continuation_accepts_matching_tool_output_and_completes():
     app = _app()
 
@@ -747,6 +803,27 @@ def test_foundry_brokered_duplicate_continuation_is_idempotent_but_conflicts_are
     assert duplicate.json() == first.json()
     assert conflict.status_code == 409
     assert conflict.json()["error"]["code"] == "conflicting_duplicate_continuation"
+
+
+def test_foundry_brokered_rejects_oversized_persisted_replay_after_limit_is_lowered(tmp_path):
+    state_file = tmp_path / "responses-state.json"
+
+    with TestClient(_app(response_state_file=state_file, max_brokered_output_bytes=1024)) as client:
+        initial = _start(client)
+        call = _call(initial)
+        payload = _continuation(
+            initial["id"],
+            call["call_id"],
+            {"approved": True, "output": {"blob": "x" * 256}},
+        )
+        completed = client.post("/responses", json=payload, headers=CONTINUATION_AUTH)
+
+    with TestClient(_app(response_state_file=state_file, max_brokered_output_bytes=128)) as client:
+        replay = client.post("/responses", json=payload, headers=CONTINUATION_AUTH)
+
+    assert completed.status_code == 200, completed.text
+    assert replay.status_code == 413
+    assert replay.json()["error"]["code"] == "brokered_output_too_large"
 
 
 def test_foundry_brokered_file_state_survives_restart_for_deterministic_continuation(tmp_path):
@@ -1091,6 +1168,53 @@ def test_foundry_brokered_model_loop_emits_model_requested_tool_and_resumes_to_f
     assert fake.requests[1]["messages"][-1]["role"] == "tool"
     assert fake.requests[1]["messages"][-1]["tool_call_id"] == call["call_id"]
     assert "tools" not in fake.requests[1]
+
+
+def test_foundry_brokered_model_loop_rejects_oversized_output_before_resume_or_state_change(tmp_path):
+    state_file = tmp_path / "responses-state.json"
+    spec = _spec(tool_name="check-network-telemetry")
+    fake = _FakeChatTransport(
+        [
+            _chat_response(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "model_generated_call_id",
+                            "type": "function",
+                            "function": {"name": "check-network-telemetry", "arguments": "{}"},
+                        }
+                    ],
+                }
+            )
+        ]
+    )
+    app = _model_loop_app(
+        spec,
+        fake,
+        response_state_file=state_file,
+        max_brokered_output_bytes=128,
+    )
+
+    with TestClient(app) as client:
+        initial = client.post("/responses", json={"input": "check-network-telemetry"})
+        call = _call(initial.json())
+        persisted_before = state_file.read_bytes()
+        oversized = client.post(
+            "/responses",
+            headers=CONTINUATION_AUTH,
+            json=_continuation(
+                initial.json()["id"],
+                call["call_id"],
+                {"approved": True, "output": {"blob": "x" * 256}},
+            ),
+        )
+
+    assert oversized.status_code == 413
+    assert oversized.json()["error"]["code"] == "brokered_output_too_large"
+    assert state_file.read_bytes() == persisted_before
+    assert len(fake.requests) == 1
 
 
 def test_foundry_brokered_invalid_file_state_starts_with_empty_store(tmp_path):
