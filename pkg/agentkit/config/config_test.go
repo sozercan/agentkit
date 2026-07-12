@@ -580,6 +580,34 @@ func TestValidatePreservesLargeIntegerSchemaValuesBeforeTypeChecking(t *testing.
 	}
 }
 
+func TestValidateNormalizesJSONContainersWithoutChangingScalarMeaning(t *testing.T) {
+	type count int64
+	namedSchema := map[string]any{jsonSchemaTypeKey: jsonSchemaTypeInteger, jsonSchemaDefaultKey: count(1)}
+	properties := map[string]any{
+		"named":  namedSchema,
+		"number": map[string]any{jsonSchemaTypeKey: jsonSchemaTypeInteger, jsonSchemaDefaultKey: json.Number("1.0")},
+	}
+	cfg := validMinimalConfig()
+	cfg.BrokeredTools = []BrokeredTool{{
+		Name:          safeLookupToolName,
+		Description:   brokeredSafeDescription,
+		BrokeredClass: BrokeredClassRead,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey:       jsonSchemaTypeObject,
+			jsonSchemaPropertiesKey: properties,
+		},
+	}}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("JSON-serializable named and json.Number integer values should validate: %v", err)
+	}
+
+	namedSchema[jsonSchemaDefaultKey] = map[string]any(nil)
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must match the declared JSON Schema type") {
+		t.Fatalf("typed nil map must retain JSON null semantics, got: %v", err)
+	}
+}
+
 func TestValidateMeasuresBrokeredSchemaSizeWithCanonicalJSON(t *testing.T) {
 	cfg := validMinimalConfig()
 	cfg.BrokeredTools = []BrokeredTool{{

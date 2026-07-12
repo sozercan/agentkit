@@ -280,6 +280,9 @@ func normalizeJSONContainers(value any) any {
 	if value == nil {
 		return nil
 	}
+	if number, ok := value.(json.Number); ok {
+		return number
+	}
 	rv := reflect.ValueOf(value)
 	for rv.Kind() == reflect.Interface || rv.Kind() == reflect.Pointer {
 		if rv.IsNil() {
@@ -289,6 +292,9 @@ func normalizeJSONContainers(value any) any {
 	}
 	switch rv.Kind() {
 	case reflect.Map:
+		if rv.IsNil() {
+			return nil
+		}
 		if rv.Type().Key().Kind() != reflect.String {
 			return value
 		}
@@ -298,7 +304,10 @@ func normalizeJSONContainers(value any) any {
 			out[iter.Key().String()] = normalizeJSONContainers(iter.Value().Interface())
 		}
 		return out
-	case reflect.Slice, reflect.Array:
+	case reflect.Slice:
+		if rv.IsNil() {
+			return nil
+		}
 		if rv.Type().Elem().Kind() == reflect.Uint8 {
 			return value
 		}
@@ -307,6 +316,24 @@ func normalizeJSONContainers(value any) any {
 			out[i] = normalizeJSONContainers(rv.Index(i).Interface())
 		}
 		return out
+	case reflect.Array:
+		out := make([]any, rv.Len())
+		for i := 0; i < rv.Len(); i++ {
+			out[i] = normalizeJSONContainers(rv.Index(i).Interface())
+		}
+		return out
+	case reflect.Bool:
+		return rv.Bool()
+	case reflect.String:
+		return rv.String()
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return rv.Int()
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return rv.Uint()
+	case reflect.Float32:
+		return float32(rv.Float())
+	case reflect.Float64:
+		return rv.Float()
 	default:
 		return rv.Interface()
 	}
@@ -604,8 +631,11 @@ func matchesSchemaType(value any, schemaType string) bool {
 		case float64:
 			return !math.IsNaN(typed) && !math.IsInf(typed, 0) && typed == math.Trunc(typed) && math.Abs(typed) <= maxExactJSONFloatInteger
 		case json.Number:
-			_, err := typed.Int64()
-			return err == nil
+			if _, err := typed.Int64(); err == nil {
+				return true
+			}
+			number, err := typed.Float64()
+			return err == nil && !math.IsNaN(number) && !math.IsInf(number, 0) && number == math.Trunc(number) && math.Abs(number) <= maxExactJSONFloatInteger
 		default:
 			return false
 		}

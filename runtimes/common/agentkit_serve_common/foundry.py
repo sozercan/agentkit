@@ -111,15 +111,19 @@ def _responses_usage(result: RunResult | None = None, usage: Mapping[str, int] |
 def _combine_usage(*usages: Mapping[str, int] | None) -> dict[str, int]:
     prompt_tokens = 0
     completion_tokens = 0
+    total_tokens = 0
     for usage in usages:
         if not usage:
             continue
-        prompt_tokens += int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
-        completion_tokens += int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
+        prompt_count = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
+        completion_count = int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
+        prompt_tokens += prompt_count
+        completion_tokens += completion_count
+        total_tokens += int(usage.get("total_tokens", prompt_count + completion_count) or 0)
     return {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
-        "total_tokens": prompt_tokens + completion_tokens,
+        "total_tokens": total_tokens,
     }
 
 
@@ -596,10 +600,16 @@ def _json_object_from_output(output: Any) -> dict[str, Any]:
     if not isinstance(approved, bool):
         raise ValueError("function_call_output.output.approved must be a boolean")
     if approved:
+        unexpected = set(parsed) - {"approved", "output"}
+        if unexpected:
+            raise ValueError("approved function_call_output.output contains unsupported fields")
         tool_output = parsed.get("output", {})
         if tool_output is not None and not isinstance(tool_output, dict):
             raise ValueError("approved function_call_output.output.output must be an object")
     else:
+        unexpected = set(parsed) - {"approved", "error"}
+        if unexpected:
+            raise ValueError("denied function_call_output.output contains unsupported fields")
         error = parsed.get("error", {})
         if error is not None and not isinstance(error, dict):
             raise ValueError("denied function_call_output.output.error must be an object")

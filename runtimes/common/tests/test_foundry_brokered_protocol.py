@@ -1269,6 +1269,86 @@ def test_foundry_brokered_model_loop_emits_model_requested_tool_and_resumes_to_f
     assert "tools" not in fake.requests[1]
 
 
+def test_foundry_brokered_model_loop_preserves_total_only_usage_across_resume():
+    spec = _spec(tool_name="check-network-telemetry")
+    initial_model_response = _chat_response(
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "model_generated_call_id",
+                    "type": "function",
+                    "function": {"name": "check-network-telemetry", "arguments": "{}"},
+                }
+            ],
+        }
+    )
+    initial_model_response["usage"] = {"total_tokens": 5}
+    final_model_response = _chat_response({"role": "assistant", "content": "done"})
+    final_model_response["usage"] = {"total_tokens": 7}
+    app = _model_loop_app(spec, _FakeChatTransport([initial_model_response, final_model_response]))
+
+    with TestClient(app) as client:
+        initial = client.post("/responses", json={"input": "check-network-telemetry"})
+        call = _call(initial.json())
+        final = client.post(
+            "/responses",
+            headers=CONTINUATION_AUTH,
+            json=_continuation(initial.json()["id"], call["call_id"], {"approved": True, "output": {"ok": True}}),
+        )
+
+    assert initial.json()["usage"] == {"input_tokens": 0, "output_tokens": 0, "total_tokens": 5}
+    assert final.status_code == 200, final.text
+    assert final.json()["usage"] == {"input_tokens": 0, "output_tokens": 0, "total_tokens": 12}
+
+
+def test_foundry_brokered_model_loop_rejects_noncanonical_denied_output_before_resume(tmp_path):
+    state_file = tmp_path / "responses-state.json"
+    spec = _spec(tool_name="dispatch-work-order", brokered_class="write")
+    fake = _FakeChatTransport(
+        [
+            _chat_response(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "model_generated_call_id",
+                            "type": "function",
+                            "function": {"name": "dispatch-work-order", "arguments": "{}"},
+                        }
+                    ],
+                }
+            )
+        ]
+    )
+    app = _model_loop_app(spec, fake, response_state_file=state_file)
+
+    with TestClient(app) as client:
+        initial = client.post("/responses", json={"input": "dispatch-work-order"})
+        call = _call(initial.json())
+        persisted_before = state_file.read_bytes()
+        denied = client.post(
+            "/responses",
+            headers=CONTINUATION_AUTH,
+            json=_continuation(
+                initial.json()["id"],
+                call["call_id"],
+                {
+                    "approved": False,
+                    "error": {"code": "approval_declined", "message": "denied"},
+                    "output": {"sensitiveDiagnostic": "must-not-reach-model"},
+                },
+            ),
+        )
+
+    assert denied.status_code == 400
+    assert denied.json()["error"]["code"] == "invalid_function_call_output"
+    assert state_file.read_bytes() == persisted_before
+    assert len(fake.requests) == 1
+
+
 def test_foundry_brokered_model_loop_rejects_oversized_output_before_resume_or_state_change(tmp_path):
     state_file = tmp_path / "responses-state.json"
     spec = _spec(tool_name="check-network-telemetry")
