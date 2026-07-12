@@ -637,6 +637,18 @@ def _enum_value(schema: Mapping[str, Any], expected_type: type) -> Any:
     return None
 
 
+def _integer_schema_bound(value: Any, *, lower: bool, exclusive: bool) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool):
+        if exclusive:
+            return value + 1 if lower else value - 1
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        if lower:
+            return math.floor(value) + 1 if exclusive else math.ceil(value)
+        return math.ceil(value) - 1 if exclusive else math.floor(value)
+    return None
+
+
 def _required_property_names(schema: Mapping[str, Any]) -> list[str]:
     names: list[str] = []
     required = schema.get("required")
@@ -712,24 +724,14 @@ def _sample_argument_value(name: str, schema: Any, run_request: RunRequest) -> A
         value = _enum_value(schema, int)
         if value is not None and not isinstance(value, bool):
             return value
-        lower_value = schema.get("minimum")
-        if isinstance(lower_value, (int, float)) and not isinstance(lower_value, bool) and math.isfinite(float(lower_value)):
-            lower = math.ceil(float(lower_value))
-        else:
-            exclusive_lower = schema.get("exclusiveMinimum")
-            if isinstance(exclusive_lower, (int, float)) and not isinstance(exclusive_lower, bool) and math.isfinite(float(exclusive_lower)):
-                lower = math.floor(float(exclusive_lower)) + 1
-            else:
-                lower = 0
-        upper_value = schema.get("maximum")
-        if isinstance(upper_value, (int, float)) and not isinstance(upper_value, bool) and math.isfinite(float(upper_value)):
-            upper = math.floor(float(upper_value))
-        else:
-            exclusive_upper = schema.get("exclusiveMaximum")
-            if isinstance(exclusive_upper, (int, float)) and not isinstance(exclusive_upper, bool) and math.isfinite(float(exclusive_upper)):
-                upper = math.ceil(float(exclusive_upper)) - 1
-            else:
-                upper = None
+        lower = _integer_schema_bound(schema.get("minimum"), lower=True, exclusive=False)
+        if lower is None:
+            lower = _integer_schema_bound(schema.get("exclusiveMinimum"), lower=True, exclusive=True)
+        if lower is None:
+            lower = 0
+        upper = _integer_schema_bound(schema.get("maximum"), lower=False, exclusive=False)
+        if upper is None:
+            upper = _integer_schema_bound(schema.get("exclusiveMaximum"), lower=False, exclusive=True)
         if upper is not None and lower > upper:
             if "minimum" in schema or "exclusiveMinimum" in schema:
                 raise AgentRunError(

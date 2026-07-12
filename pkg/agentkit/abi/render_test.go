@@ -23,8 +23,10 @@ const (
 const (
 	jsonSchemaTypeKey       = "type"
 	jsonSchemaTypeObject    = "object"
+	jsonSchemaTypeNumber    = "number"
 	jsonSchemaPropertiesKey = "properties"
 	jsonSchemaMinimumKey    = "minimum"
+	jsonSchemaDefaultKey    = "default"
 )
 
 func sampleConfig() *config.AgentConfig {
@@ -298,7 +300,7 @@ func TestRenderAgentYAMLFormatsJSONNumberBrokeredSchemaValuesAsNumbers(t *testin
 		Parameters: map[string]any{
 			jsonSchemaTypeKey: jsonSchemaTypeObject,
 			jsonSchemaPropertiesKey: map[string]any{
-				"small": map[string]any{jsonSchemaTypeKey: "number", jsonSchemaMinimumKey: json.Number("1e-7")},
+				"small": map[string]any{jsonSchemaTypeKey: jsonSchemaTypeNumber, jsonSchemaMinimumKey: json.Number("1e-7")},
 			},
 		},
 	}}
@@ -322,7 +324,9 @@ func TestRenderAgentYAMLPreservesNegativeZeroBrokeredSchemaFloats(t *testing.T) 
 		Parameters: map[string]any{
 			jsonSchemaTypeKey: jsonSchemaTypeObject,
 			jsonSchemaPropertiesKey: map[string]any{
-				"offset": map[string]any{jsonSchemaTypeKey: "number", "default": math.Copysign(0, -1)},
+				"offset":       map[string]any{jsonSchemaTypeKey: jsonSchemaTypeNumber, jsonSchemaDefaultKey: math.Copysign(0, -1)},
+				"jsonOffset":   map[string]any{jsonSchemaTypeKey: jsonSchemaTypeNumber, jsonSchemaDefaultKey: json.Number("-0e0")},
+				"largeInteger": map[string]any{jsonSchemaTypeKey: "integer", jsonSchemaDefaultKey: json.Number("9007199254740995.0")},
 			},
 		},
 	}
@@ -337,7 +341,10 @@ func TestRenderAgentYAMLPreservesNegativeZeroBrokeredSchemaFloats(t *testing.T) 
 	if err != nil {
 		t.Fatalf("render error: %v", err)
 	}
-	if !strings.Contains(string(out), "default: -0.0") {
+	if strings.Count(string(out), "default: -0.0") != 2 {
 		t.Fatalf("rendered agent.yaml did not preserve negative zero as a float\n---\n%s", out)
+	}
+	if !strings.Contains(string(out), "default: 9007199254740995") || strings.Contains(string(out), "9007199254740995.0") {
+		t.Fatalf("rendered agent.yaml did not preserve a large integral decimal as an integer\n---\n%s", out)
 	}
 }

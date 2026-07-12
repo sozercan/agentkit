@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	pathpkg "path"
 	"reflect"
 	"sort"
@@ -280,15 +281,15 @@ func normalizeJSONContainers(value any) any {
 	if value == nil {
 		return nil
 	}
-	if number, ok := value.(json.Number); ok {
-		return number
-	}
 	rv := reflect.ValueOf(value)
 	for rv.Kind() == reflect.Interface || rv.Kind() == reflect.Pointer {
 		if rv.IsNil() {
 			return nil
 		}
 		rv = rv.Elem()
+	}
+	if number, ok := rv.Interface().(json.Number); ok {
+		return number
 	}
 	switch rv.Kind() {
 	case reflect.Map:
@@ -448,8 +449,8 @@ func isFiniteJSONNumber(value any) bool {
 	case float64:
 		return !math.IsNaN(typed) && !math.IsInf(typed, 0)
 	case json.Number:
-		number, err := typed.Float64()
-		return err == nil && !math.IsNaN(number) && !math.IsInf(number, 0)
+		number, ok := parseJSONNumber(typed)
+		return ok && jsonNumberIsRepresentable(typed, number)
 	default:
 		return false
 	}
@@ -475,17 +476,36 @@ func isNonNegativeJSONInteger(value any) bool {
 	case float64:
 		return !math.IsNaN(typed) && !math.IsInf(typed, 0) && typed >= 0 && math.Trunc(typed) == typed
 	case json.Number:
-		if integer, err := strconv.ParseInt(typed.String(), 10, 64); err == nil {
-			return integer >= 0
-		}
-		if _, err := strconv.ParseUint(typed.String(), 10, 64); err == nil {
-			return true
-		}
-		number, err := typed.Float64()
-		return err == nil && !math.IsNaN(number) && !math.IsInf(number, 0) && number >= 0 && math.Trunc(number) == number
+		number, ok := parseJSONNumber(typed)
+		return ok && number.Sign() >= 0 && jsonNumberIsExactInteger(typed, number)
 	default:
 		return false
 	}
+}
+
+func parseJSONNumber(value json.Number) (*big.Rat, bool) {
+	raw := value.String()
+	if !json.Valid([]byte(raw)) {
+		return nil, false
+	}
+	return new(big.Rat).SetString(raw)
+}
+
+func jsonNumberIsExactInteger(value json.Number, number *big.Rat) bool {
+	return number.IsInt() && jsonNumberIsRepresentable(value, number)
+}
+
+func jsonNumberIsRepresentable(value json.Number, number *big.Rat) bool {
+	raw := value.String()
+	if !strings.ContainsAny(raw, ".eE") {
+		return true
+	}
+	parsed, err := strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+		return false
+	}
+	roundTrip, ok := new(big.Rat).SetString(strconv.FormatFloat(parsed, 'g', -1, 64))
+	return ok && roundTrip.Cmp(number) == 0
 }
 
 func validateJSONSchemaType(add func(string, ...any), path string, value any) {
@@ -631,18 +651,22 @@ func matchesSchemaType(value any, schemaType string) bool {
 		case float64:
 			return !math.IsNaN(typed) && !math.IsInf(typed, 0) && typed == math.Trunc(typed) && math.Abs(typed) <= maxExactJSONFloatInteger
 		case json.Number:
-			if _, err := typed.Int64(); err == nil {
-				return true
-			}
-			number, err := typed.Float64()
-			return err == nil && !math.IsNaN(number) && !math.IsInf(number, 0) && number == math.Trunc(number) && math.Abs(number) <= maxExactJSONFloatInteger
+			number, ok := parseJSONNumber(typed)
+			return ok && jsonNumberIsExactInteger(typed, number)
 		default:
 			return false
 		}
 	case jsonSchemaTypeNumber:
-		switch value.(type) {
-		case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64, json.Number:
+		switch typed := value.(type) {
+		case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
 			return true
+		case float32:
+			return !math.IsNaN(float64(typed)) && !math.IsInf(float64(typed), 0)
+		case float64:
+			return !math.IsNaN(typed) && !math.IsInf(typed, 0)
+		case json.Number:
+			number, ok := parseJSONNumber(typed)
+			return ok && jsonNumberIsRepresentable(typed, number)
 		default:
 			return false
 		}
@@ -818,7 +842,38 @@ func canonicalJSONString(value string) ([]byte, error) {
 	if err := encoder.Encode(value); err != nil {
 		return nil, err
 	}
-	return bytes.TrimSuffix(encoded.Bytes(), []byte("\n")), nil
+	return unescapeJSONLineSeparators(bytes.TrimSuffix(encoded.Bytes(), []byte("\n"))), nil
+}
+
+func unescapeJSONLineSeparators(encoded []byte) []byte {
+	out := make([]byte, 0, len(encoded))
+	for i := 0; i < len(encoded); {
+		if encoded[i] != '\\' {
+			out = append(out, encoded[i])
+			i++
+			continue
+		}
+		start := i
+		for i < len(encoded) && encoded[i] == '\\' {
+			i++
+		}
+		runLength := i - start
+		if runLength%2 == 1 && i+5 <= len(encoded) && encoded[i] == 'u' {
+			escape := string(encoded[i : i+5])
+			if escape == "u2028" || escape == "u2029" {
+				out = append(out, encoded[start:i-1]...)
+				if escape == "u2028" {
+					out = append(out, []byte("\u2028")...)
+				} else {
+					out = append(out, []byte("\u2029")...)
+				}
+				i += 5
+				continue
+			}
+		}
+		out = append(out, encoded[start:i]...)
+	}
+	return out
 }
 
 func canonicalJSONNumberString(value string) (string, error) {

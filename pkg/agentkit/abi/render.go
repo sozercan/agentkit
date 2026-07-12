@@ -5,6 +5,7 @@ package abi
 import (
 	"encoding/json"
 	"math"
+	"math/big"
 	"strconv"
 	"strings"
 
@@ -18,6 +19,8 @@ const Version = "v0"
 
 // Path is where the rendered agent.yaml is baked into the agent image.
 const Path = "/agent/agent.yaml"
+
+const yamlNegativeZero = "-0.0"
 
 // The following types are the WRITER half of the frozen agent.yaml ABI
 // (docs/agent-abi.md). agentkit-serve reads this file with pydantic
@@ -33,7 +36,7 @@ func (n yamlNumber) MarshalYAML() ([]byte, error) {
 func yamlFloat(value float64, bitSize int) yamlNumber {
 	rendered := strconv.FormatFloat(value, 'f', -1, bitSize)
 	if value == 0 && math.Signbit(value) {
-		rendered = "-0.0"
+		rendered = yamlNegativeZero
 	}
 	return yamlNumber(rendered)
 }
@@ -133,6 +136,14 @@ type abiAgent struct {
 
 func expandJSONNumber(value string) string {
 	lower := strings.ToLower(value)
+	if json.Valid([]byte(lower)) {
+		if number, ok := new(big.Rat).SetString(lower); ok && number.IsInt() {
+			if number.Sign() == 0 && strings.HasPrefix(lower, "-") {
+				return yamlNegativeZero
+			}
+			return number.Num().String()
+		}
+	}
 	parts := strings.Split(lower, "e")
 	if len(parts) != 2 {
 		return value
@@ -156,6 +167,9 @@ func expandJSONNumber(value string) string {
 	}
 	mantissa = strings.TrimLeft(mantissa, "0")
 	if mantissa == "" {
+		if sign == "-" {
+			return yamlNegativeZero
+		}
 		return "0"
 	}
 	decimalPos := len(mantissa) - fracLen + exponent

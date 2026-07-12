@@ -388,6 +388,31 @@ def test_foundry_brokered_integer_arguments_honor_float_bounds():
     assert json.loads(_call(body.json())["arguments"]) == {"count": 1, "after": 1, "below": 0}
 
 
+def test_foundry_brokered_integer_arguments_preserve_large_integer_bounds():
+    huge = 10**100
+    spec = _spec(tool_name="large-integer-bounds")
+    spec.brokered_tools[0].parameters = {
+        "type": "object",
+        "properties": {
+            "minimum": {"type": "integer", "minimum": huge},
+            "exclusiveMinimum": {"type": "integer", "exclusiveMinimum": huge},
+            "exclusiveMaximum": {"type": "integer", "exclusiveMaximum": -huge},
+        },
+        "required": ["minimum", "exclusiveMinimum", "exclusiveMaximum"],
+    }
+    app = _app(spec)
+
+    with TestClient(app) as client:
+        response = client.post("/responses", json={"input": "large-integer-bounds"})
+
+    assert response.status_code == 200, response.text
+    assert json.loads(_call(response.json())["arguments"]) == {
+        "minimum": huge,
+        "exclusiveMinimum": huge + 1,
+        "exclusiveMaximum": -huge - 1,
+    }
+
+
 def test_foundry_brokered_synthesizes_arguments_that_honor_basic_constraints():
     spec = _spec(tool_name="bounded-lookup")
     tool = spec.brokered_tools[0]

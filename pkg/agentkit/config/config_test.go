@@ -582,10 +582,15 @@ func TestValidatePreservesLargeIntegerSchemaValuesBeforeTypeChecking(t *testing.
 
 func TestValidateNormalizesJSONContainersWithoutChangingScalarMeaning(t *testing.T) {
 	type count int64
+	pointerNumber := json.Number("2.0")
 	namedSchema := map[string]any{jsonSchemaTypeKey: jsonSchemaTypeInteger, jsonSchemaDefaultKey: count(1)}
+	numberSchema := map[string]any{jsonSchemaTypeKey: jsonSchemaTypeInteger, jsonSchemaDefaultKey: json.Number("1.0")}
+	fractionalSchema := map[string]any{jsonSchemaTypeKey: jsonSchemaTypeNumber, jsonSchemaDefaultKey: json.Number("0.1")}
 	properties := map[string]any{
-		"named":  namedSchema,
-		"number": map[string]any{jsonSchemaTypeKey: jsonSchemaTypeInteger, jsonSchemaDefaultKey: json.Number("1.0")},
+		"fractional": fractionalSchema,
+		"named":      namedSchema,
+		"number":     numberSchema,
+		"pointer":    map[string]any{jsonSchemaTypeKey: jsonSchemaTypeInteger, jsonSchemaDefaultKey: &pointerNumber},
 	}
 	cfg := validMinimalConfig()
 	cfg.BrokeredTools = []BrokeredTool{{
@@ -601,6 +606,29 @@ func TestValidateNormalizesJSONContainersWithoutChangingScalarMeaning(t *testing
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("JSON-serializable named and json.Number integer values should validate: %v", err)
 	}
+
+	numberSchema[jsonSchemaDefaultKey] = json.Number("1.00000000000000001")
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must match the declared JSON Schema type") {
+		t.Fatalf("non-integral json.Number must fail integer validation, got: %v", err)
+	}
+	numberSchema[jsonSchemaDefaultKey] = json.Number("100000000000000000001.0")
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must match the declared JSON Schema type") {
+		t.Fatalf("large float-form json.Number must fail integer validation, got: %v", err)
+	}
+	numberSchema[jsonSchemaDefaultKey] = json.Number("100000000000000000001")
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("large lexical integer json.Number should validate exactly: %v", err)
+	}
+	numberSchema[jsonSchemaDefaultKey] = json.Number("1/1")
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must be JSON serializable") {
+		t.Fatalf("non-JSON json.Number syntax must fail serialization validation, got: %v", err)
+	}
+	numberSchema[jsonSchemaDefaultKey] = json.Number("1.0")
+	fractionalSchema[jsonSchemaDefaultKey] = json.Number("1e-400")
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must match the declared JSON Schema type") {
+		t.Fatalf("underflowing json.Number must fail number validation, got: %v", err)
+	}
+	fractionalSchema[jsonSchemaDefaultKey] = json.Number("0.1")
 
 	namedSchema[jsonSchemaDefaultKey] = map[string]any(nil)
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must match the declared JSON Schema type") {
@@ -1122,6 +1150,19 @@ func TestBrokeredToolSchemaDigestMatchesPythonCanonicalJSON(t *testing.T) {
 	}
 	if digest != "sha256:7066de4e62dd1a6550701772aad901e1efcf5eb81a4f639252f82e6c7be8d4c1" {
 		t.Fatalf("digest = %q", digest)
+	}
+}
+
+func TestCanonicalJSONStringMatchesPythonForUnicodeLineSeparators(t *testing.T) {
+	value := "line\u2028paragraph\u2029literal\\u2028"
+
+	encoded, err := canonicalJSONString(value)
+	if err != nil {
+		t.Fatalf("canonicalJSONString error: %v", err)
+	}
+	want := "\"line\u2028paragraph\u2029literal\\\\u2028\""
+	if string(encoded) != want {
+		t.Fatalf("canonicalJSONString = %q, want %q", encoded, want)
 	}
 }
 
