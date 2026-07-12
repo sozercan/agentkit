@@ -10,7 +10,9 @@ schema digest may cross into hosted AgentKit.
 from __future__ import annotations
 
 import argparse
+import math
 import sys
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -22,6 +24,44 @@ from .runtime import BrokeredToolDefinition
 _ORKA_TOOL_API_VERSION = "core.orka.ai/v1alpha1"
 _ORKA_TOOL_KIND = "Tool"
 _ORKA_BROKERED_TOOL_CLASSES = ("read", "write", "coordination")
+_MAX_EXACT_YAML_FLOAT_INTEGER_DIGITS = 4096
+
+
+class _LosslessToolCRDLoader(yaml.SafeLoader):
+    """Safe YAML loader that never silently rounds CRD numeric scalars."""
+
+
+def _construct_lossless_tool_crd_float(loader: yaml.SafeLoader, node: yaml.Node) -> int | float:
+    raw = loader.construct_scalar(node).replace("_", "").lower()
+    if ":" in raw:
+        raise ValueError(f"YAML float literal {raw!r} uses unsupported sexagesimal notation")
+    try:
+        decimal = Decimal(raw)
+    except InvalidOperation as exc:
+        raise ValueError(f"YAML float literal {raw!r} is invalid") from exc
+    if not decimal.is_finite():
+        raise ValueError(f"YAML float literal {raw!r} must be finite")
+    if decimal.is_zero() and decimal.is_signed():
+        return -0.0
+    if decimal == decimal.to_integral_value():
+        digits = max(decimal.adjusted() + 1, len(decimal.as_tuple().digits)) if decimal else 1
+        if digits > _MAX_EXACT_YAML_FLOAT_INTEGER_DIGITS:
+            raise ValueError(f"YAML float literal {raw!r} expands to an integer that is too large")
+        return int(decimal)
+    try:
+        candidate = float(decimal)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(f"YAML float literal {raw!r} cannot be represented exactly") from exc
+    if not math.isfinite(candidate) or Decimal(str(candidate)) != decimal:
+        raise ValueError(f"YAML float literal {raw!r} cannot be represented exactly")
+    return candidate
+
+
+_LosslessToolCRDLoader.add_constructor("tag:yaml.org,2002:float", _construct_lossless_tool_crd_float)
+
+
+def _load_orka_tool_crd_documents(raw: str) -> list[Any]:
+    return [doc for doc in yaml.load_all(raw, Loader=_LosslessToolCRDLoader) if doc is not None]
 
 
 def brokered_tool_definitions(spec: AgentSpec) -> list[BrokeredToolDefinition]:
@@ -148,7 +188,7 @@ def load_orka_tool_crd_file(path: str | Path, *, include_digest: bool = True) ->
     """Load Tool CRD YAML/JSON documents and return safe brokeredTools entries."""
 
     raw = Path(path).read_text(encoding="utf-8")
-    docs = [doc for doc in yaml.safe_load_all(raw) if doc is not None]
+    docs = _load_orka_tool_crd_documents(raw)
     return generate_brokered_tools_from_orka_tool_crds(docs, include_digest=include_digest)
 
 
@@ -158,7 +198,7 @@ def load_orka_tool_crd_files(paths: Sequence[str | Path], *, include_digest: boo
     documents: list[Any] = []
     for path in paths:
         raw = Path(path).read_text(encoding="utf-8")
-        documents.extend(doc for doc in yaml.safe_load_all(raw) if doc is not None)
+        documents.extend(_load_orka_tool_crd_documents(raw))
     entries = generate_brokered_tools_from_orka_tool_crds(documents, include_digest=include_digest)
     seen: set[str] = set()
     duplicates: set[str] = set()

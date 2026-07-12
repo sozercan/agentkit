@@ -53,6 +53,7 @@ _DEFAULT_MAX_ARGUMENT_BYTES = 8192
 _DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024
 _MAX_SYNTHETIC_ARRAY_ITEMS = 32
 _MAX_SYNTHETIC_STRING_LENGTH = 4096
+_MAX_SYNTHETIC_VALUES = 256
 _STATE_TTL_ENV = "AGENTKIT_FOUNDRY_RESPONSE_STATE_TTL_SECONDS"
 _MAX_PENDING_ENV = "AGENTKIT_FOUNDRY_RESPONSE_STATE_MAX_PENDING"
 _MAX_ARGUMENT_BYTES_ENV = "AGENTKIT_FOUNDRY_BROKERED_MAX_ARGUMENT_BYTES"
@@ -816,7 +817,16 @@ def _required_property_names(schema: Mapping[str, Any]) -> list[str]:
     return names
 
 
-def _sample_argument_value(name: str, schema: Any, run_request: RunRequest) -> Any:
+def _sample_argument_value(name: str, schema: Any, run_request: RunRequest, *, budget: list[int] | None = None) -> Any:
+    if budget is None:
+        budget = [_MAX_SYNTHETIC_VALUES]
+    if budget[0] <= 0:
+        raise AgentRunError(
+            f"brokered tool schema for {name!r} exceeds deterministic synthesis value budget",
+            status=413,
+            code="brokered_arguments_too_large",
+        )
+    budget[0] -= 1
     if not isinstance(schema, Mapping):
         return run_request.prompt
     if "multipleOf" in schema:
@@ -998,14 +1008,14 @@ def _sample_argument_value(name: str, schema: Any, run_request: RunRequest) -> A
             return value
         min_items = schema.get("minItems", 0)
         if isinstance(min_items, int) and min_items > 0:
-            if min_items > _MAX_SYNTHETIC_ARRAY_ITEMS:
+            if min_items > _MAX_SYNTHETIC_ARRAY_ITEMS or min_items > budget[0]:
                 raise AgentRunError(
                     f"brokered tool schema for {name!r} has minItems too large for deterministic synthesis",
                     status=413,
                     code="brokered_arguments_too_large",
                 )
             item_schema = schema.get("items", {})
-            return [_sample_argument_value(name, item_schema, run_request) for _ in range(min_items)]
+            return [_sample_argument_value(name, item_schema, run_request, budget=budget) for _ in range(min_items)]
         return []
 
     if schema_type == "object":
@@ -1016,7 +1026,7 @@ def _sample_argument_value(name: str, schema: Any, run_request: RunRequest) -> A
         nested: dict[str, Any] = {}
         properties = schema.get("properties") if isinstance(schema.get("properties"), Mapping) else {}
         for child_name in _required_property_names(schema):
-            nested[child_name] = _sample_argument_value(child_name, properties.get(child_name, {}), run_request)
+            nested[child_name] = _sample_argument_value(child_name, properties.get(child_name, {}), run_request, budget=budget)
         return nested
 
     for key in ("const", "default"):
@@ -1086,8 +1096,9 @@ def _deterministic_tool_arguments(tool: BrokeredToolDefinition, run_request: Run
                     code="UnsupportedBrokeredSchema",
                 )
     arguments: dict[str, Any] = {}
+    synthesis_budget = [_MAX_SYNTHETIC_VALUES]
     for name in required_names:
-        arguments[name] = _sample_argument_value(name, properties.get(name, {}), run_request)
+        arguments[name] = _sample_argument_value(name, properties.get(name, {}), run_request, budget=synthesis_budget)
     if tool.name == "conformance_read" and "probe" in properties and "probe" not in arguments:
         arguments["probe"] = True
     if not arguments and "prompt" in properties:
@@ -1097,7 +1108,7 @@ def _deterministic_tool_arguments(tool: BrokeredToolDefinition, run_request: Run
                 status=400,
                 code="UnsupportedBrokeredSchema",
             )
-        arguments["prompt"] = _sample_argument_value("prompt", properties["prompt"], run_request)
+        arguments["prompt"] = _sample_argument_value("prompt", properties["prompt"], run_request, budget=synthesis_budget)
     return arguments
 
 
@@ -1539,6 +1550,7 @@ def create_foundry_app(
             spec,
             brokered_tools,
             http_client=brokered_model_http_client,
+            max_argument_bytes=max_argument_bytes,
             max_output_bytes=max_output_bytes,
         )
         if brokered_tools and _brokered_model_loop_enabled(brokered_model_loop_enabled)

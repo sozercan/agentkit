@@ -24,6 +24,8 @@ from .config import AgentSpec
 from .conversation import FORWARDED_ROLES, RunRequest
 from .runtime import AgentRunError, BrokeredToolDefinition
 
+_MAX_ARGUMENT_DEPTH = 128
+
 
 @dataclass(frozen=True)
 class ModelLoopFinal:
@@ -48,11 +50,13 @@ class BrokeredChatModelLoop:
         tools: Sequence[BrokeredToolDefinition],
         *,
         http_client: httpx.AsyncClient | None = None,
+        max_argument_bytes: int = 8192,
         max_output_bytes: int = 64 * 1024,
     ) -> None:
         self.spec = spec
         self.tools = list(tools)
         self.http_client = http_client
+        self.max_argument_bytes = max_argument_bytes
         self.max_output_bytes = max_output_bytes
         self.tools_by_name = {tool.name: tool for tool in self.tools}
 
@@ -80,7 +84,18 @@ class BrokeredChatModelLoop:
         if not isinstance(name, str) or name not in self.tools_by_name:
             raise AgentRunError(f"model requested unknown brokered tool {name!r}", status=400, code="unknown_brokered_tool")
         raw_arguments = function.get("arguments", "{}")
+        if isinstance(raw_arguments, str):
+            try:
+                if len(raw_arguments) > self.max_argument_bytes or len(raw_arguments.encode("utf-8")) > self.max_argument_bytes:
+                    raise AgentRunError(
+                        "model brokered tool arguments are too large",
+                        status=413,
+                        code="brokered_arguments_too_large",
+                    )
+            except UnicodeEncodeError as exc:
+                raise AgentRunError("model tool arguments must contain valid Unicode", status=400, code="InvalidToolArguments") from exc
         arguments = _parse_arguments(raw_arguments)
+        _validate_json_unicode(arguments)
         argument_text = json.dumps(arguments, separators=(",", ":"), sort_keys=True)
         assistant_message = {
             "role": "assistant",
@@ -192,15 +207,29 @@ def _choice_message(data: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def _message_text(message: Mapping[str, Any]) -> str:
-    content = message.get("content", "")
-    return content if isinstance(content, str) else str(content or "")
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    refusal = message.get("refusal")
+    if content is None and isinstance(refusal, str):
+        return refusal
+    raise AgentRunError(
+        "model response final assistant content must be a string",
+        status=502,
+        code="InvalidModelResponse",
+    )
 
 
 def _parse_arguments(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, str):
         raise AgentRunError("model tool arguments must be a JSON object string", status=400, code="InvalidToolArguments")
     try:
-        parsed = json.loads(raw or "{}", parse_float=_parse_json_float, parse_constant=_reject_json_constant)
+        parsed = json.loads(
+            raw or "{}",
+            parse_float=_parse_json_float,
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=_reject_duplicate_argument_keys,
+        )
     except AgentRunError:
         raise
     except (json.JSONDecodeError, ValueError, RecursionError) as exc:
@@ -208,6 +237,35 @@ def _parse_arguments(raw: Any) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise AgentRunError("model tool arguments must be a JSON object", status=400, code="InvalidToolArguments")
     return parsed
+
+
+def _reject_duplicate_argument_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise AgentRunError(f"model tool arguments contain duplicate key {key!r}", status=400, code="InvalidToolArguments")
+        out[key] = value
+    return out
+
+
+def _validate_json_unicode(value: Any, *, path: str = "arguments") -> None:
+    pending: list[tuple[Any, str, int]] = [(value, path, 0)]
+    while pending:
+        current, current_path, depth = pending.pop()
+        if depth > _MAX_ARGUMENT_DEPTH:
+            raise AgentRunError("model tool arguments are nested too deeply", status=400, code="InvalidToolArguments")
+        if isinstance(current, str):
+            try:
+                current.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise AgentRunError(f"model tool arguments contain invalid Unicode at {current_path}", status=400, code="InvalidToolArguments") from exc
+        elif isinstance(current, Mapping):
+            for key, child in current.items():
+                pending.append((child, f"{current_path}[{key!r}]", depth + 1))
+                pending.append((key, f"{current_path}.<key>", depth + 1))
+        elif isinstance(current, list):
+            for index, child in enumerate(current):
+                pending.append((child, f"{current_path}[{index}]", depth + 1))
 
 
 def _parse_json_float(raw: str) -> float:

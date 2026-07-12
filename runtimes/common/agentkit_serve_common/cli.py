@@ -131,6 +131,11 @@ def run(factory: RuntimeFactory, argv: list[str] | None = None) -> None:
     # builds a runtime session.
     os.environ["AGENTKIT_PROTOCOL"] = protocol
     spec = _load_spec_or_exit(args.config, protocol)
+    if spec.brokered_tools and protocol != "foundry":
+        _fail(
+            "brokeredTools require AGENTKIT_PROTOCOL=foundry (or --protocol foundry); "
+            f"the {protocol!r} protocol cannot broker Foundry Responses tool calls"
+        )
 
     # --- resolve bind/port ------------------------------------------------
     bind = os.environ.get("AGENTKIT_BIND", "127.0.0.1").strip()

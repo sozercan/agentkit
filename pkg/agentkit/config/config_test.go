@@ -608,8 +608,8 @@ func TestValidateNormalizesJSONContainersWithoutChangingScalarMeaning(t *testing
 	}
 
 	numberSchema[jsonSchemaDefaultKey] = json.Number("1.00000000000000001")
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must match the declared JSON Schema type") {
-		t.Fatalf("non-integral json.Number must fail integer validation, got: %v", err)
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "cannot be represented exactly") {
+		t.Fatalf("lossy non-integral json.Number must fail exact representation validation, got: %v", err)
 	}
 	numberSchema[jsonSchemaDefaultKey] = json.Number("100000000000000000001.0")
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must match the declared JSON Schema type") {
@@ -625,14 +625,34 @@ func TestValidateNormalizesJSONContainersWithoutChangingScalarMeaning(t *testing
 	}
 	numberSchema[jsonSchemaDefaultKey] = json.Number("1.0")
 	fractionalSchema[jsonSchemaDefaultKey] = json.Number("1e-400")
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must match the declared JSON Schema type") {
-		t.Fatalf("underflowing json.Number must fail number validation, got: %v", err)
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "cannot be represented exactly") {
+		t.Fatalf("underflowing json.Number must fail exact representation validation, got: %v", err)
 	}
 	fractionalSchema[jsonSchemaDefaultKey] = json.Number("0.1")
 
 	namedSchema[jsonSchemaDefaultKey] = map[string]any(nil)
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must match the declared JSON Schema type") {
 		t.Fatalf("typed nil map must retain JSON null semantics, got: %v", err)
+	}
+}
+
+func TestValidateRejectsLossyTypelessJSONNumberSchemaValues(t *testing.T) {
+	cfg := validMinimalConfig()
+	cfg.BrokeredTools = []BrokeredTool{{
+		Name:          safeLookupToolName,
+		Description:   brokeredSafeDescription,
+		BrokeredClass: BrokeredClassWrite,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey: jsonSchemaTypeObject,
+			jsonSchemaPropertiesKey: map[string]any{
+				"ratio": map[string]any{jsonSchemaDefaultKey: json.Number("0.100000000000000005")},
+			},
+		},
+	}}
+
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "cannot be represented exactly") {
+		t.Fatalf("lossy typeless json.Number must fail validation, got: %v", err)
 	}
 }
 

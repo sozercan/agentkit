@@ -877,16 +877,18 @@ func unescapeJSONLineSeparators(encoded []byte) []byte {
 }
 
 func canonicalJSONNumberString(value string) (string, error) {
-	if json.Valid([]byte(value)) {
-		if number, ok := new(big.Rat).SetString(value); ok && number.IsInt() {
-			if number.Sign() == 0 && strings.HasPrefix(value, "-") {
-				return "-0", nil
-			}
-			return number.Num().String(), nil
-		}
+	if !json.Valid([]byte(value)) {
+		return "", fmt.Errorf("invalid JSON number %q", value)
 	}
-	if !strings.ContainsAny(value, ".eE") {
-		return value, nil
+	number, ok := new(big.Rat).SetString(value)
+	if !ok {
+		return "", fmt.Errorf("invalid JSON number %q", value)
+	}
+	if number.IsInt() {
+		if number.Sign() == 0 && strings.HasPrefix(value, "-") {
+			return "-0", nil
+		}
+		return number.Num().String(), nil
 	}
 	parsed, err := strconv.ParseFloat(value, 64)
 	if err != nil {
@@ -894,6 +896,10 @@ func canonicalJSONNumberString(value string) (string, error) {
 	}
 	if math.IsNaN(parsed) || math.IsInf(parsed, 0) {
 		return "", fmt.Errorf("JSON numbers must be finite")
+	}
+	roundTrip, ok := new(big.Rat).SetString(strconv.FormatFloat(parsed, 'g', -1, 64))
+	if !ok || roundTrip.Cmp(number) != 0 {
+		return "", fmt.Errorf("JSON number %q cannot be represented exactly", value)
 	}
 	return strconv.FormatFloat(parsed, 'f', -1, 64), nil
 }

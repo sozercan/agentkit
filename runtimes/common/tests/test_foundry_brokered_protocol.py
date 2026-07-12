@@ -695,6 +695,59 @@ def test_foundry_brokered_rejects_unbounded_schema_synthesis_before_allocating()
     assert resp.json()["error"]["code"] == "brokered_arguments_too_large"
 
 
+def test_foundry_brokered_bounds_nested_array_synthesis_before_recursive_allocation():
+    spec = _spec(tool_name="nested-array")
+    spec.brokered_tools[0].parameters = {
+        "type": "object",
+        "properties": {
+            "values": {
+                "type": "array",
+                "minItems": 32,
+                "items": {
+                    "type": "array",
+                    "minItems": 32,
+                    "items": {"type": "string"},
+                },
+            }
+        },
+        "required": ["values"],
+    }
+    app = _app(spec)
+
+    with TestClient(app) as client:
+        response = client.post("/responses", json={"input": "nested-array"})
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "brokered_arguments_too_large"
+
+
+def test_foundry_brokered_counts_wide_object_members_against_synthesis_budget():
+    item_properties = {f"field{index}": {"type": "string"} for index in range(32)}
+    spec = _spec(tool_name="wide-object-array")
+    spec.brokered_tools[0].parameters = {
+        "type": "object",
+        "properties": {
+            "values": {
+                "type": "array",
+                "minItems": 32,
+                "items": {
+                    "type": "object",
+                    "properties": item_properties,
+                    "required": list(item_properties),
+                },
+            }
+        },
+        "required": ["values"],
+    }
+    app = _app(spec)
+
+    with TestClient(app) as client:
+        response = client.post("/responses", json={"input": "wide-object-array"})
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "brokered_arguments_too_large"
+
+
 def test_foundry_brokered_tool_selection_requires_token_boundary_match():
     data = _multi_tool_spec().model_dump(by_alias=True)
     data["brokeredTools"] = [
@@ -1992,6 +2045,31 @@ def test_foundry_brokered_model_loop_can_return_final_message_without_tool_call(
     assert fake.requests[0]["tool_choice"] == "auto"
 
 
+def test_foundry_brokered_model_loop_returns_assistant_refusal_without_tool_call():
+    fake = _FakeChatTransport(
+        [_chat_response({"role": "assistant", "content": None, "refusal": "I cannot help with that."})]
+    )
+    app = _model_loop_app(_spec(tool_name="check-network-telemetry"), fake)
+
+    with TestClient(app) as client:
+        response = client.post("/responses", json={"input": "Do something unsafe"})
+
+    assert response.status_code == 200, response.text
+    assert _message_text(response.json()) == "I cannot help with that."
+
+
+@pytest.mark.parametrize("content", [None, {"text": "not supported"}, ["not supported"]])
+def test_foundry_brokered_model_loop_rejects_non_string_final_content(content: Any):
+    fake = _FakeChatTransport([_chat_response({"role": "assistant", "content": content})])
+    app = _model_loop_app(_spec(tool_name="check-network-telemetry"), fake)
+
+    with TestClient(app) as client:
+        response = client.post("/responses", json={"input": "Say hello"})
+
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "InvalidModelResponse"
+
+
 def test_foundry_brokered_model_loop_rejects_unsupported_pattern_deterministically():
     spec = _spec(tool_name="check-network-telemetry")
     spec.brokered_tools[0].parameters = {
@@ -2113,6 +2191,134 @@ def test_foundry_brokered_model_loop_rejects_object_valued_tool_arguments():
 
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "InvalidToolArguments"
+
+
+def test_foundry_brokered_model_loop_rejects_duplicate_tool_argument_keys():
+    fake = _FakeChatTransport(
+        [
+            _chat_response(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_model",
+                            "type": "function",
+                            "function": {
+                                "name": "check-network-telemetry",
+                                "arguments": '{"site":"sfo","site":"sea"}',
+                            },
+                        }
+                    ],
+                }
+            )
+        ]
+    )
+    app = _model_loop_app(_spec(tool_name="check-network-telemetry"), fake)
+
+    with TestClient(app) as client:
+        response = client.post("/responses", json={"input": "check-network-telemetry"})
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "InvalidToolArguments"
+
+
+def test_foundry_brokered_model_loop_rejects_decoded_surrogate_arguments():
+    fake = _FakeChatTransport(
+        [
+            _chat_response(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_model",
+                            "type": "function",
+                            "function": {
+                                "name": "check-network-telemetry",
+                                "arguments": '{"site":"\\ud800"}',
+                            },
+                        }
+                    ],
+                }
+            )
+        ]
+    )
+    app = _model_loop_app(_spec(tool_name="check-network-telemetry"), fake)
+
+    with TestClient(app) as client:
+        response = client.post("/responses", json={"input": "check-network-telemetry"})
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "InvalidToolArguments"
+
+
+def test_foundry_brokered_model_loop_rejects_excessively_nested_arguments():
+    nested = '"leaf"'
+    for _ in range(200):
+        nested = f"[{nested}]"
+    fake = _FakeChatTransport(
+        [
+            _chat_response(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_model",
+                            "type": "function",
+                            "function": {
+                                "name": "check-network-telemetry",
+                                "arguments": '{"site":' + nested + "}",
+                            },
+                        }
+                    ],
+                }
+            )
+        ]
+    )
+    app = _model_loop_app(_spec(tool_name="check-network-telemetry"), fake)
+
+    with TestClient(app) as client:
+        response = client.post("/responses", json={"input": "check-network-telemetry"})
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "InvalidToolArguments"
+
+
+def test_foundry_brokered_model_loop_bounds_raw_arguments_before_parsing(monkeypatch):
+    fake = _FakeChatTransport(
+        [
+            _chat_response(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_model",
+                            "type": "function",
+                            "function": {
+                                "name": "check-network-telemetry",
+                                "arguments": '{"blob":"' + ("x" * 128) + '"}',
+                            },
+                        }
+                    ],
+                }
+            )
+        ]
+    )
+
+    def fail_if_parsed(_raw: Any) -> dict[str, Any]:
+        raise AssertionError("oversized model arguments must be rejected before parsing")
+
+    monkeypatch.setattr(foundry_model_loop_module, "_parse_arguments", fail_if_parsed)
+    app = _model_loop_app(_spec(tool_name="check-network-telemetry"), fake, max_brokered_argument_bytes=64)
+
+    with TestClient(app) as client:
+        response = client.post("/responses", json={"input": "check-network-telemetry"})
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "brokered_arguments_too_large"
 
 
 def test_foundry_brokered_model_loop_normalizes_json_parser_failures():
