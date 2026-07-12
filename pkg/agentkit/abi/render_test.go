@@ -324,10 +324,12 @@ func TestRenderAgentYAMLPreservesNegativeZeroBrokeredSchemaFloats(t *testing.T) 
 		Parameters: map[string]any{
 			jsonSchemaTypeKey: jsonSchemaTypeObject,
 			jsonSchemaPropertiesKey: map[string]any{
-				"offset":       map[string]any{jsonSchemaTypeKey: jsonSchemaTypeNumber, jsonSchemaDefaultKey: math.Copysign(0, -1)},
-				"jsonOffset":   map[string]any{jsonSchemaTypeKey: jsonSchemaTypeNumber, jsonSchemaDefaultKey: json.Number("-0e0")},
-				"largeInteger": map[string]any{jsonSchemaTypeKey: "integer", jsonSchemaDefaultKey: json.Number("9007199254740995.0")},
-				"typedNested":  map[string][]float64{"enum": {math.Copysign(0, -1)}},
+				"offset":        map[string]any{jsonSchemaTypeKey: jsonSchemaTypeNumber, jsonSchemaDefaultKey: math.Copysign(0, -1)},
+				"jsonOffset":    map[string]any{jsonSchemaTypeKey: jsonSchemaTypeNumber, jsonSchemaDefaultKey: json.Number("-0e0")},
+				"largeInteger":  map[string]any{jsonSchemaTypeKey: "integer", jsonSchemaDefaultKey: json.Number("9007199254740995.0")},
+				"typedNested":   map[string][]float64{"enum": {math.Copysign(0, -1)}},
+				"typedNil":      map[string]any{jsonSchemaDefaultKey: map[string]string(nil)},
+				"typedNilSlice": map[string]any{jsonSchemaDefaultKey: []string(nil)},
 			},
 		},
 	}
@@ -350,5 +352,8 @@ func TestRenderAgentYAMLPreservesNegativeZeroBrokeredSchemaFloats(t *testing.T) 
 	}
 	if strings.Count(string(out), yamlNegativeZero) != 3 {
 		t.Fatalf("rendered agent.yaml did not normalize negative zero in typed nested containers\n---\n%s", out)
+	}
+	if strings.Count(string(out), "default: null") != 2 {
+		t.Fatalf("rendered agent.yaml did not preserve typed nil containers as null\n---\n%s", out)
 	}
 }

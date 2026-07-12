@@ -74,6 +74,9 @@ initial_response="$transcript_dir/02-initial-response.json"
 continuation_request="$transcript_dir/03-continuation-request.json"
 continuation_response="$transcript_dir/04-continuation-response.json"
 summary_file="$transcript_dir/summary.json"
+expected_output_file="$transcript_dir/.expected-output.json"
+trap 'rm -f -- "$expected_output_file"' EXIT
+printf '%s' "$conformance_output" >"$expected_output_file"
 
 PROMPT="$prompt" python3 - <<'PY' >"$initial_request"
 import json
@@ -153,6 +156,7 @@ verifier_args=(
   "$transcript_dir"
   --expected-tool-name "$expected_tool_name"
   --expected-arguments-json "$expected_arguments"
+  --expected-output-file "$expected_output_file"
   --expected-call-id "$expected_call_id"
   --write-summary
 )
@@ -161,6 +165,8 @@ if [[ -n "$expected_call_id_prefix" ]]; then
 fi
 python3 deploy/foundry/scripts/verify_brokered_transcript.py "${verifier_args[@]}" >"$summary_file.tmp"
 rm -f "$summary_file.tmp"
+rm -f "$expected_output_file"
+trap - EXIT
 
 echo "Foundry brokered conformance passed. Sanitized transcript: ${transcript_dir}"
 cat "$summary_file"

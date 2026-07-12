@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ EXPECTED_FILES = (
     "03-continuation-request.json",
     "04-continuation-response.json",
 )
+_MAX_SUMMARY_INTEGER_DIGITS = 4096
 
 
 def _load_json(path: Path) -> Any:
@@ -33,6 +35,64 @@ def _load_json(path: Path) -> Any:
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise ValueError(message)
+
+
+def _reject_json_constant(raw: str) -> None:
+    raise ValueError(f"non-finite JSON number {raw} is not allowed")
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f"duplicate JSON object key {key!r} is not allowed")
+        out[key] = value
+    return out
+
+
+def _parse_json_lossless(raw: str) -> Any:
+    return json.loads(
+        raw,
+        parse_int=Decimal,
+        parse_float=Decimal,
+        parse_constant=_reject_json_constant,
+        object_pairs_hook=_reject_duplicate_keys,
+    )
+
+
+def _strict_json_equal(left: Any, right: Any) -> bool:
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left == right
+    if isinstance(left, (int, float, Decimal)) and isinstance(right, (int, float, Decimal)):
+        try:
+            return Decimal(str(left)) == Decimal(str(right))
+        except InvalidOperation:
+            return False
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(_strict_json_equal(left[key], right[key]) for key in left)
+    if isinstance(left, list):
+        return len(left) == len(right) and all(_strict_json_equal(a, b) for a, b in zip(left, right))
+    return left == right
+
+
+def _json_compatible(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _json_compatible(child) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_json_compatible(child) for child in value]
+    if isinstance(value, Decimal):
+        if value == value.to_integral_value():
+            digits = max(value.adjusted() + 1, len(value.as_tuple().digits)) if value else 1
+            if digits > _MAX_SUMMARY_INTEGER_DIGITS:
+                raise ValueError("numeric argument is too large to include safely in the summary")
+            return int(value)
+        candidate = float(value)
+        if Decimal(str(candidate)) == value:
+            return candidate
+        return str(value)
+    return value
 
 
 def _message_text(response: dict[str, Any]) -> str:
@@ -52,11 +112,13 @@ def verify_transcript(
     *,
     expected_tool_name: str = "conformance_read",
     expected_arguments_json: str = '{"probe":true}',
+    expected_output_json: str = '{"approved":true,"output":{"success":true}}',
     expected_call_id: str = "call_conformance_1",
     expected_call_id_prefix: str | None = None,
 ) -> dict[str, Any]:
     root = Path(transcript_dir)
-    expected_arguments = json.loads(expected_arguments_json)
+    expected_arguments = _parse_json_lossless(expected_arguments_json)
+    expected_output = _parse_json_lossless(expected_output_json)
     initial_request = _load_json(root / "01-initial-request.json")
     initial_response = _load_json(root / "02-initial-response.json")
     continuation_request = _load_json(root / "03-continuation-request.json")
@@ -86,8 +148,8 @@ def verify_transcript(
         _require(call_id.startswith(expected_call_id_prefix), f"function_call call_id must start with {expected_call_id_prefix}")
     arguments = call.get("arguments")
     _require(isinstance(arguments, str), "function_call arguments must be a JSON string")
-    parsed_arguments = json.loads(arguments)
-    _require(parsed_arguments == expected_arguments, f"function_call arguments must be {expected_arguments}")
+    parsed_arguments = _parse_json_lossless(arguments)
+    _require(_strict_json_equal(parsed_arguments, expected_arguments), f"function_call arguments must be {expected_arguments}")
 
     _require(isinstance(continuation_request, dict), "continuation request must be a JSON object")
     _require(continuation_request.get("previous_response_id") == initial_response_id, "continuation previous_response_id must match initial id")
@@ -99,8 +161,9 @@ def verify_transcript(
     _require(continuation_item.get("call_id") == call_id, "continuation call_id must match function_call call_id")
     continuation_output = continuation_item.get("output")
     _require(isinstance(continuation_output, str), "continuation output must be a JSON string")
-    parsed_output = json.loads(continuation_output)
+    parsed_output = _parse_json_lossless(continuation_output)
     _require(isinstance(parsed_output, dict), "continuation output JSON must be an object")
+    _require(_strict_json_equal(parsed_output, expected_output), "continuation output did not match expected JSON")
 
     _require(isinstance(continuation_response, dict), "continuation response must be a JSON object")
     _require(continuation_response.get("status") == "completed", "continuation response status must be completed")
@@ -115,7 +178,7 @@ def verify_transcript(
         "continuation_response_id": continuation_response_id,
         "function_call_name": function_name,
         "call_id": call_id,
-        "arguments": parsed_arguments,
+        "arguments": _json_compatible(parsed_arguments),
         "final_text": final_text,
         "transcript_files": list(EXPECTED_FILES),
     }
@@ -126,6 +189,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("transcript_dir", help="directory containing 01/02/03/04 conformance transcript JSON files")
     parser.add_argument("--expected-tool-name", default="conformance_read", help="expected function_call name")
     parser.add_argument("--expected-arguments-json", default='{"probe":true}', help="expected function_call arguments JSON")
+    parser.add_argument("--expected-output-json", default='{"approved":true,"output":{"success":true}}', help="expected function_call_output JSON")
+    parser.add_argument("--expected-output-file", default=None, help="private file containing expected function_call_output JSON")
     parser.add_argument("--expected-call-id", default="call_conformance_1", help="expected call_id, or 'auto' to only require a non-empty id")
     parser.add_argument("--expected-call-id-prefix", default=None, help="optional required call_id prefix")
     parser.add_argument("--write-summary", action="store_true", help="write summary.json in the transcript directory")
@@ -135,10 +200,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     try:
+        expected_output_json = (
+            Path(args.expected_output_file).read_text(encoding="utf-8")
+            if args.expected_output_file
+            else args.expected_output_json
+        )
         summary = verify_transcript(
             args.transcript_dir,
             expected_tool_name=args.expected_tool_name,
             expected_arguments_json=args.expected_arguments_json,
+            expected_output_json=expected_output_json,
             expected_call_id=args.expected_call_id,
             expected_call_id_prefix=args.expected_call_id_prefix,
         )

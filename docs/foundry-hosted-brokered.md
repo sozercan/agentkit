@@ -190,6 +190,12 @@ they are persisted, replayed, embedded in deterministic responses, or sent back
 through the model loop. A platform-managed state backend is still required
 before treating multi-replica production as fully supported.
 
+The file is sensitive runtime state, not harmless metadata. In model-loop mode
+it includes model messages such as system instructions, conversation history,
+and user prompts, in addition to brokered arguments/outputs and cached final
+payloads. Store it on access-controlled storage and apply an appropriate
+retention/deletion policy.
+
 ## Streaming
 
 The current route is non-streaming. If clients send `stream: true`, AgentKit

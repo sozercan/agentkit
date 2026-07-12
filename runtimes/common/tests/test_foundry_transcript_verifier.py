@@ -75,6 +75,8 @@ def test_foundry_brokered_conformance_script_keeps_sensitive_headers_out_of_curl
     assert text.count("--config -") == 2
     assert '-H "Authorization: Bearer ${token}"' not in text
     assert '-H "x-agentkit-brokered-continuation-proof:' not in text
+    assert '--expected-output-file "$expected_output_file"' in text
+    assert '--expected-output-json "$conformance_output"' not in text
 
 
 def test_verify_brokered_transcript_rejects_old_response_ids(tmp_path):
@@ -122,6 +124,51 @@ def test_verify_brokered_transcript_rejects_extra_final_output_items(tmp_path):
 
     with pytest.raises(ValueError, match="must contain exactly one item"):
         verifier.verify_transcript(transcript)
+
+
+def test_verify_brokered_transcript_rejects_unexpected_continuation_output(tmp_path):
+    verifier = _load_verifier()
+    transcript = _write_transcript(tmp_path)
+    continuation = json.loads((transcript / "03-continuation-request.json").read_text(encoding="utf-8"))
+    continuation["input"][0]["output"] = '{"approved":false,"error":{"code":"denied"}}'
+    (transcript / "03-continuation-request.json").write_text(json.dumps(continuation), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="continuation output did not match expected JSON"):
+        verifier.verify_transcript(transcript)
+
+
+def test_verify_brokered_transcript_compares_output_json_types_strictly(tmp_path):
+    verifier = _load_verifier()
+    transcript = _write_transcript(tmp_path)
+    continuation = json.loads((transcript / "03-continuation-request.json").read_text(encoding="utf-8"))
+    continuation["input"][0]["output"] = '{"approved":1,"output":{"success":1}}'
+    (transcript / "03-continuation-request.json").write_text(json.dumps(continuation), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="continuation output did not match expected JSON"):
+        verifier.verify_transcript(transcript)
+
+
+def test_verify_brokered_transcript_json_comparison_distinguishes_booleans_but_normalizes_numbers():
+    verifier = _load_verifier()
+
+    assert verifier._strict_json_equal({"limit": 1}, {"limit": 1.0})
+    assert not verifier._strict_json_equal({"approved": True}, {"approved": 1})
+    assert not verifier._strict_json_equal(
+        verifier._parse_json_lossless('{"value":9007199254740992.0}'),
+        verifier._parse_json_lossless('{"value":9007199254740993.0}'),
+    )
+    compatible = verifier._json_compatible(verifier._parse_json_lossless('{"count":9007199254740993,"ratio":0.5}'))
+    assert compatible == {"count": 9007199254740993, "ratio": 0.5}
+    json.dumps(compatible)
+
+
+def test_verify_brokered_transcript_rejects_duplicate_json_keys_and_huge_summary_integers():
+    verifier = _load_verifier()
+
+    with pytest.raises(ValueError, match="duplicate JSON object key"):
+        verifier._parse_json_lossless('{"probe":false,"probe":true}')
+    with pytest.raises(ValueError, match="too large to include safely"):
+        verifier._json_compatible(verifier._parse_json_lossless("1e1000000"))
 
 
 def test_verify_brokered_transcript_cli_writes_summary(tmp_path, capsys):

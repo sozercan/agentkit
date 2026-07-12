@@ -207,48 +207,78 @@ func copyMap(in map[string]any) map[string]any {
 func copyAny(v any) any {
 	switch typed := v.(type) {
 	case map[string]any:
+		if typed == nil {
+			return nil
+		}
 		return copyMap(typed)
 	case map[string]string:
+		if typed == nil {
+			return nil
+		}
 		out := make(map[string]string, len(typed))
 		for key, value := range typed {
 			out[key] = value
 		}
 		return out
 	case map[string]int:
+		if typed == nil {
+			return nil
+		}
 		out := make(map[string]int, len(typed))
 		for key, value := range typed {
 			out[key] = value
 		}
 		return out
 	case map[string]float64:
+		if typed == nil {
+			return nil
+		}
 		out := make(map[string]any, len(typed))
 		for key, value := range typed {
 			out[key] = yamlFloat(value, 64)
 		}
 		return out
 	case map[string]bool:
+		if typed == nil {
+			return nil
+		}
 		out := make(map[string]bool, len(typed))
 		for key, value := range typed {
 			out[key] = value
 		}
 		return out
 	case []any:
+		if typed == nil {
+			return nil
+		}
 		out := make([]any, len(typed))
 		for i, item := range typed {
 			out[i] = copyAny(item)
 		}
 		return out
 	case []string:
+		if typed == nil {
+			return nil
+		}
 		return append([]string(nil), typed...)
 	case []int:
+		if typed == nil {
+			return nil
+		}
 		return append([]int(nil), typed...)
 	case []float64:
+		if typed == nil {
+			return nil
+		}
 		out := make([]any, len(typed))
 		for i, item := range typed {
 			out[i] = yamlFloat(item, 64)
 		}
 		return out
 	case []bool:
+		if typed == nil {
+			return nil
+		}
 		return append([]bool(nil), typed...)
 	case float32:
 		return yamlFloat(float64(typed), 32)
