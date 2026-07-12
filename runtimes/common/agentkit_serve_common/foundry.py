@@ -268,7 +268,9 @@ class _HostedResponseState:
 
 
 class _StateExpired(KeyError):
-    pass
+    def __init__(self, response_id: str, state: _HostedResponseState) -> None:
+        super().__init__(response_id)
+        self.state = state
 
 
 class _StateStoreFull(Exception):
@@ -435,7 +437,7 @@ class _FoundryResponseStateStore:
         if state.expires_at <= time.time():
             self._states.pop(response_id, None)
             self._persist()
-            raise _StateExpired(response_id)
+            raise _StateExpired(response_id, state)
         self.purge_expired()
         return state
 
@@ -1375,9 +1377,16 @@ async def _handle_brokered_continuation(
             status=400,
             code="missing_previous_response_id",
         )
+    input_items = input_value if isinstance(input_value, list) else [input_value] if isinstance(input_value, dict) else []
     if len(outputs) != 1:
         return _error(
             "multiple function_call_output items are not supported by this deterministic brokered adapter",
+            status=400,
+            code="multiple_tool_outputs_unsupported",
+        )
+    if len(input_items) != 1:
+        return _error(
+            "continuation input must contain exactly one function_call_output item",
             status=400,
             code="multiple_tool_outputs_unsupported",
         )
@@ -1631,8 +1640,10 @@ def create_foundry_app(
         if brokered_tools and isinstance(previous_response_id, str) and previous_response_id:
             try:
                 previous_state = response_states.get(previous_response_id)
-            except _StateExpired:
-                return _error("previous_response_id state has expired", status=410, code="response_state_expired")
+            except _StateExpired as exc:
+                if exc.state.status in {"pending", "resuming"}:
+                    return _error("previous_response_id state has expired", status=410, code="response_state_expired")
+                previous_state = None
             except KeyError:
                 previous_state = None
             if previous_state is not None and previous_state.status in {"pending", "resuming"}:

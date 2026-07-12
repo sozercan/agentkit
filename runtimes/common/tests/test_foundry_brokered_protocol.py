@@ -1245,6 +1245,39 @@ def test_foundry_brokered_rejects_normal_followup_to_expired_pending_response():
     assert response.json()["error"]["code"] == "response_state_expired"
 
 
+def test_foundry_brokered_allows_normal_followup_after_completed_state_expires(monkeypatch):
+    stores: list[Any] = []
+    original_store = foundry_module._FoundryResponseStateStore
+
+    def capture_store(*args: Any, **kwargs: Any) -> Any:
+        store = original_store(*args, **kwargs)
+        stores.append(store)
+        return store
+
+    monkeypatch.setattr(foundry_module, "_FoundryResponseStateStore", capture_store)
+    app = _app()
+
+    with TestClient(app) as client:
+        initial = _start(client)
+        call = _call(initial)
+        completed = client.post(
+            "/responses",
+            headers=CONTINUATION_AUTH,
+            json=_continuation(initial["id"], call["call_id"], {"approved": True, "output": {"ok": True}}),
+        )
+        state = stores[0].get(initial["id"])
+        state.expires_at = time.time() - 1
+        stores[0].save(state)
+        followup = client.post(
+            "/responses",
+            json={"previous_response_id": initial["id"], "input": "next question"},
+        )
+
+    assert completed.status_code == 200, completed.text
+    assert followup.status_code == 200, followup.text
+    assert _call(followup.json())
+
+
 def test_foundry_brokered_refuses_to_synthesize_nonliteral_write_arguments():
     spec = _spec(tool_name="dispatch-work-order", brokered_class="write")
     spec.brokered_tools[0].parameters = {
@@ -1413,6 +1446,26 @@ def test_foundry_brokered_rejects_multiple_tool_outputs_deterministically():
     assert resp.status_code == 400
     assert resp.json()["error"]["code"] == "multiple_tool_outputs_unsupported"
 
+
+
+def test_foundry_brokered_rejects_continuation_with_extra_non_output_item():
+    app = _app()
+
+    with TestClient(app) as client:
+        initial = _start(client)
+        call = _call(initial)
+        request = _continuation(initial["id"], call["call_id"], {"approved": True, "output": {"ok": True}})
+        request["input"].append({"type": "message", "role": "user", "content": "ignored"})
+        rejected = client.post("/responses", json=request, headers=CONTINUATION_AUTH)
+        accepted = client.post(
+            "/responses",
+            json=_continuation(initial["id"], call["call_id"], {"approved": True, "output": {"ok": True}}),
+            headers=CONTINUATION_AUTH,
+        )
+
+    assert rejected.status_code == 400
+    assert rejected.json()["error"]["code"] == "multiple_tool_outputs_unsupported"
+    assert accepted.status_code == 200, accepted.text
 
 
 def test_foundry_brokered_disables_invocations_direct_runtime_bypass():
