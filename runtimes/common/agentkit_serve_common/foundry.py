@@ -564,10 +564,29 @@ def _reject_nonfinite_json_values(value: Any, *, path: str = "value") -> None:
             _reject_nonfinite_json_values(child, path=f"{path}[{idx}]")
 
 
+def _parse_output_float(raw: str) -> float:
+    try:
+        decimal = Decimal(raw)
+    except InvalidOperation as exc:
+        raise ValueError("function_call_output.output must contain valid JSON numbers") from exc
+    parsed = float(decimal)
+    if not math.isfinite(parsed) or Decimal(str(parsed)) != decimal:
+        raise ValueError("function_call_output.output contains a number that cannot be represented exactly")
+    return parsed
+
+
+def _reject_output_constant(raw: str) -> None:
+    raise ValueError(f"function_call_output.output contains non-finite number {raw}")
+
+
 def _json_object_from_output(output: Any) -> dict[str, Any]:
     if isinstance(output, str):
         try:
-            parsed = json.loads(output)
+            parsed = json.loads(
+                output,
+                parse_float=_parse_output_float,
+                parse_constant=_reject_output_constant,
+            )
         except json.JSONDecodeError as exc:
             raise ValueError("function_call_output.output must be a JSON object string") from exc
     else:
