@@ -95,6 +95,26 @@ def test_verify_brokered_transcript_rejects_reused_continuation_response_id(tmp_
         verifier.verify_transcript(transcript)
 
 
+def test_verify_brokered_transcript_rejects_extra_final_output_items(tmp_path):
+    verifier = _load_verifier()
+    transcript = _write_transcript(tmp_path)
+    continuation = json.loads((transcript / "04-continuation-response.json").read_text(encoding="utf-8"))
+    continuation["output"].append(
+        {
+            "type": "function_call",
+            "id": "fc_unexpected",
+            "call_id": "call_unexpected",
+            "name": "unexpected",
+            "arguments": "{}",
+            "status": "completed",
+        }
+    )
+    (transcript / "04-continuation-response.json").write_text(json.dumps(continuation), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must contain exactly one item"):
+        verifier.verify_transcript(transcript)
+
+
 def test_verify_brokered_transcript_cli_writes_summary(tmp_path, capsys):
     verifier = _load_verifier()
     transcript = _write_transcript(tmp_path)

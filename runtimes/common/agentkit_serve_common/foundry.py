@@ -24,6 +24,7 @@ import re
 import time
 import uuid
 from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 from pathlib import Path
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -649,6 +650,118 @@ def _integer_schema_bound(value: Any, *, lower: bool, exclusive: bool) -> int | 
     return None
 
 
+def _effective_numeric_bounds(schema: Mapping[str, Any]) -> tuple[Fraction | None, bool, Fraction | None, bool]:
+    lower_value: Fraction | None = None
+    lower_open = False
+    for key, exclusive in (("minimum", False), ("exclusiveMinimum", True)):
+        raw = schema.get(key)
+        if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+            continue
+        if isinstance(raw, float) and not math.isfinite(raw):
+            raise AgentRunError("brokered tool schema has a non-finite numeric bound", status=400, code="UnsupportedBrokeredSchema")
+        try:
+            candidate = Fraction(str(raw))
+        except (ValueError, ZeroDivisionError) as exc:
+            raise AgentRunError("brokered tool schema has an invalid numeric bound", status=400, code="UnsupportedBrokeredSchema") from exc
+        if lower_value is None or candidate > lower_value:
+            lower_value = candidate
+            lower_open = exclusive
+        elif candidate == lower_value and exclusive:
+            lower_open = True
+
+    upper_value: Fraction | None = None
+    upper_open = False
+    for key, exclusive in (("maximum", False), ("exclusiveMaximum", True)):
+        raw = schema.get(key)
+        if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+            continue
+        if isinstance(raw, float) and not math.isfinite(raw):
+            raise AgentRunError("brokered tool schema has a non-finite numeric bound", status=400, code="UnsupportedBrokeredSchema")
+        try:
+            candidate = Fraction(str(raw))
+        except (ValueError, ZeroDivisionError) as exc:
+            raise AgentRunError("brokered tool schema has an invalid numeric bound", status=400, code="UnsupportedBrokeredSchema") from exc
+        if upper_value is None or candidate < upper_value:
+            upper_value = candidate
+            upper_open = exclusive
+        elif candidate == upper_value and exclusive:
+            upper_open = True
+    return lower_value, lower_open, upper_value, upper_open
+
+
+def _fraction_floor(value: Fraction) -> int:
+    return value.numerator // value.denominator
+
+
+def _fraction_ceil(value: Fraction) -> int:
+    return -((-value.numerator) // value.denominator)
+
+
+def _fraction_json_candidate(value: Fraction, *, name: str, require_exact: bool) -> int | float:
+    if value.denominator == 1:
+        integer_text = str(value.numerator)
+        try:
+            compact_float = float(value.numerator)
+        except OverflowError:
+            compact_float = math.inf
+        if math.isfinite(compact_float) and Fraction(str(compact_float)) == value and len(str(compact_float)) < len(integer_text):
+            return compact_float
+        return value.numerator
+    try:
+        candidate = float(value)
+    except OverflowError as exc:
+        raise AgentRunError(
+            f"brokered tool schema for {name!r} has no representable numeric value in bounds",
+            status=400,
+            code="UnsupportedBrokeredSchema",
+        ) from exc
+    if not math.isfinite(candidate) or (require_exact and Fraction(str(candidate)) != value):
+        raise AgentRunError(
+            f"brokered tool schema for {name!r} has no representable numeric value in bounds",
+            status=400,
+            code="UnsupportedBrokeredSchema",
+        )
+    return candidate
+
+
+def _fraction_in_numeric_bounds(
+    candidate: Fraction,
+    *,
+    lower_value: Fraction | None,
+    lower_open: bool,
+    upper_value: Fraction | None,
+    upper_open: bool,
+) -> bool:
+    if lower_value is not None and (candidate < lower_value or (candidate == lower_value and lower_open)):
+        return False
+    if upper_value is not None and (candidate > upper_value or (candidate == upper_value and upper_open)):
+        return False
+    return True
+
+
+def _integer_candidate_from_bounds(
+    *,
+    lower_value: Fraction | None,
+    lower_open: bool,
+    upper_value: Fraction | None,
+    upper_open: bool,
+    step: int = 1,
+) -> int:
+    if lower_value is not None:
+        quotient = lower_value / step
+        multiplier = _fraction_ceil(quotient)
+        if lower_open and quotient.denominator == 1:
+            multiplier += 1
+        return multiplier * step
+    if upper_value is not None:
+        quotient = upper_value / step
+        multiplier = _fraction_floor(quotient)
+        if upper_open and quotient.denominator == 1:
+            multiplier -= 1
+        return multiplier * step
+    return 0
+
+
 def _required_property_names(schema: Mapping[str, Any]) -> list[str]:
     names: list[str] = []
     required = schema.get("required")
@@ -693,6 +806,12 @@ def _required_property_names(schema: Mapping[str, Any]) -> list[str]:
 def _sample_argument_value(name: str, schema: Any, run_request: RunRequest) -> Any:
     if not isinstance(schema, Mapping):
         return run_request.prompt
+    if "multipleOf" in schema:
+        raise AgentRunError(
+            f"brokered tool schema for {name!r} has unsupported numeric multipleOf",
+            status=400,
+            code="UnsupportedBrokeredSchema",
+        )
     if "const" in schema:
         return schema["const"]
     if "default" in schema:
@@ -724,16 +843,26 @@ def _sample_argument_value(name: str, schema: Any, run_request: RunRequest) -> A
         value = _enum_value(schema, int)
         if value is not None and not isinstance(value, bool):
             return value
-        lower = _integer_schema_bound(schema.get("minimum"), lower=True, exclusive=False)
-        if lower is None:
-            lower = _integer_schema_bound(schema.get("exclusiveMinimum"), lower=True, exclusive=True)
-        if lower is None:
-            lower = 0
-        upper = _integer_schema_bound(schema.get("maximum"), lower=False, exclusive=False)
-        if upper is None:
-            upper = _integer_schema_bound(schema.get("exclusiveMaximum"), lower=False, exclusive=True)
+        lower_candidates = [
+            candidate
+            for candidate in (
+                _integer_schema_bound(schema.get("minimum"), lower=True, exclusive=False),
+                _integer_schema_bound(schema.get("exclusiveMinimum"), lower=True, exclusive=True),
+            )
+            if candidate is not None
+        ]
+        upper_candidates = [
+            candidate
+            for candidate in (
+                _integer_schema_bound(schema.get("maximum"), lower=False, exclusive=False),
+                _integer_schema_bound(schema.get("exclusiveMaximum"), lower=False, exclusive=True),
+            )
+            if candidate is not None
+        ]
+        lower = max(lower_candidates, default=0)
+        upper = min(upper_candidates) if upper_candidates else None
         if upper is not None and lower > upper:
-            if "minimum" in schema or "exclusiveMinimum" in schema:
+            if lower_candidates:
                 raise AgentRunError(
                     f"brokered tool schema for {name!r} has incompatible integer bounds",
                     status=400,
@@ -741,16 +870,6 @@ def _sample_argument_value(name: str, schema: Any, run_request: RunRequest) -> A
                 )
             lower = upper
         multiple_of = schema.get("multipleOf")
-        if isinstance(multiple_of, int) and not isinstance(multiple_of, bool) and multiple_of > 0:
-            remainder = lower % multiple_of
-            candidate = lower if remainder == 0 else lower + (multiple_of - remainder)
-            if upper is not None and candidate > upper:
-                raise AgentRunError(
-                    f"brokered tool schema for {name!r} has no integer multipleOf value in bounds",
-                    status=400,
-                    code="UnsupportedBrokeredSchema",
-                )
-            return candidate
         if multiple_of is not None:
             raise AgentRunError(
                 f"brokered tool schema for {name!r} has unsupported integer multipleOf",
@@ -767,50 +886,94 @@ def _sample_argument_value(name: str, schema: Any, run_request: RunRequest) -> A
         value = _enum_value(schema, (int, float))
         if value is not None and not isinstance(value, bool):
             return value
-        lower_value = schema.get("minimum")
-        lower_open = False
-        if not isinstance(lower_value, (int, float)) or isinstance(lower_value, bool):
-            lower_value = schema.get("exclusiveMinimum")
-            lower_open = isinstance(lower_value, (int, float)) and not isinstance(lower_value, bool)
-        upper_value = schema.get("maximum")
-        upper_open = False
-        if not isinstance(upper_value, (int, float)) or isinstance(upper_value, bool):
-            upper_value = schema.get("exclusiveMaximum")
-            upper_open = isinstance(upper_value, (int, float)) and not isinstance(upper_value, bool)
-        has_lower = isinstance(lower_value, (int, float)) and not isinstance(lower_value, bool)
-        has_upper = isinstance(upper_value, (int, float)) and not isinstance(upper_value, bool)
-        if has_lower and has_upper:
-            if lower_value > upper_value or (lower_value == upper_value and (lower_open or upper_open)):
+        lower_fraction, lower_open, upper_fraction, upper_open = _effective_numeric_bounds(schema)
+        has_lower = lower_fraction is not None
+        has_upper = upper_fraction is not None
+        if lower_fraction is not None and upper_fraction is not None:
+            if lower_fraction > upper_fraction or (lower_fraction == upper_fraction and (lower_open or upper_open)):
                 raise AgentRunError(
                     f"brokered tool schema for {name!r} has incompatible numeric bounds",
                     status=400,
                     code="UnsupportedBrokeredSchema",
                 )
-            if lower_value == upper_value:
-                return lower_value
-            return (lower_value + upper_value) / 2
-        if has_lower:
-            candidate = lower_value + (1 if lower_open else 0)
-        elif has_upper:
-            candidate = upper_value - (1 if upper_open else 0)
-        else:
-            candidate = 0
+            if lower_fraction == upper_fraction:
+                return _fraction_json_candidate(lower_fraction, name=name, require_exact=True)
+
         multiple_of = schema.get("multipleOf")
-        if isinstance(multiple_of, (int, float)) and not isinstance(multiple_of, bool) and multiple_of > 0:
-            candidate = math.ceil(candidate / multiple_of) * multiple_of
-            if has_upper and (candidate > upper_value or (candidate == upper_value and upper_open)):
-                raise AgentRunError(
-                    f"brokered tool schema for {name!r} has no numeric multipleOf value in bounds",
-                    status=400,
-                    code="UnsupportedBrokeredSchema",
-                )
-        elif multiple_of is not None:
+        if multiple_of is not None:
             raise AgentRunError(
                 f"brokered tool schema for {name!r} has unsupported numeric multipleOf",
                 status=400,
                 code="UnsupportedBrokeredSchema",
             )
-        return candidate
+
+        candidates: list[int | float] = []
+
+        def add_candidate(candidate: int | float) -> None:
+            if isinstance(candidate, float) and not math.isfinite(candidate):
+                return
+            if _fraction_in_numeric_bounds(
+                Fraction(str(candidate)),
+                lower_value=lower_fraction,
+                lower_open=lower_open,
+                upper_value=upper_fraction,
+                upper_open=upper_open,
+            ):
+                candidates.append(candidate)
+
+        add_candidate(0)
+
+        for boundary, is_open in (
+            (lower_fraction, lower_open),
+            (upper_fraction, upper_open),
+        ):
+            if boundary is None or is_open:
+                continue
+            try:
+                add_candidate(_fraction_json_candidate(boundary, name=name, require_exact=True))
+            except AgentRunError:
+                pass
+
+        for boundary, is_open, direction in (
+            (lower_fraction, lower_open, math.inf),
+            (upper_fraction, upper_open, -math.inf),
+        ):
+            if boundary is None or not is_open:
+                continue
+            try:
+                boundary_float = float(boundary)
+            except OverflowError:
+                continue
+            if math.isfinite(boundary_float):
+                add_candidate(math.nextafter(boundary_float, direction))
+
+        integer_candidate = _integer_candidate_from_bounds(
+            lower_value=lower_fraction,
+            lower_open=lower_open,
+            upper_value=upper_fraction,
+            upper_open=upper_open,
+            step=1,
+        )
+        add_candidate(integer_candidate)
+
+        if lower_fraction is not None and upper_fraction is not None:
+            midpoint = (lower_fraction + upper_fraction) / 2
+            try:
+                add_candidate(_fraction_json_candidate(midpoint, name=name, require_exact=False))
+            except AgentRunError:
+                pass
+
+        if candidates:
+            return min(
+                candidates,
+                key=lambda candidate: len(json.dumps(candidate, allow_nan=False, separators=(",", ":"))),
+            )
+
+        raise AgentRunError(
+            f"brokered tool schema for {name!r} has no representable numeric value in bounds",
+            status=400,
+            code="UnsupportedBrokeredSchema",
+        )
 
     if schema_type == "array":
         for key in ("const", "default"):

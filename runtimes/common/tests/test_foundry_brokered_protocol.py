@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from copy import deepcopy
 from types import TracebackType
@@ -527,7 +528,7 @@ def test_foundry_brokered_argument_synthesis_honors_dependent_required_and_min_p
     assert json.loads(_call(body)["arguments"]) == {"site": "check-network-telemetry", "region": "west", "extra": True}
 
 
-def test_foundry_brokered_integer_synthesis_honors_multiple_of():
+def test_foundry_brokered_integer_synthesis_rejects_unsupported_multiple_of():
     spec = _spec(tool_name="check-network-telemetry")
     spec.brokered_tools[0].parameters = {
         "type": "object",
@@ -537,9 +538,10 @@ def test_foundry_brokered_integer_synthesis_honors_multiple_of():
     app = _app(spec)
 
     with TestClient(app) as client:
-        body = client.post("/responses", json={"input": "check-network-telemetry"}).json()
+        response = client.post("/responses", json={"input": "check-network-telemetry"})
 
-    assert json.loads(_call(body)["arguments"]) == {"n": 2}
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "UnsupportedBrokeredSchema"
 
 
 def test_foundry_brokered_number_synthesis_uses_midpoint_for_fractional_exclusive_range():
@@ -555,6 +557,126 @@ def test_foundry_brokered_number_synthesis_uses_midpoint_for_fractional_exclusiv
         body = client.post("/responses", json={"input": "check-network-telemetry"}).json()
 
     assert json.loads(_call(body)["arguments"]) == {"ratio": 0.5}
+
+
+def test_foundry_brokered_number_synthesis_handles_large_finite_bounds_without_overflow():
+    spec = _spec(tool_name="large-number-bounds")
+    spec.brokered_tools[0].parameters = {
+        "type": "object",
+        "properties": {
+            "midpoint": {"type": "number", "minimum": 1e308, "maximum": 1.1e308},
+            "above": {"type": "number", "exclusiveMinimum": 1e308},
+            "below": {"type": "number", "exclusiveMaximum": -1e308},
+            "exactInteger": {"type": "number", "minimum": 9007199254740993, "maximum": 9007199254740994},
+            "roundedMidpoint": {"type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 0.9999999999999999},
+            "narrowValue": {"type": "number", "exclusiveMinimum": 1.0, "maximum": 1.0000000000000002},
+        },
+        "required": ["midpoint", "above", "below", "exactInteger", "roundedMidpoint", "narrowValue"],
+    }
+    app = _app(spec)
+
+    with TestClient(app) as client:
+        response = client.post("/responses", json={"input": "large-number-bounds"})
+
+    assert response.status_code == 200, response.text
+    arguments = json.loads(_call(response.json())["arguments"])
+    assert arguments["midpoint"] == 1e308
+    assert arguments["above"] == math.nextafter(1e308, math.inf)
+    assert arguments["below"] == math.nextafter(-1e308, -math.inf)
+    assert arguments["exactInteger"] == 9007199254740993
+    assert 0 < arguments["roundedMidpoint"] < 0.9999999999999999
+    assert arguments["narrowValue"] == 1.0000000000000002
+
+
+def test_foundry_brokered_number_synthesis_rejects_unsupported_multiple_of():
+    spec = _spec(tool_name="number-multiple")
+    spec.brokered_tools[0].parameters = {
+        "type": "object",
+        "properties": {"value": {"type": "number", "minimum": 0, "multipleOf": 0.5}},
+        "required": ["value"],
+    }
+    app = _app(spec)
+
+    with TestClient(app) as client:
+        response = client.post("/responses", json={"input": "number-multiple"})
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "UnsupportedBrokeredSchema"
+
+
+def test_foundry_brokered_number_synthesis_combines_all_declared_bounds():
+    spec = _spec(tool_name="combined-number-bounds")
+    spec.brokered_tools[0].parameters = {
+        "type": "object",
+        "properties": {
+            "value": {"type": "number", "minimum": 0, "exclusiveMinimum": 0, "maximum": 1},
+        },
+        "required": ["value"],
+    }
+    app = _app(spec)
+
+    with TestClient(app) as client:
+        response = client.post("/responses", json={"input": "combined-number-bounds"})
+
+    assert response.status_code == 200, response.text
+    assert json.loads(_call(response.json())["arguments"]) == {"value": 1}
+
+
+@pytest.mark.parametrize("bound", [float("nan"), float("inf"), float("-inf")])
+def test_foundry_brokered_number_synthesis_rejects_nonfinite_bounds(bound: float):
+    spec = _spec(tool_name="nonfinite-number-bound")
+    spec.brokered_tools[0].parameters = {
+        "type": "object",
+        "properties": {"value": {"type": "number", "minimum": bound}},
+        "required": ["value"],
+    }
+    app = _app(spec)
+
+    with TestClient(app) as client:
+        response = client.post("/responses", json={"input": "nonfinite-number-bound"})
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "UnsupportedBrokeredSchema"
+
+
+def test_foundry_brokered_number_synthesis_prefers_compact_zero_within_wide_bounds():
+    spec = _spec(tool_name="compact-number-bounds")
+    properties = {
+        f"value{index}": {"type": "number", "minimum": -1e308, "maximum": 1e308}
+        for index in range(27)
+    }
+    spec.brokered_tools[0].parameters = {
+        "type": "object",
+        "properties": properties,
+        "required": list(properties),
+    }
+    app = _app(spec)
+
+    with TestClient(app) as client:
+        response = client.post("/responses", json={"input": "compact-number-bounds"})
+
+    assert response.status_code == 200, response.text
+    assert json.loads(_call(response.json())["arguments"]) == {name: 0 for name in properties}
+
+
+def test_foundry_brokered_number_synthesis_prefers_compact_float_boundary_over_large_integer():
+    spec = _spec(tool_name="compact-large-number-bounds")
+    properties = {
+        f"value{index}": {"type": "number", "minimum": 1e308, "maximum": 1.1e308}
+        for index in range(27)
+    }
+    spec.brokered_tools[0].parameters = {
+        "type": "object",
+        "properties": properties,
+        "required": list(properties),
+    }
+    app = _app(spec)
+
+    with TestClient(app) as client:
+        response = client.post("/responses", json={"input": "compact-large-number-bounds"})
+
+    assert response.status_code == 200, response.text
+    assert json.loads(_call(response.json())["arguments"]) == {name: 1e308 for name in properties}
 
 
 def test_foundry_brokered_rejects_unbounded_schema_synthesis_before_allocating():

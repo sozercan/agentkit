@@ -37,7 +37,7 @@ def _require(condition: bool, message: str) -> None:
 
 def _message_text(response: dict[str, Any]) -> str:
     output = response.get("output")
-    _require(isinstance(output, list) and bool(output), "final response output must be a non-empty array")
+    _require(isinstance(output, list) and len(output) == 1, "final response output must contain exactly one item")
     message = output[0]
     _require(isinstance(message, dict) and message.get("type") == "message", "final response output[0] must be a message")
     content = message.get("content")

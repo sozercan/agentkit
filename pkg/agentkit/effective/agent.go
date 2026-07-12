@@ -3,6 +3,8 @@
 package effective
 
 import (
+	"bytes"
+	"encoding/json"
 	"reflect"
 
 	"github.com/sozercan/agentkit/pkg/agentkit/config"
@@ -120,43 +122,78 @@ func copyAny(v any) any {
 	case map[string]any:
 		return copyMap(typed)
 	case map[string]string:
+		if typed == nil {
+			return typed
+		}
 		out := make(map[string]string, len(typed))
 		for key, value := range typed {
 			out[key] = value
 		}
 		return out
 	case map[string]int:
+		if typed == nil {
+			return typed
+		}
 		out := make(map[string]int, len(typed))
 		for key, value := range typed {
 			out[key] = value
 		}
 		return out
 	case map[string]float64:
+		if typed == nil {
+			return typed
+		}
 		out := make(map[string]float64, len(typed))
 		for key, value := range typed {
 			out[key] = value
 		}
 		return out
 	case map[string]bool:
+		if typed == nil {
+			return typed
+		}
 		out := make(map[string]bool, len(typed))
 		for key, value := range typed {
 			out[key] = value
 		}
 		return out
 	case []any:
+		if typed == nil {
+			return typed
+		}
 		out := make([]any, len(typed))
 		for i, item := range typed {
 			out[i] = copyAny(item)
 		}
 		return out
 	case []string:
-		return append([]string(nil), typed...)
+		if typed == nil {
+			return typed
+		}
+		out := make([]string, len(typed))
+		copy(out, typed)
+		return out
 	case []int:
-		return append([]int(nil), typed...)
+		if typed == nil {
+			return typed
+		}
+		out := make([]int, len(typed))
+		copy(out, typed)
+		return out
 	case []float64:
-		return append([]float64(nil), typed...)
+		if typed == nil {
+			return typed
+		}
+		out := make([]float64, len(typed))
+		copy(out, typed)
+		return out
 	case []bool:
-		return append([]bool(nil), typed...)
+		if typed == nil {
+			return typed
+		}
+		out := make([]bool, len(typed))
+		copy(out, typed)
+		return out
 	default:
 		return copyReflectValue(v)
 	}
@@ -165,44 +202,103 @@ func copyAny(v any) any {
 func copyReflectValue(v any) any {
 	value := reflect.ValueOf(v)
 	switch value.Kind() {
+	case reflect.Interface:
+		if value.IsNil() {
+			return nil
+		}
+		return copyAny(value.Elem().Interface())
+	case reflect.Pointer:
+		if value.IsNil() {
+			return reflect.Zero(value.Type()).Interface()
+		}
+		if normalized, ok := copyJSONNormalized(value.Interface()); ok {
+			return normalized
+		}
+		out := reflect.New(value.Type().Elem())
+		copied := copyAny(value.Elem().Interface())
+		out.Elem().Set(copiedReflectValue(copied, value.Type().Elem(), value.Elem()))
+		return out.Interface()
 	case reflect.Map:
+		if value.IsNil() {
+			return reflect.Zero(value.Type()).Interface()
+		}
 		out := reflect.MakeMapWithSize(value.Type(), value.Len())
 		iter := value.MapRange()
 		for iter.Next() {
 			copied := copyAny(iter.Value().Interface())
-			copiedValue := reflect.ValueOf(copied)
-			if copied == nil {
-				copiedValue = reflect.Zero(value.Type().Elem())
-			} else if !copiedValue.Type().AssignableTo(value.Type().Elem()) {
-				if copiedValue.Type().ConvertibleTo(value.Type().Elem()) {
-					copiedValue = copiedValue.Convert(value.Type().Elem())
-				} else {
-					copiedValue = iter.Value()
-				}
-			}
-			out.SetMapIndex(iter.Key(), copiedValue)
+			out.SetMapIndex(iter.Key(), copiedReflectValue(copied, value.Type().Elem(), iter.Value()))
 		}
 		return out.Interface()
 	case reflect.Slice:
+		if value.IsNil() {
+			return reflect.Zero(value.Type()).Interface()
+		}
 		out := reflect.MakeSlice(value.Type(), value.Len(), value.Len())
 		for i := 0; i < value.Len(); i++ {
 			copied := copyAny(value.Index(i).Interface())
-			copiedValue := reflect.ValueOf(copied)
-			if copied == nil {
-				copiedValue = reflect.Zero(value.Type().Elem())
-			} else if !copiedValue.Type().AssignableTo(value.Type().Elem()) {
-				if copiedValue.Type().ConvertibleTo(value.Type().Elem()) {
-					copiedValue = copiedValue.Convert(value.Type().Elem())
-				} else {
-					copiedValue = value.Index(i)
-				}
-			}
-			out.Index(i).Set(copiedValue)
+			out.Index(i).Set(copiedReflectValue(copied, value.Type().Elem(), value.Index(i)))
 		}
 		return out.Interface()
+	case reflect.Array:
+		out := reflect.New(value.Type()).Elem()
+		for i := 0; i < value.Len(); i++ {
+			copied := copyAny(value.Index(i).Interface())
+			out.Index(i).Set(copiedReflectValue(copied, value.Type().Elem(), value.Index(i)))
+		}
+		return out.Interface()
+	case reflect.Struct:
+		if normalized, ok := copyJSONNormalized(value.Interface()); ok {
+			return normalized
+		}
+		return value.Interface()
 	default:
 		return v
 	}
+}
+
+func copyJSONNormalized(value any) (any, bool) {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return nil, false
+	}
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.UseNumber()
+	var out any
+	if err := decoder.Decode(&out); err != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+func copiedReflectValue(copied any, targetType reflect.Type, fallback reflect.Value) reflect.Value {
+	if copied == nil {
+		return reflect.Zero(targetType)
+	}
+	value := reflect.ValueOf(copied)
+	if value.Type().AssignableTo(targetType) {
+		return value
+	}
+	if value.Type().ConvertibleTo(targetType) {
+		return value.Convert(targetType)
+	}
+	if rehydrated, ok := jsonNormalizedToType(copied, targetType); ok {
+		return rehydrated
+	}
+	return fallback
+}
+
+func jsonNormalizedToType(value any, targetType reflect.Type) (reflect.Value, bool) {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return reflect.Value{}, false
+	}
+	target := reflect.New(targetType)
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.UseNumber()
+	if err := decoder.Decode(target.Interface()); err != nil {
+		return reflect.Value{}, false
+	}
+	return target.Elem(), true
 }
 
 func copyEnvVars(in []config.EnvVar) []config.EnvVar {
