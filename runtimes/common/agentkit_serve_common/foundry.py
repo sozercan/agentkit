@@ -853,6 +853,12 @@ def _deterministic_tool_arguments(tool: BrokeredToolDefinition, run_request: Run
             return dict(literal)
     enum = parameters.get("enum")
     if isinstance(enum, list):
+        if tool.brokered_class != "read" and len(enum) > 1:
+            raise AgentRunError(
+                f"brokered {tool.brokered_class} tool {tool.name!r} has multiple root enum payloads; deterministic mode refuses to choose side-effecting arguments",
+                status=400,
+                code="UnsupportedBrokeredSchema",
+            )
         for item in enum:
             if isinstance(item, Mapping):
                 return dict(item)
@@ -872,6 +878,12 @@ def _deterministic_tool_arguments(tool: BrokeredToolDefinition, run_request: Run
     if tool.name == "conformance_read" and "probe" in properties and "probe" not in arguments:
         arguments["probe"] = True
     if not arguments and "prompt" in properties:
+        if tool.brokered_class != "read" and not _schema_has_literal_value(properties["prompt"]):
+            raise AgentRunError(
+                f"brokered {tool.brokered_class} tool {tool.name!r} has a non-literal optional prompt; deterministic mode refuses to synthesize side-effecting arguments",
+                status=400,
+                code="UnsupportedBrokeredSchema",
+            )
         arguments["prompt"] = _sample_argument_value("prompt", properties["prompt"], run_request)
     return arguments
 
@@ -1386,7 +1398,7 @@ def create_foundry_app(
                 previous_state = response_states.get(previous_response_id)
             except (KeyError, _StateExpired):
                 previous_state = None
-            if previous_state is not None and previous_state.status == "pending":
+            if previous_state is not None and previous_state.status in {"pending", "resuming"}:
                 return _error(
                     "previous_response_id is pending a brokered function_call_output",
                     status=409,

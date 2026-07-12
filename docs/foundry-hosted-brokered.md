@@ -56,6 +56,11 @@ startup fails if a configured digest no longer matches the safe schema in
 `agent.yaml`. Orka still validates every live call against current Tool CRDs at
 execution time.
 
+The exporter accepts canonical `core.orka.ai/v1alpha1` `Tool` resources and
+reads the governed class from `spec.brokeredToolClass`. Tools without that field
+are not brokered and are omitted; exporting an input set with no brokered tools
+fails instead of silently downgrading a tool to `read`.
+
 Example export command:
 
 ```sh

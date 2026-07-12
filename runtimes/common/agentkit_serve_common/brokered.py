@@ -19,6 +19,10 @@ import yaml
 from .config import AgentSpec, BrokeredToolSpec, brokered_tool_schema_digest
 from .runtime import BrokeredToolDefinition
 
+_ORKA_TOOL_API_VERSION = "core.orka.ai/v1alpha1"
+_ORKA_TOOL_KIND = "Tool"
+_ORKA_BROKERED_TOOL_CLASSES = ("read", "write", "coordination")
+
 
 def brokered_tool_definitions(spec: AgentSpec) -> list[BrokeredToolDefinition]:
     """Return runtime-safe brokered tool definitions from an AgentSpec."""
@@ -70,65 +74,56 @@ def brokered_tool_config_entry(
     return out
 
 
-def _nested_get(mapping: Mapping[str, Any], *path: str) -> Any:
-    current: Any = mapping
-    for key in path:
-        if not isinstance(current, Mapping):
-            return None
-        current = current.get(key)
-    return current
-
-
-def _first_present(*values: Any) -> Any:
-    for value in values:
-        if value not in (None, ""):
-            return value
-    return None
-
-
 def generate_brokered_tools_from_orka_tool_crds(
-    documents: Iterable[Mapping[str, Any]],
+    documents: Iterable[Any],
     *,
     include_digest: bool = True,
 ) -> list[dict[str, Any]]:
     """Generate deterministic safe AgentKit brokeredTools config from Orka Tool CRDs.
 
-    The Orka Tool CRD remains the source of truth. This helper deliberately
-    extracts only the safe model-facing subset and validates it with the same
-    `BrokeredToolSpec` model used by `agent.yaml` loading.
+    The Orka Tool CRD remains the source of truth. Only the canonical
+    `core.orka.ai/v1alpha1` `Tool` shape is accepted. Tools without
+    `spec.brokeredToolClass` are not brokered and are skipped; an input set with
+    no brokered tools is rejected. Safe model-facing fields are validated with
+    the same `BrokeredToolSpec` model used by `agent.yaml` loading.
     """
 
     entries: list[dict[str, Any]] = []
     for idx, document in enumerate(documents):
-        if not isinstance(document, Mapping) or not document:
+        if document is None:
             continue
-        kind = str(document.get("kind") or "")
-        if kind and kind.lower() != "tool":
+        if not isinstance(document, Mapping):
+            raise ValueError(f"Orka Tool CRD document {idx} must be an object")
+        api_version = document.get("apiVersion")
+        kind = document.get("kind")
+        if api_version != _ORKA_TOOL_API_VERSION or kind != _ORKA_TOOL_KIND:
+            raise ValueError(
+                f"unsupported Orka Tool GVK in document {idx}: apiVersion={api_version!r}, kind={kind!r}; "
+                f"expected apiVersion={_ORKA_TOOL_API_VERSION!r}, kind={_ORKA_TOOL_KIND!r}"
+            )
+        metadata = document.get("metadata")
+        if not isinstance(metadata, Mapping):
+            raise ValueError(f"Orka Tool CRD document {idx} metadata must be an object")
+        spec = document.get("spec")
+        if not isinstance(spec, Mapping):
+            raise ValueError(f"Orka Tool CRD document {idx} spec must be an object")
+        if "brokeredToolClass" not in spec:
             continue
-        metadata = document.get("metadata") if isinstance(document.get("metadata"), Mapping) else {}
-        spec = document.get("spec") if isinstance(document.get("spec"), Mapping) else {}
-        name = _first_present(spec.get("name"), metadata.get("name"))
+        name = metadata.get("name")
         if not isinstance(name, str):
             raise ValueError(f"Tool CRD document {idx} is missing metadata.name")
-        description = _first_present(spec.get("description"), spec.get("summary"), name)
+        description = spec.get("description")
         if not isinstance(description, str):
             raise ValueError(f"Tool CRD {name!r} description must be a string")
-        brokered_class = _first_present(
-            spec.get("brokeredClass"),
-            spec.get("brokered_class"),
-            spec.get("class"),
-            _nested_get(spec, "brokered", "class"),
-            "read",
-        )
+        brokered_class = spec["brokeredToolClass"]
         if not isinstance(brokered_class, str):
-            raise ValueError(f"Tool CRD {name!r} brokered class must be a string")
-        parameters = _first_present(
-            spec.get("parameters"),
-            spec.get("inputSchema"),
-            spec.get("input_schema"),
-            spec.get("schema"),
-            _nested_get(spec, "input", "schema"),
-        )
+            raise ValueError(f"Tool CRD {name!r} spec.brokeredToolClass must be a string")
+        if brokered_class not in _ORKA_BROKERED_TOOL_CLASSES:
+            supported = ", ".join(_ORKA_BROKERED_TOOL_CLASSES)
+            raise ValueError(
+                f"Tool CRD {name!r} has unsupported spec.brokeredToolClass {brokered_class!r}; expected {supported}"
+            )
+        parameters = spec.get("parameters")
         if parameters is None:
             parameters = {"type": "object"}
         if not isinstance(parameters, Mapping):
@@ -142,6 +137,10 @@ def generate_brokered_tools_from_orka_tool_crds(
                 include_digest=include_digest,
             )
         )
+    if not entries:
+        raise ValueError(
+            "no brokered Orka Tool CRDs found; set spec.brokeredToolClass to read, write, or coordination"
+        )
     return sorted(entries, key=lambda item: item["name"])
 
 
@@ -149,17 +148,17 @@ def load_orka_tool_crd_file(path: str | Path, *, include_digest: bool = True) ->
     """Load Tool CRD YAML/JSON documents and return safe brokeredTools entries."""
 
     raw = Path(path).read_text(encoding="utf-8")
-    docs = [doc for doc in yaml.safe_load_all(raw) if isinstance(doc, Mapping)]
+    docs = [doc for doc in yaml.safe_load_all(raw) if doc is not None]
     return generate_brokered_tools_from_orka_tool_crds(docs, include_digest=include_digest)
 
 
 def load_orka_tool_crd_files(paths: Sequence[str | Path], *, include_digest: bool = True) -> list[dict[str, Any]]:
     """Load one or more Tool CRD files and merge deterministic safe entries."""
 
-    documents: list[Mapping[str, Any]] = []
+    documents: list[Any] = []
     for path in paths:
         raw = Path(path).read_text(encoding="utf-8")
-        documents.extend(doc for doc in yaml.safe_load_all(raw) if isinstance(doc, Mapping))
+        documents.extend(doc for doc in yaml.safe_load_all(raw) if doc is not None)
     entries = generate_brokered_tools_from_orka_tool_crds(documents, include_digest=include_digest)
     seen: set[str] = set()
     duplicates: set[str] = set()

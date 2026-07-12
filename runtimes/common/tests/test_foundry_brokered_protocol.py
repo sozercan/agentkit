@@ -8,7 +8,9 @@ from typing import Any
 
 from fastapi.testclient import TestClient
 import httpx
+import pytest
 
+from agentkit_serve_common import foundry as foundry_module
 from agentkit_serve_common.config import AgentSpec
 from agentkit_serve_common.conversation import RunRequest
 from agentkit_serve_common.foundry import create_foundry_app
@@ -224,6 +226,29 @@ def test_foundry_brokered_rejects_normal_followup_while_previous_response_is_pen
 
     with TestClient(app) as client:
         initial = _start(client)
+        resp = client.post("/responses", json={"previous_response_id": initial["id"], "input": "next question"})
+
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "response_pending_function_call_output"
+
+
+def test_foundry_brokered_rejects_normal_followup_while_previous_response_is_resuming(monkeypatch):
+    stores: list[Any] = []
+    original_store = foundry_module._FoundryResponseStateStore
+
+    def capture_store(*args: Any, **kwargs: Any) -> Any:
+        store = original_store(*args, **kwargs)
+        stores.append(store)
+        return store
+
+    monkeypatch.setattr(foundry_module, "_FoundryResponseStateStore", capture_store)
+    app = _app()
+
+    with TestClient(app) as client:
+        initial = _start(client)
+        state = stores[0].get(initial["id"])
+        state.status = "resuming"
+        stores[0].save(state)
         resp = client.post("/responses", json={"previous_response_id": initial["id"], "input": "next question"})
 
     assert resp.status_code == 409
@@ -844,6 +869,40 @@ def test_foundry_brokered_refuses_multi_value_enum_write_arguments():
     assert resp.json()["error"]["code"] == "UnsupportedBrokeredSchema"
 
 
+@pytest.mark.parametrize("brokered_class", ["write", "coordination"])
+def test_foundry_brokered_refuses_multi_value_root_enum_side_effecting_arguments(brokered_class: str):
+    spec = _spec(tool_name="dispatch-work-order", brokered_class=brokered_class)
+    spec.brokered_tools[0].parameters = {
+        "type": "object",
+        "enum": [
+            {"operation": "delete"},
+            {"operation": "create"},
+        ],
+    }
+    app = _app(spec)
+
+    with TestClient(app) as client:
+        resp = client.post("/responses", json={"input": "dispatch-work-order"})
+
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "UnsupportedBrokeredSchema"
+
+
+def test_foundry_brokered_allows_single_value_root_enum_write_arguments():
+    spec = _spec(tool_name="dispatch-work-order", brokered_class="write")
+    spec.brokered_tools[0].parameters = {
+        "type": "object",
+        "enum": [{"operation": "create"}],
+    }
+    app = _app(spec)
+
+    with TestClient(app) as client:
+        resp = client.post("/responses", json={"input": "dispatch-work-order"})
+
+    assert resp.status_code == 200
+    assert json.loads(_call(resp.json())["arguments"]) == {"operation": "create"}
+
+
 def test_foundry_brokered_allows_single_value_enum_write_arguments():
     spec = _spec(tool_name="dispatch-work-order", brokered_class="write")
     spec.brokered_tools[0].parameters = {
@@ -858,6 +917,37 @@ def test_foundry_brokered_allows_single_value_enum_write_arguments():
 
     assert resp.status_code == 200
     assert json.loads(_call(resp.json())["arguments"]) == {"operation": "create"}
+
+
+@pytest.mark.parametrize("brokered_class", ["write", "coordination"])
+def test_foundry_brokered_refuses_nonliteral_optional_prompt_for_side_effecting_tools(brokered_class: str):
+    spec = _spec(tool_name="dispatch-work-order", brokered_class=brokered_class)
+    spec.brokered_tools[0].parameters = {
+        "type": "object",
+        "properties": {"prompt": {"type": "string"}},
+    }
+    app = _app(spec)
+
+    with TestClient(app) as client:
+        resp = client.post("/responses", json={"input": "dispatch-work-order with arbitrary payload"})
+
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "UnsupportedBrokeredSchema"
+
+
+def test_foundry_brokered_allows_literal_optional_prompt_for_write_tools():
+    spec = _spec(tool_name="dispatch-work-order", brokered_class="write")
+    spec.brokered_tools[0].parameters = {
+        "type": "object",
+        "properties": {"prompt": {"type": "string", "const": "fixed"}},
+    }
+    app = _app(spec)
+
+    with TestClient(app) as client:
+        resp = client.post("/responses", json={"input": "dispatch-work-order with arbitrary payload"})
+
+    assert resp.status_code == 200
+    assert json.loads(_call(resp.json())["arguments"]) == {"prompt": "fixed"}
 
 
 def test_foundry_brokered_allows_literal_write_arguments_for_conformance():

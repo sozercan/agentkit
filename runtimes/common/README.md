@@ -66,6 +66,11 @@ parameters schema, and optional schema digest. Execution URLs, auth headers,
 Secret refs, tokens, and other credential-shaped schema fields are rejected or
 omitted before the fragment is model-visible.
 
+Inputs must use the canonical `core.orka.ai/v1alpha1` `Tool` shape. The exporter
+reads `spec.brokeredToolClass`; unclassified tools are not brokered and are
+skipped, and an input set with no classified tools fails rather than defaulting
+their class to `read`.
+
 
 ## Foundry brokered conformance app
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import yaml
 
 from agentkit_serve_common.brokered import (
@@ -16,28 +17,220 @@ from agentkit_serve_common.runtime import BrokeredToolDefinition
 def _tool_docs() -> list[dict]:
     return [
         {
-            "apiVersion": "orka.example/v1",
+            "apiVersion": "core.orka.ai/v1alpha1",
             "kind": "Tool",
             "metadata": {"name": "dispatch-work-order"},
             "spec": {
                 "description": "Dispatch a field tech.",
-                "brokeredClass": "write",
+                "brokeredToolClass": "write",
                 "parameters": {"type": "object", "properties": {"incident": {"type": "string"}}, "required": ["incident"]},
-                "url": "http://tool.default.svc.cluster.local",
-                "secretRef": {"name": "do-not-export"},
+                "http": {
+                    "url": "http://tool.default.svc.cluster.local",
+                    "method": "POST",
+                    "authSecretRef": {"name": "do-not-export", "key": "token"},
+                },
             },
         },
         {
-            "apiVersion": "orka.example/v1",
+            "apiVersion": "core.orka.ai/v1alpha1",
             "kind": "Tool",
             "metadata": {"name": "check-network-telemetry"},
             "spec": {
                 "description": "Read telemetry.",
-                "brokeredClass": "read",
-                "inputSchema": {"type": "object", "properties": {"site": {"type": "string"}}},
-                "headers": {"Authorization": "do-not-export"},
+                "brokeredToolClass": "read",
+                "parameters": {"type": "object", "properties": {"site": {"type": "string"}}},
+                "http": {
+                    "url": "http://tool.default.svc.cluster.local",
+                    "method": "POST",
+                    "headers": {"Authorization": "do-not-export"},
+                },
             },
         },
+    ]
+
+
+def test_generate_brokered_tools_uses_canonical_orka_brokered_tool_class():
+    documents = [
+        {
+            "apiVersion": "core.orka.ai/v1alpha1",
+            "kind": "Tool",
+            "metadata": {"name": "read-telemetry"},
+            "spec": {
+                "description": "Read telemetry.",
+                "brokeredToolClass": "read",
+                "parameters": {"type": "object"},
+                "http": {"url": "http://tools.default.svc/read", "method": "POST"},
+            },
+        },
+        {
+            "apiVersion": "core.orka.ai/v1alpha1",
+            "kind": "Tool",
+            "metadata": {"name": "dispatch-work-order"},
+            "spec": {
+                "description": "Dispatch a work order.",
+                "brokeredToolClass": "write",
+                "parameters": {"type": "object"},
+                "http": {"url": "http://tools.default.svc/write", "method": "POST"},
+            },
+        },
+        {
+            "apiVersion": "core.orka.ai/v1alpha1",
+            "kind": "Tool",
+            "metadata": {"name": "coordinate-response"},
+            "spec": {
+                "description": "Coordinate incident response.",
+                "brokeredToolClass": "coordination",
+                "parameters": {"type": "object"},
+                "http": {"url": "http://tools.default.svc/coordinate", "method": "POST"},
+            },
+        },
+    ]
+
+    generated = generate_brokered_tools_from_orka_tool_crds(documents, include_digest=False)
+
+    assert [(tool["name"], tool["brokeredClass"]) for tool in generated] == [
+        ("coordinate-response", "coordination"),
+        ("dispatch-work-order", "write"),
+        ("read-telemetry", "read"),
+    ]
+
+
+def test_generate_brokered_tools_rejects_unsupported_orka_api_version():
+    document = {
+        "apiVersion": "core.orka.ai/v1",
+        "kind": "Tool",
+        "metadata": {"name": "read-telemetry"},
+        "spec": {
+            "description": "Read telemetry.",
+            "brokeredToolClass": "read",
+            "parameters": {"type": "object"},
+            "http": {"url": "http://tools.default.svc/read", "method": "POST"},
+        },
+    }
+
+    with pytest.raises(ValueError, match=r"unsupported Orka Tool GVK.*core\.orka\.ai/v1alpha1.*Tool"):
+        generate_brokered_tools_from_orka_tool_crds([document])
+
+
+def test_generate_brokered_tools_rejects_unsupported_orka_kind():
+    document = {
+        "apiVersion": "core.orka.ai/v1alpha1",
+        "kind": "AgentRuntime",
+        "metadata": {"name": "runtime"},
+        "spec": {},
+    }
+
+    with pytest.raises(ValueError, match=r"unsupported Orka Tool GVK.*AgentRuntime.*Tool"):
+        generate_brokered_tools_from_orka_tool_crds([document])
+
+
+def test_generate_brokered_tools_rejects_non_object_documents():
+    valid_tool = {
+        "apiVersion": "core.orka.ai/v1alpha1",
+        "kind": "Tool",
+        "metadata": {"name": "read-telemetry"},
+        "spec": {
+            "description": "Read telemetry.",
+            "brokeredToolClass": "read",
+            "parameters": {"type": "object"},
+            "http": {"url": "http://tools.default.svc/read", "method": "POST"},
+        },
+    }
+
+    with pytest.raises(ValueError, match=r"document 0 must be an object"):
+        generate_brokered_tools_from_orka_tool_crds(["not-a-resource", valid_tool])
+
+
+def test_generate_brokered_tools_skips_unclassified_orka_tools():
+    documents = [
+        {
+            "apiVersion": "core.orka.ai/v1alpha1",
+            "kind": "Tool",
+            "metadata": {"name": "local-only-tool"},
+            "spec": {
+                "description": "Run only inside Orka.",
+                "parameters": {"type": "object"},
+                "http": {"url": "http://tools.default.svc/local", "method": "POST"},
+            },
+        },
+        {
+            "apiVersion": "core.orka.ai/v1alpha1",
+            "kind": "Tool",
+            "metadata": {"name": "read-telemetry"},
+            "spec": {
+                "description": "Read telemetry.",
+                "brokeredToolClass": "read",
+                "parameters": {"type": "object"},
+                "http": {"url": "http://tools.default.svc/read", "method": "POST"},
+            },
+        },
+    ]
+
+    generated = generate_brokered_tools_from_orka_tool_crds(documents, include_digest=False)
+
+    assert [(tool["name"], tool["brokeredClass"]) for tool in generated] == [("read-telemetry", "read")]
+
+
+def test_generate_brokered_tools_rejects_unknown_canonical_brokered_tool_class():
+    document = {
+        "apiVersion": "core.orka.ai/v1alpha1",
+        "kind": "Tool",
+        "metadata": {"name": "admin-tool"},
+        "spec": {
+            "description": "Attempt an unsupported operation.",
+            "brokeredToolClass": "admin",
+            "parameters": {"type": "object"},
+            "http": {"url": "http://tools.default.svc/admin", "method": "POST"},
+        },
+    }
+
+    with pytest.raises(ValueError, match=r"spec\.brokeredToolClass.*read.*write.*coordination"):
+        generate_brokered_tools_from_orka_tool_crds([document])
+
+
+def test_generate_brokered_tools_rejects_input_without_brokered_tools():
+    document = {
+        "apiVersion": "core.orka.ai/v1alpha1",
+        "kind": "Tool",
+        "metadata": {"name": "local-only-tool"},
+        "spec": {
+            "description": "Run only inside Orka.",
+            "brokeredClass": "read",
+            "parameters": {"type": "object"},
+            "http": {"url": "http://tools.default.svc/local", "method": "POST"},
+        },
+    }
+
+    with pytest.raises(ValueError, match=r"no brokered Orka Tool CRDs.*spec\.brokeredToolClass"):
+        generate_brokered_tools_from_orka_tool_crds([document])
+
+
+def test_generate_brokered_tools_never_lets_legacy_aliases_override_canonical_fields():
+    document = {
+        "apiVersion": "core.orka.ai/v1alpha1",
+        "kind": "Tool",
+        "metadata": {"name": "canonical-tool"},
+        "spec": {
+            "name": "legacy-tool",
+            "description": "Canonical description.",
+            "summary": "Legacy description.",
+            "brokeredToolClass": "write",
+            "brokeredClass": "read",
+            "parameters": {"type": "object", "properties": {"canonical": {"type": "string"}}},
+            "inputSchema": {"type": "object", "properties": {"legacy": {"type": "string"}}},
+            "http": {"url": "http://tools.default.svc/canonical", "method": "POST"},
+        },
+    }
+
+    generated = generate_brokered_tools_from_orka_tool_crds([document], include_digest=False)
+
+    assert generated == [
+        {
+            "name": "canonical-tool",
+            "description": "Canonical description.",
+            "brokeredClass": "write",
+            "parameters": {"properties": {"canonical": {"type": "string"}}, "type": "object"},
+        }
     ]
 
 
@@ -87,6 +280,14 @@ def test_load_orka_tool_crd_files_rejects_duplicate_exported_names(tmp_path):
         raise AssertionError("expected duplicate brokered tool names to fail")
 
 
+def test_load_orka_tool_crd_files_does_not_silently_drop_invalid_documents(tmp_path):
+    src = tmp_path / "tools.yaml"
+    src.write_text("---\nnot-a-resource\n---\n" + yaml.safe_dump(_tool_docs()[0]), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"document 0 must be an object"):
+        load_orka_tool_crd_files([src])
+
+
 def test_brokered_tools_export_cli_writes_safe_fragment(tmp_path, capsys):
     src = tmp_path / "tools.yaml"
     out = tmp_path / "brokered-tools.yaml"
@@ -101,16 +302,33 @@ def test_brokered_tools_export_cli_writes_safe_fragment(tmp_path, capsys):
     assert all("schemaDigest" not in entry for entry in parsed["brokeredTools"])
 
 
+def test_brokered_tools_export_cli_rejects_inputs_without_brokered_tools(tmp_path, capsys):
+    src = tmp_path / "tools.yaml"
+    out = tmp_path / "brokered-tools.yaml"
+    document = _tool_docs()[0]
+    document["spec"].pop("brokeredToolClass")
+    src.write_text(yaml.safe_dump(document), encoding="utf-8")
+
+    code = main([str(src), "--output", str(out)])
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out == ""
+    assert "no brokered Orka Tool CRDs" in captured.err
+    assert not out.exists()
+
+
 def test_brokered_tools_export_cli_reports_validation_errors(tmp_path, capsys):
     src = tmp_path / "bad.yaml"
     src.write_text(
         yaml.safe_dump(
             {
+                "apiVersion": "core.orka.ai/v1alpha1",
                 "kind": "Tool",
                 "metadata": {"name": "bad"},
                 "spec": {
                     "description": "bad",
-                    "brokeredClass": "read",
+                    "brokeredToolClass": "read",
                     "parameters": {"type": "object", "properties": {"tokenValue": {"type": "string"}}},
                 },
             }
