@@ -2115,6 +2115,36 @@ def test_foundry_brokered_model_loop_rejects_object_valued_tool_arguments():
     assert response.json()["error"]["code"] == "InvalidToolArguments"
 
 
+def test_foundry_brokered_model_loop_normalizes_json_parser_failures():
+    fake = _FakeChatTransport(
+        [
+            _chat_response(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_model",
+                            "type": "function",
+                            "function": {
+                                "name": "check-network-telemetry",
+                                "arguments": '{"value":' + ("9" * 5000) + "}",
+                            },
+                        }
+                    ],
+                }
+            )
+        ]
+    )
+    app = _model_loop_app(_spec(tool_name="check-network-telemetry"), fake)
+
+    with TestClient(app) as client:
+        response = client.post("/responses", json={"input": "check-network-telemetry"})
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "InvalidToolArguments"
+
+
 def test_foundry_brokered_model_loop_validates_schema_valued_additional_properties():
     spec = _spec(tool_name="flex-tool")
     spec.brokered_tools[0].parameters = {

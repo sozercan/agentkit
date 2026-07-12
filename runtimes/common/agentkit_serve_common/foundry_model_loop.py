@@ -203,7 +203,7 @@ def _parse_arguments(raw: Any) -> dict[str, Any]:
         parsed = json.loads(raw or "{}", parse_float=_parse_json_float, parse_constant=_reject_json_constant)
     except AgentRunError:
         raise
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, ValueError, RecursionError) as exc:
         raise AgentRunError("model tool arguments must be valid JSON", status=400, code="InvalidToolArguments") from exc
     if not isinstance(parsed, dict):
         raise AgentRunError("model tool arguments must be a JSON object", status=400, code="InvalidToolArguments")

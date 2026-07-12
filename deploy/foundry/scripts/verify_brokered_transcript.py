@@ -25,10 +25,10 @@ _MAX_SUMMARY_INTEGER_DIGITS = 4096
 
 def _load_json(path: Path) -> Any:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return _parse_json_lossless(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
         raise ValueError(f"missing transcript file: {path.name}") from exc
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, ValueError, RecursionError) as exc:
         raise ValueError(f"{path.name} is not valid JSON: {exc}") from exc
 
 
@@ -113,6 +113,7 @@ def verify_transcript(
     expected_tool_name: str = "conformance_read",
     expected_arguments_json: str = '{"probe":true}',
     expected_output_json: str = '{"approved":true,"output":{"success":true}}',
+    expected_final_text: str | None = None,
     expected_call_id: str = "call_conformance_1",
     expected_call_id_prefix: str | None = None,
 ) -> dict[str, Any]:
@@ -172,6 +173,8 @@ def verify_transcript(
     _require(isinstance(continuation_response_id, str) and continuation_response_id.startswith("caresp_"), "continuation response id must start with caresp_")
     _require(continuation_response_id != initial_response_id, "continuation response id must differ from initial response id")
     final_text = _message_text(continuation_response)
+    if expected_final_text is not None:
+        _require(final_text == expected_final_text, "final message text did not match expected conformance result")
 
     return {
         "initial_response_id": initial_response_id,
@@ -191,6 +194,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--expected-arguments-json", default='{"probe":true}', help="expected function_call arguments JSON")
     parser.add_argument("--expected-output-json", default='{"approved":true,"output":{"success":true}}', help="expected function_call_output JSON")
     parser.add_argument("--expected-output-file", default=None, help="private file containing expected function_call_output JSON")
+    parser.add_argument("--expected-final-text", default=None, help="expected final assistant text")
+    parser.add_argument("--expected-final-text-file", default=None, help="private file containing expected final assistant text")
     parser.add_argument("--expected-call-id", default="call_conformance_1", help="expected call_id, or 'auto' to only require a non-empty id")
     parser.add_argument("--expected-call-id-prefix", default=None, help="optional required call_id prefix")
     parser.add_argument("--write-summary", action="store_true", help="write summary.json in the transcript directory")
@@ -205,11 +210,17 @@ def main(argv: list[str] | None = None) -> int:
             if args.expected_output_file
             else args.expected_output_json
         )
+        expected_final_text = (
+            Path(args.expected_final_text_file).read_text(encoding="utf-8")
+            if args.expected_final_text_file
+            else args.expected_final_text
+        )
         summary = verify_transcript(
             args.transcript_dir,
             expected_tool_name=args.expected_tool_name,
             expected_arguments_json=args.expected_arguments_json,
             expected_output_json=expected_output_json,
+            expected_final_text=expected_final_text,
             expected_call_id=args.expected_call_id,
             expected_call_id_prefix=args.expected_call_id_prefix,
         )

@@ -77,6 +77,7 @@ def test_foundry_brokered_conformance_script_keeps_sensitive_headers_out_of_curl
     assert '-H "x-agentkit-brokered-continuation-proof:' not in text
     assert '--expected-output-file "$expected_output_file"' in text
     assert '--expected-output-json "$conformance_output"' not in text
+    assert '--expected-final-text-file "$expected_final_text_file"' in text
 
 
 def test_verify_brokered_transcript_rejects_old_response_ids(tmp_path):
@@ -92,6 +93,18 @@ def test_verify_brokered_transcript_rejects_old_response_ids(tmp_path):
         assert "caresp_" in str(exc)
     else:  # pragma: no cover - assertion path.
         raise AssertionError("expected old response id to fail")
+
+
+def test_verify_brokered_transcript_rejects_duplicate_keys_in_top_level_files(tmp_path):
+    verifier = _load_verifier()
+    transcript = _write_transcript(tmp_path)
+    initial_path = transcript / "02-initial-response.json"
+    initial = json.loads(initial_path.read_text(encoding="utf-8"))
+    encoded = json.dumps(initial, separators=(",", ":"))
+    initial_path.write_text(encoded[:-1] + ',"status":"failed"}', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="duplicate JSON object key"):
+        verifier.verify_transcript(transcript)
 
 
 def test_verify_brokered_transcript_rejects_reused_continuation_response_id(tmp_path):
@@ -124,6 +137,14 @@ def test_verify_brokered_transcript_rejects_extra_final_output_items(tmp_path):
 
     with pytest.raises(ValueError, match="must contain exactly one item"):
         verifier.verify_transcript(transcript)
+
+
+def test_verify_brokered_transcript_rejects_unexpected_final_text(tmp_path):
+    verifier = _load_verifier()
+    transcript = _write_transcript(tmp_path)
+
+    with pytest.raises(ValueError, match="final message text did not match"):
+        verifier.verify_transcript(transcript, expected_final_text="unrelated response")
 
 
 def test_verify_brokered_transcript_rejects_unexpected_continuation_output(tmp_path):
