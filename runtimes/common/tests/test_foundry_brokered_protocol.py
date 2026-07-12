@@ -711,6 +711,34 @@ def test_foundry_brokered_rejects_lossy_function_call_output_float_before_state_
     assert _message_text(exact.json()).endswith('{"id":9007199254740992.0}')
 
 
+def test_foundry_brokered_rejects_object_valued_function_call_output_before_state_change(tmp_path):
+    state_file = tmp_path / "responses-state.json"
+    app = _app(response_state_file=state_file)
+
+    with TestClient(app) as client:
+        initial = _start(client)
+        call = _call(initial)
+        persisted_before = state_file.read_bytes()
+        response = client.post(
+            "/responses",
+            headers=CONTINUATION_AUTH,
+            json={
+                "previous_response_id": initial["id"],
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": call["call_id"],
+                        "output": {"approved": True, "output": {"id": 9007199254740993.0}},
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_function_call_output"
+    assert state_file.read_bytes() == persisted_before
+
+
 def test_foundry_brokered_rejects_oversized_function_call_output_before_state_change(tmp_path):
     state_file = tmp_path / "responses-state.json"
     app = _app(response_state_file=state_file, max_brokered_output_bytes=128)

@@ -820,6 +820,35 @@ def test_load_rejects_invalid_brokered_schema_type_values_and_defaults(tmp_path,
     assert "brokeredTools.0.parameters" in msg
 
 
+def test_load_accepts_integral_float_values_for_integer_brokered_schema(tmp_path):
+    spec_dict = deepcopy(_BASE_SPEC)
+    spec_dict.update(
+        tools=[],
+        brokeredTools=[
+            {
+                "name": "integer_values",
+                "description": "integer schema values",
+                "brokeredClass": "read",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "withDefault": {"type": "integer", "default": 1.0},
+                        "withConst": {"type": "integer", "const": 2.0},
+                        "withEnum": {"type": "integer", "enum": [3.0]},
+                    },
+                },
+            }
+        ],
+    )
+
+    spec = load(_write_spec(tmp_path, spec_dict))
+
+    properties = spec.brokered_tools[0].parameters["properties"]
+    assert properties["withDefault"]["default"] == 1.0
+    assert properties["withConst"]["const"] == 2.0
+    assert properties["withEnum"]["enum"] == [3.0]
+
+
 def test_load_rejects_unknown_brokered_class_and_malformed_schema(tmp_path):
     unknown_class = _invalid_message(
         tmp_path,

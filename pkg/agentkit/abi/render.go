@@ -4,6 +4,7 @@ package abi
 
 import (
 	"encoding/json"
+	"math"
 	"strconv"
 	"strings"
 
@@ -27,6 +28,14 @@ type yamlNumber string
 
 func (n yamlNumber) MarshalYAML() ([]byte, error) {
 	return []byte(n), nil
+}
+
+func yamlFloat(value float64, bitSize int) yamlNumber {
+	rendered := strconv.FormatFloat(value, 'f', -1, bitSize)
+	if value == 0 && math.Signbit(value) {
+		rendered = "-0.0"
+	}
+	return yamlNumber(rendered)
 }
 
 type abiMetadata struct {
@@ -199,7 +208,7 @@ func copyAny(v any) any {
 	case map[string]float64:
 		out := make(map[string]any, len(typed))
 		for key, value := range typed {
-			out[key] = yamlNumber(strconv.FormatFloat(value, 'f', -1, 64))
+			out[key] = yamlFloat(value, 64)
 		}
 		return out
 	case map[string]bool:
@@ -221,15 +230,15 @@ func copyAny(v any) any {
 	case []float64:
 		out := make([]any, len(typed))
 		for i, item := range typed {
-			out[i] = yamlNumber(strconv.FormatFloat(item, 'f', -1, 64))
+			out[i] = yamlFloat(item, 64)
 		}
 		return out
 	case []bool:
 		return append([]bool(nil), typed...)
 	case float32:
-		return yamlNumber(strconv.FormatFloat(float64(typed), 'f', -1, 32))
+		return yamlFloat(float64(typed), 32)
 	case float64:
-		return yamlNumber(strconv.FormatFloat(typed, 'f', -1, 64))
+		return yamlFloat(typed, 64)
 	case json.Number:
 		return yamlNumber(expandJSONNumber(typed.String()))
 	default:

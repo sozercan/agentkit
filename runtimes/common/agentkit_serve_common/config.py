@@ -622,7 +622,9 @@ def _value_matches_schema_type(value: Any, schema_type: str) -> bool:
     if schema_type == "boolean":
         return isinstance(value, bool)
     if schema_type == "integer":
-        return isinstance(value, int) and not isinstance(value, bool)
+        return (isinstance(value, int) and not isinstance(value, bool)) or (
+            isinstance(value, float) and math.isfinite(value) and value.is_integer()
+        )
     if schema_type == "number":
         return isinstance(value, (int, float)) and not isinstance(value, bool)
     if schema_type == "string":

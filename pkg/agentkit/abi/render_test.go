@@ -2,6 +2,7 @@ package abi
 
 import (
 	"encoding/json"
+	"math"
 	"os"
 	"strings"
 	"testing"
@@ -20,8 +21,10 @@ const (
 )
 
 const (
-	jsonSchemaTypeKey    = "type"
-	jsonSchemaMinimumKey = "minimum"
+	jsonSchemaTypeKey       = "type"
+	jsonSchemaTypeObject    = "object"
+	jsonSchemaPropertiesKey = "properties"
+	jsonSchemaMinimumKey    = "minimum"
 )
 
 func sampleConfig() *config.AgentConfig {
@@ -260,8 +263,8 @@ func TestRenderAgentYAMLIncludesBrokeredTools(t *testing.T) {
 		Description:   "Read telemetry.",
 		BrokeredClass: config.BrokeredClassRead,
 		Parameters: map[string]any{
-			jsonSchemaTypeKey: "object",
-			"properties": map[string]any{
+			jsonSchemaTypeKey: jsonSchemaTypeObject,
+			jsonSchemaPropertiesKey: map[string]any{
 				"site":        map[string]any{jsonSchemaTypeKey: "string", jsonSchemaMinimumKey: 0.000001},
 				"typedFloats": map[string]float64{jsonSchemaMinimumKey: 0.000001},
 				"empty":       map[string]any{},
@@ -293,8 +296,8 @@ func TestRenderAgentYAMLFormatsJSONNumberBrokeredSchemaValuesAsNumbers(t *testin
 		Description:   "Read numeric data.",
 		BrokeredClass: config.BrokeredClassRead,
 		Parameters: map[string]any{
-			jsonSchemaTypeKey: "object",
-			"properties": map[string]any{
+			jsonSchemaTypeKey: jsonSchemaTypeObject,
+			jsonSchemaPropertiesKey: map[string]any{
 				"small": map[string]any{jsonSchemaTypeKey: "number", jsonSchemaMinimumKey: json.Number("1e-7")},
 			},
 		},
@@ -306,5 +309,35 @@ func TestRenderAgentYAMLFormatsJSONNumberBrokeredSchemaValuesAsNumbers(t *testin
 	}
 	if !strings.Contains(string(out), "minimum: 0.0000001") || strings.Contains(string(out), "1e-7") {
 		t.Fatalf("rendered agent.yaml did not preserve json.Number as fixed YAML number\n---\n%s", out)
+	}
+}
+
+func TestRenderAgentYAMLPreservesNegativeZeroBrokeredSchemaFloats(t *testing.T) {
+	cfg := sampleConfig()
+	cfg.Tools = nil
+	tool := config.BrokeredTool{
+		Name:          "negative-zero-tool",
+		Description:   "Preserve negative zero.",
+		BrokeredClass: config.BrokeredClassRead,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey: jsonSchemaTypeObject,
+			jsonSchemaPropertiesKey: map[string]any{
+				"offset": map[string]any{jsonSchemaTypeKey: "number", "default": math.Copysign(0, -1)},
+			},
+		},
+	}
+	digest, err := config.BrokeredToolSchemaDigest(tool)
+	if err != nil {
+		t.Fatalf("digest error: %v", err)
+	}
+	tool.SchemaDigest = digest
+	cfg.BrokeredTools = []config.BrokeredTool{tool}
+
+	out, err := Render(effective.FromConfig(cfg, testInstructions))
+	if err != nil {
+		t.Fatalf("render error: %v", err)
+	}
+	if !strings.Contains(string(out), "default: -0.0") {
+		t.Fatalf("rendered agent.yaml did not preserve negative zero as a float\n---\n%s", out)
 	}
 }

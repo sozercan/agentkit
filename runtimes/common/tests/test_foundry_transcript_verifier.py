@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+import pytest
 
 from agentkit_serve_common.foundry_conformance import create_foundry_conformance_app
 
@@ -73,6 +74,18 @@ def test_verify_brokered_transcript_rejects_old_response_ids(tmp_path):
         assert "caresp_" in str(exc)
     else:  # pragma: no cover - assertion path.
         raise AssertionError("expected old response id to fail")
+
+
+def test_verify_brokered_transcript_rejects_reused_continuation_response_id(tmp_path):
+    verifier = _load_verifier()
+    transcript = _write_transcript(tmp_path)
+    initial = json.loads((transcript / "02-initial-response.json").read_text(encoding="utf-8"))
+    continuation = json.loads((transcript / "04-continuation-response.json").read_text(encoding="utf-8"))
+    continuation["id"] = initial["id"]
+    (transcript / "04-continuation-response.json").write_text(json.dumps(continuation), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must differ from initial response id"):
+        verifier.verify_transcript(transcript)
 
 
 def test_verify_brokered_transcript_cli_writes_summary(tmp_path, capsys):

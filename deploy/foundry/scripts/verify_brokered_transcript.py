@@ -107,6 +107,7 @@ def verify_transcript(
     _require(continuation_response.get("previous_response_id") == initial_response_id, "continuation response previous_response_id must match initial id")
     continuation_response_id = continuation_response.get("id")
     _require(isinstance(continuation_response_id, str) and continuation_response_id.startswith("caresp_"), "continuation response id must start with caresp_")
+    _require(continuation_response_id != initial_response_id, "continuation response id must differ from initial response id")
     final_text = _message_text(continuation_response)
 
     return {

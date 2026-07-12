@@ -580,17 +580,16 @@ def _reject_output_constant(raw: str) -> None:
 
 
 def _json_object_from_output(output: Any) -> dict[str, Any]:
-    if isinstance(output, str):
-        try:
-            parsed = json.loads(
-                output,
-                parse_float=_parse_output_float,
-                parse_constant=_reject_output_constant,
-            )
-        except json.JSONDecodeError as exc:
-            raise ValueError("function_call_output.output must be a JSON object string") from exc
-    else:
-        parsed = output
+    if not isinstance(output, str):
+        raise ValueError("function_call_output.output must be a JSON object string")
+    try:
+        parsed = json.loads(
+            output,
+            parse_float=_parse_output_float,
+            parse_constant=_reject_output_constant,
+        )
+    except json.JSONDecodeError as exc:
+        raise ValueError("function_call_output.output must be a JSON object string") from exc
     if not isinstance(parsed, dict):
         raise ValueError("function_call_output.output must be a JSON object")
     approved = parsed.get("approved")
