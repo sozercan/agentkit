@@ -51,6 +51,8 @@ _DEFAULT_STATE_TTL_SECONDS = 15 * 60
 _DEFAULT_MAX_PENDING_RESPONSES = 128
 _DEFAULT_MAX_ARGUMENT_BYTES = 8192
 _DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024
+_DEFAULT_MAX_REQUEST_BODY_BYTES = 1024 * 1024
+_DEFAULT_MAX_MODEL_MESSAGES_BYTES = 1024 * 1024
 _MAX_SYNTHETIC_ARRAY_ITEMS = 32
 _MAX_SYNTHETIC_STRING_LENGTH = 4096
 _MAX_SYNTHETIC_VALUES = 256
@@ -59,6 +61,8 @@ _STATE_TTL_ENV = "AGENTKIT_FOUNDRY_RESPONSE_STATE_TTL_SECONDS"
 _MAX_PENDING_ENV = "AGENTKIT_FOUNDRY_RESPONSE_STATE_MAX_PENDING"
 _MAX_ARGUMENT_BYTES_ENV = "AGENTKIT_FOUNDRY_BROKERED_MAX_ARGUMENT_BYTES"
 _MAX_OUTPUT_BYTES_ENV = "AGENTKIT_FOUNDRY_BROKERED_MAX_OUTPUT_BYTES"
+_MAX_REQUEST_BODY_BYTES_ENV = "AGENTKIT_FOUNDRY_MAX_REQUEST_BODY_BYTES"
+_MAX_MODEL_MESSAGES_BYTES_ENV = "AGENTKIT_FOUNDRY_BROKERED_MAX_MODEL_MESSAGES_BYTES"
 _CONTINUATION_PROOF_ENV = "AGENTKIT_FOUNDRY_BROKERED_CONTINUATION_PROOF"
 _CONTINUATION_PROOF_HEADER = "x-agentkit-brokered-continuation-proof"
 _MODEL_LOOP_ENV = "AGENTKIT_FOUNDRY_BROKERED_MODEL_LOOP"
@@ -330,6 +334,15 @@ def _pending_call_from_state_payload(data: Mapping[str, Any]) -> _PendingCall:
     )
 
 
+def _persistence_json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
 def _state_to_payload(state: _HostedResponseState) -> dict[str, Any]:
     return {
         "responseID": state.response_id,
@@ -361,6 +374,9 @@ def _state_from_payload(data: Mapping[str, Any]) -> _HostedResponseState:
     if not isinstance(initial_usage, Mapping):
         raise ValueError("stored initialUsage must be an object")
     status = str(data.get("status") or "pending")
+    expires_at = float(data.get("expiresAt") or 0)
+    if not math.isfinite(expires_at):
+        raise ValueError("stored expiresAt must be finite")
     accepted = {str(key): str(value) for key, value in accepted_outputs.items()}
     if final_payload is None and accepted:
         # A persisted accepted output without a final payload means the process
@@ -373,7 +389,7 @@ def _state_from_payload(data: Mapping[str, Any]) -> _HostedResponseState:
         response_id=str(data.get("responseID") or ""),
         session_id=str(data["sessionID"]) if data.get("sessionID") is not None else None,
         pending_calls={str(call_id): _pending_call_from_state_payload(call) for call_id, call in pending_calls_raw.items() if isinstance(call, Mapping)},
-        expires_at=float(data.get("expiresAt") or 0),
+        expires_at=expires_at,
         status=status,
         accepted_outputs=accepted,
         final_payload=final_payload,
@@ -497,7 +513,7 @@ class _FoundryResponseStateStore:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         payload = {"states": {response_id: _state_to_payload(state) for response_id, state in self._states.items()}}
         tmp = self.state_file.with_name(f".{self.state_file.name}.tmp")
-        data = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        data = _persistence_json_bytes(payload)
         try:
             tmp.unlink(missing_ok=True)
         except OSError:
@@ -558,6 +574,37 @@ def _max_argument_bytes(value: int | None = None) -> int:
 
 def _max_output_bytes(value: int | None = None) -> int:
     return _positive_int_setting(value, env_name=_MAX_OUTPUT_BYTES_ENV, default=_DEFAULT_MAX_OUTPUT_BYTES)
+
+
+def _max_request_body_bytes(value: int | None = None) -> int:
+    return _positive_int_setting(
+        value,
+        env_name=_MAX_REQUEST_BODY_BYTES_ENV,
+        default=_DEFAULT_MAX_REQUEST_BODY_BYTES,
+    )
+
+
+def _max_model_messages_bytes(value: int | None = None) -> int:
+    return _positive_int_setting(
+        value,
+        env_name=_MAX_MODEL_MESSAGES_BYTES_ENV,
+        default=_DEFAULT_MAX_MODEL_MESSAGES_BYTES,
+    )
+
+
+class _RequestBodyTooLarge(Exception):
+    pass
+
+
+async def _bounded_request_body(request: Request, *, max_bytes: int) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > max_bytes:
+            raise _RequestBodyTooLarge
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _brokered_model_loop_enabled(value: bool | None = None) -> bool:
@@ -846,7 +893,37 @@ def _required_property_names(schema: Mapping[str, Any]) -> list[str]:
     return names
 
 
-def _sample_argument_value(name: str, schema: Any, run_request: RunRequest, *, budget: list[int] | None = None) -> Any:
+def _bounded_synthetic_literal(name: str, value: Any, *, depth: int) -> Any:
+    pending: list[tuple[Any, int]] = [(value, depth)]
+    while pending:
+        current, current_depth = pending.pop()
+        if current_depth > _MAX_OUTPUT_DEPTH:
+            raise AgentRunError(
+                f"brokered tool schema for {name!r} exceeds deterministic synthesis depth limit",
+                status=413,
+                code="brokered_arguments_too_large",
+            )
+        if isinstance(current, Mapping):
+            pending.extend((child, current_depth + 1) for child in current.values())
+        elif isinstance(current, list):
+            pending.extend((child, current_depth + 1) for child in current)
+    return value
+
+
+def _sample_argument_value(
+    name: str,
+    schema: Any,
+    run_request: RunRequest,
+    *,
+    budget: list[int] | None = None,
+    depth: int = 1,
+) -> Any:
+    if depth > _MAX_OUTPUT_DEPTH:
+        raise AgentRunError(
+            f"brokered tool schema for {name!r} exceeds deterministic synthesis depth limit",
+            status=413,
+            code="brokered_arguments_too_large",
+        )
     if budget is None:
         budget = [_MAX_SYNTHETIC_VALUES]
     if budget[0] <= 0:
@@ -865,12 +942,12 @@ def _sample_argument_value(name: str, schema: Any, run_request: RunRequest, *, b
             code="UnsupportedBrokeredSchema",
         )
     if "const" in schema:
-        return schema["const"]
+        return _bounded_synthetic_literal(name, schema["const"], depth=depth)
     if "default" in schema:
-        return schema["default"]
+        return _bounded_synthetic_literal(name, schema["default"], depth=depth)
     enum_values = schema.get("enum")
     if isinstance(enum_values, list) and enum_values:
-        return enum_values[0]
+        return _bounded_synthetic_literal(name, enum_values[0], depth=depth)
 
     schema_type = schema.get("type")
     if isinstance(schema_type, list):
@@ -1044,7 +1121,10 @@ def _sample_argument_value(name: str, schema: Any, run_request: RunRequest, *, b
                     code="brokered_arguments_too_large",
                 )
             item_schema = schema.get("items", {})
-            return [_sample_argument_value(name, item_schema, run_request, budget=budget) for _ in range(min_items)]
+            return [
+                _sample_argument_value(name, item_schema, run_request, budget=budget, depth=depth + 1)
+                for _ in range(min_items)
+            ]
         return []
 
     if schema_type == "object":
@@ -1055,7 +1135,13 @@ def _sample_argument_value(name: str, schema: Any, run_request: RunRequest, *, b
         nested: dict[str, Any] = {}
         properties = schema.get("properties") if isinstance(schema.get("properties"), Mapping) else {}
         for child_name in _required_property_names(schema):
-            nested[child_name] = _sample_argument_value(child_name, properties.get(child_name, {}), run_request, budget=budget)
+            nested[child_name] = _sample_argument_value(
+                child_name,
+                properties.get(child_name, {}),
+                run_request,
+                budget=budget,
+                depth=depth + 1,
+            )
         return nested
 
     for key in ("const", "default"):
@@ -1102,7 +1188,7 @@ def _deterministic_tool_arguments(tool: BrokeredToolDefinition, run_request: Run
     for key in ("const", "default"):
         literal = parameters.get(key)
         if isinstance(literal, Mapping):
-            return dict(literal)
+            return dict(_bounded_synthetic_literal(tool.name, literal, depth=0))
     enum = parameters.get("enum")
     if isinstance(enum, list):
         if tool.brokered_class != "read" and len(enum) > 1:
@@ -1113,7 +1199,7 @@ def _deterministic_tool_arguments(tool: BrokeredToolDefinition, run_request: Run
             )
         for item in enum:
             if isinstance(item, Mapping):
-                return dict(item)
+                return dict(_bounded_synthetic_literal(tool.name, item, depth=0))
     properties = parameters.get("properties") if isinstance(parameters.get("properties"), Mapping) else {}
     required_names = _required_property_names(parameters)
     if tool.brokered_class != "read":
@@ -1559,6 +1645,8 @@ def create_foundry_app(
     max_pending_responses: int | None = None,
     max_brokered_argument_bytes: int | None = None,
     max_brokered_output_bytes: int | None = None,
+    max_request_body_bytes: int | None = None,
+    max_model_messages_bytes: int | None = None,
     brokered_model_loop_enabled: bool | None = None,
     brokered_model_http_client: Any | None = None,
     response_state_file: str | Path | None = None,
@@ -1569,6 +1657,8 @@ def create_foundry_app(
     continuation_proof = brokered_continuation_proof or os.environ.get(_CONTINUATION_PROOF_ENV) or None
     max_argument_bytes = _max_argument_bytes(max_brokered_argument_bytes)
     max_output_bytes = _max_output_bytes(max_brokered_output_bytes)
+    request_body_limit = _max_request_body_bytes(max_request_body_bytes)
+    model_messages_limit = _max_model_messages_bytes(max_model_messages_bytes)
     response_states = _FoundryResponseStateStore(
         ttl_seconds=_state_ttl_seconds(state_ttl_seconds),
         max_entries=_max_pending_responses(max_pending_responses),
@@ -1626,8 +1716,12 @@ def create_foundry_app(
                 code="invocations_disabled_in_brokered_mode",
             )
         try:
-            data = await request.json()
-        except json.JSONDecodeError:
+            raw_body = await _bounded_request_body(request, max_bytes=request_body_limit)
+        except _RequestBodyTooLarge:
+            return Response("Request body is too large", status_code=413)
+        try:
+            data = json.loads(raw_body)
+        except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
             return Response("Request body must be JSON", status_code=400)
 
         if not isinstance(data, dict):
@@ -1650,8 +1744,12 @@ def create_foundry_app(
     @app.post("/responses", dependencies=[auth])
     async def responses(request: Request):
         try:
-            data = await request.json()
-        except json.JSONDecodeError:
+            raw_body = await _bounded_request_body(request, max_bytes=request_body_limit)
+        except _RequestBodyTooLarge:
+            return _error("Request body is too large", status=413, code="request_body_too_large")
+        try:
+            data = json.loads(raw_body)
+        except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
             return _error("Request body must be JSON", status=400, code="invalid_json")
 
         if not isinstance(data, dict):
@@ -1751,6 +1849,22 @@ def create_foundry_app(
                             "brokered function_call arguments are too large for pending state",
                             status=413,
                             code="brokered_arguments_too_large",
+                        )
+                    try:
+                        model_messages_bytes = len(
+                            _persistence_json_bytes(model_result.messages)
+                        )
+                    except (TypeError, ValueError, RecursionError, UnicodeEncodeError) as exc:
+                        return _error(
+                            f"model loop messages are invalid: {exc}",
+                            status=502,
+                            code="InvalidModelResponse",
+                        )
+                    if model_messages_bytes > model_messages_limit:
+                        return _error(
+                            "model loop messages are too large for pending state",
+                            status=413,
+                            code="brokered_model_messages_too_large",
                         )
                     call = _PendingCall(
                         call_id=call_id,

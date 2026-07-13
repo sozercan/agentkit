@@ -287,7 +287,7 @@ deploy/foundry/scripts/foundry_brokered_conformance.sh conformance_read ./foundr
 The script performs the initial `function_call` request, posts the matching
 `function_call_output` continuation with `previous_response_id`, asserts SDK-style
 `caresp_...` IDs, and saves request/response JSON plus `summary.json` as a
-sanitized transcript. Re-run `python3 deploy/foundry/scripts/verify_brokered_transcript.py <transcript-dir>` to verify archived transcript evidence later. This live transcript is still required before claiming A0
+sanitized transcript. Re-run `python3 deploy/foundry/scripts/verify_brokered_transcript.py <transcript-dir> --expected-final-text '<known expected assistant result>'` to verify archived transcript evidence later. This live transcript is still required before claiming A0
 completion; the local test only proves the SDK-hosted contract before deployment.
 
 ## Production brokered-only fixture

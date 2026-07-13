@@ -98,6 +98,22 @@ def test_foundry_responses_tolerates_stream_flag_with_non_streaming_response():
     assert resp.json()["output"][0]["content"][0]["text"] == "echo: hi"
 
 
+def test_foundry_invocations_enforces_request_body_limit_before_runtime():
+    factory = EchoFactory()
+    app = create_foundry_app(_spec(), factory, max_request_body_bytes=64)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/invocations",
+            content='{"message":"' + ("x" * 128) + '"}',
+            headers={"content-type": "application/json"},
+        )
+
+    assert response.status_code == 413
+    assert "too large" in response.text
+    assert factory.runtime.requests == []
+
+
 def test_foundry_protocols_reject_non_object_json():
     app = create_foundry_app(_spec(), EchoFactory())
     with TestClient(app) as client:

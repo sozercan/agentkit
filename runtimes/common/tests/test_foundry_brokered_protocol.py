@@ -748,6 +748,75 @@ def test_foundry_brokered_counts_wide_object_members_against_synthesis_budget():
     assert response.json()["error"]["code"] == "brokered_arguments_too_large"
 
 
+def test_foundry_brokered_rejects_overly_deep_deterministic_synthesis():
+    child: dict[str, Any] = {"type": "string", "default": "leaf"}
+    for _ in range(129):
+        child = {
+            "type": "object",
+            "properties": {"child": child},
+            "required": ["child"],
+        }
+    spec = _spec(tool_name="deep-synthesis")
+    spec.brokered_tools[0].parameters = {
+        "type": "object",
+        "properties": {"root": child},
+        "required": ["root"],
+    }
+    app = _app(spec)
+
+    with TestClient(app) as client:
+        response = client.post("/responses", json={"input": "deep-synthesis"})
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "brokered_arguments_too_large"
+
+
+def test_foundry_brokered_rejects_overly_deep_root_literal_synthesis():
+    literal: dict[str, Any] = {}
+    for _ in range(129):
+        literal = {"nested": literal}
+    spec = _spec(tool_name="deep-root-literal")
+    spec.brokered_tools[0].parameters = {
+        "type": "object",
+        "const": literal,
+    }
+    app = _app(spec)
+
+    with TestClient(app) as client:
+        response = client.post("/responses", json={"input": "deep-root-literal"})
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "brokered_arguments_too_large"
+
+
+@pytest.mark.parametrize(
+    ("literal", "expected"),
+    [
+        ({"const": 2.0}, 2.0),
+        ({"default": 1.0}, 1.0),
+        ({"enum": [3.0]}, 3.0),
+    ],
+)
+def test_foundry_brokered_honors_integral_float_integer_literals(
+    literal: dict[str, Any], expected: float
+):
+    spec = _spec(tool_name="integer-literal")
+    spec.brokered_tools[0].parameters = {
+        "type": "object",
+        "properties": {"count": {"type": "integer", **literal}},
+        "required": ["count"],
+    }
+    app = _app(spec)
+
+    with TestClient(app) as client:
+        response = client.post("/responses", json={"input": "integer-literal"})
+
+    assert response.status_code == 200, response.text
+    count = json.loads(_call(response.json())["arguments"])["count"]
+    assert count == expected
+    assert isinstance(count, float)
+
+
 def test_foundry_brokered_tool_selection_requires_token_boundary_match():
     data = _multi_tool_spec().model_dump(by_alias=True)
     data["brokeredTools"] = [
@@ -1831,6 +1900,85 @@ def test_foundry_brokered_rejects_deep_continuation_output_without_consuming_sta
     assert accepted.status_code == 200, accepted.text
 
 
+def test_foundry_brokered_bounds_request_body_before_model_call():
+    fake = _FakeChatTransport([_chat_response({"role": "assistant", "content": "must not run"})])
+    app = _model_loop_app(
+        _spec(tool_name="check-network-telemetry"),
+        fake,
+        max_request_body_bytes=64,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/responses",
+            content=json.dumps({"input": "x" * 128}),
+            headers={"content-type": "application/json"},
+        )
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "request_body_too_large"
+    assert fake.requests == []
+
+
+def test_foundry_brokered_model_message_size_matches_persistence_encoding():
+    messages = [{"role": "user", "content": "😀" * 8}]
+
+    measured = foundry_module._persistence_json_bytes(messages)
+    persisted = json.dumps(
+        messages,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    utf8_compact = json.dumps(
+        messages,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+    assert measured == persisted
+    assert len(measured) > len(utf8_compact)
+
+
+def test_foundry_brokered_bounds_persisted_model_messages_and_releases_reservation():
+    tool_response = _chat_response(
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_model",
+                    "type": "function",
+                    "function": {"name": "check-network-telemetry", "arguments": "{}"},
+                }
+            ],
+        }
+    )
+    fake = _FakeChatTransport([tool_response, deepcopy(tool_response)])
+    app = _model_loop_app(
+        _spec(tool_name="check-network-telemetry"),
+        fake,
+        max_request_body_bytes=4096,
+        max_model_messages_bytes=512,
+        max_pending_responses=1,
+    )
+
+    with TestClient(app) as client:
+        oversized = client.post(
+            "/responses",
+            json={"input": "check-network-telemetry " + ("x" * 1024)},
+        )
+        accepted = client.post("/responses", json={"input": "check-network-telemetry"})
+
+    assert oversized.status_code == 413
+    assert oversized.json()["error"]["code"] == "brokered_model_messages_too_large"
+    assert accepted.status_code == 200, accepted.text
+    assert _call(accepted.json())
+    assert len(fake.requests) == 2
+
+
 def test_foundry_brokered_model_loop_reserves_capacity_before_model_call():
     fake = _FakeChatTransport(
         [
@@ -1965,6 +2113,23 @@ def test_foundry_brokered_invalid_file_state_fails_startup_without_overwriting(t
     state_file.write_text(raw_state, encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="invalid Foundry response state file"):
+        _app(response_state_file=state_file)
+
+    assert state_file.read_text(encoding="utf-8") == raw_state
+
+
+@pytest.mark.parametrize("expires_at", [float("nan"), float("inf"), float("-inf")])
+def test_foundry_brokered_rejects_nonfinite_persisted_expiry(tmp_path, expires_at: float):
+    state_file = tmp_path / "responses-state.json"
+    with TestClient(_app(response_state_file=state_file)) as client:
+        _start(client)
+    persisted = json.loads(state_file.read_text(encoding="utf-8"))
+    state = next(iter(persisted["states"].values()))
+    state["expiresAt"] = expires_at
+    raw_state = json.dumps(persisted, separators=(",", ":"))
+    state_file.write_text(raw_state, encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="stored expiresAt must be finite"):
         _app(response_state_file=state_file)
 
     assert state_file.read_text(encoding="utf-8") == raw_state

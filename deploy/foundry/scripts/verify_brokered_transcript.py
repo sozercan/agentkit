@@ -104,8 +104,10 @@ def _message_text(response: dict[str, Any], *, response_id: str) -> str:
     _require(message.get("role") == "assistant", "final message role must be assistant")
     _require(message.get("status") == "completed", "final message status must be completed")
     content = message.get("content")
-    _require(isinstance(content, list) and bool(content), "final message content must be a non-empty array")
-    text = content[0].get("text") if isinstance(content[0], dict) else None
+    _require(isinstance(content, list) and len(content) == 1, "final message content must contain exactly one item")
+    content_item = content[0]
+    _require(isinstance(content_item, dict) and content_item.get("type") == "output_text", "final message content[0] must be output_text")
+    text = content_item.get("text")
     _require(isinstance(text, str) and bool(text), "final message must contain text")
     return text
 
@@ -120,6 +122,7 @@ def verify_transcript(
     expected_call_id: str = "call_conformance_1",
     expected_call_id_prefix: str | None = None,
 ) -> dict[str, Any]:
+    _require(expected_final_text is not None, "expected final text is required for transcript verification")
     root = Path(transcript_dir)
     expected_arguments = _parse_json_lossless(expected_arguments_json)
     expected_output = _parse_json_lossless(expected_output_json)
@@ -142,6 +145,7 @@ def verify_transcript(
     call = output[0]
     _require(isinstance(call, dict), "initial response output[0] must be an object")
     _require(call.get("type") == "function_call", "initial output item must be function_call")
+    _require(call.get("status") == "completed", "function_call status must be completed")
     _require(call.get("response_id") == initial_response_id, "function_call response_id must match initial response id")
     function_name = call.get("name")
     _require(function_name == expected_tool_name, f"function_call name must be {expected_tool_name}")
@@ -198,8 +202,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--expected-arguments-json", default='{"probe":true}', help="expected function_call arguments JSON")
     parser.add_argument("--expected-output-json", default='{"approved":true,"output":{"success":true}}', help="expected function_call_output JSON")
     parser.add_argument("--expected-output-file", default=None, help="private file containing expected function_call_output JSON")
-    parser.add_argument("--expected-final-text", default=None, help="expected final assistant text")
-    parser.add_argument("--expected-final-text-file", default=None, help="private file containing expected final assistant text")
+    final_text_group = parser.add_mutually_exclusive_group(required=True)
+    final_text_group.add_argument("--expected-final-text", help="expected final assistant text")
+    final_text_group.add_argument("--expected-final-text-file", help="private file containing expected final assistant text")
     parser.add_argument("--expected-call-id", default="call_conformance_1", help="expected call_id, or 'auto' to only require a non-empty id")
     parser.add_argument("--expected-call-id-prefix", default=None, help="optional required call_id prefix")
     parser.add_argument("--write-summary", action="store_true", help="write summary.json in the transcript directory")

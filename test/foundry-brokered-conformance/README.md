@@ -82,5 +82,5 @@ export AGENT_RESPONSES_ENDPOINT="https://<hosted-agent>/responses"
 deploy/foundry/scripts/foundry_brokered_conformance.sh conformance_read ./foundry-brokered-transcript
 ```
 
-The helper writes request/response JSON plus `summary.json`. Re-run `python3 deploy/foundry/scripts/verify_brokered_transcript.py <transcript-dir>` to verify an archived transcript later. Keep bearer tokens
+The helper writes request/response JSON plus `summary.json`. Re-run `python3 deploy/foundry/scripts/verify_brokered_transcript.py <transcript-dir> --expected-final-text '<known expected assistant result>'` to verify an archived transcript later. Keep bearer tokens
 out of transcripts.
