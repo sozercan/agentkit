@@ -1,0 +1,6 @@
+{
+  "error": {
+    "message": "multiple function_call_output items are not supported by this deterministic brokered adapter",
+    "code": "multiple_tool_outputs_unsupported"
+  }
+}

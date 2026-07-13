@@ -57,6 +57,21 @@ tools:
       type: bearer
       tokenEnv: TOOLBOX_TOKEN
 
+# Alternative to `tools` above for Foundry hosted Orka-brokered mode. v0 does
+# not allow owned `tools` and `brokeredTools` together, so remove/comment the
+# `tools` block before enabling this schema-only block.
+# brokeredTools:
+#   - name: check-network-telemetry
+#     description: Read sanitized optical telemetry.
+#     brokeredClass: read
+#     parameters:
+#       type: object
+#       properties:
+#         site:
+#           type: string
+#       required: [site]
+#     schemaDigest: sha256:<optional deploy-time digest>
+
 env:
   - name: REQUIRED_FOO
     required: true
@@ -97,6 +112,7 @@ expose:
 | `model` | yes | Hosted OpenAI-compatible model connection metadata. |
 | `instructions` | yes | Fully-resolved system prompt scalar. |
 | `tools` | no | Owned MCP tools, either stdio or Streamable HTTP. |
+| `brokeredTools` | no | Static safe Orka-brokered tool schemas for Foundry hosted Responses mode. |
 | `env` | no | Runtime env var requirements by name only. |
 | `context` | no | Provider-neutral context providers; runtime capability-gated. Filesystem skills paths must be pre-staged under `/agent/skills`; arbitrary build-context directories are not copied into the image. |
 | `observability` | no | Provider-neutral observability env names; runtime capability-gated. |
@@ -146,6 +162,21 @@ Supported auth types:
 - `bearer` with `tokenEnv`.
 - `workload-identity-token` with opaque `audience`, only for runtimes that declare
   `workload-identity-token-auth`.
+
+## Brokered tool schemas
+
+`brokeredTools` is used by Foundry hosted brokered Responses mode. It is
+intentionally schema-only: the reader rejects execution URLs, auth/header/token
+fields, Secret refs, unsafe parameter names, unknown brokered classes, malformed
+JSON Schema, duplicate names, and owned-tool/brokered-tool name overlap.
+
+When `schemaDigest` is present, it must match the deterministic digest of the
+safe model-facing schema fields. Generate it from Orka Tool CRDs during
+deployment so stale or hand-edited schemas fail before a live run. Orka remains
+the execution and policy authority even when AgentKit's static schema is valid.
+
+See `docs/foundry-hosted-brokered.md` for the hosted Responses continuation
+lifecycle and state/scaling limits.
 
 ## Reader contract
 

@@ -1,10 +1,18 @@
 package config
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"math/big"
 	pathpkg "path"
+	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/sozercan/agentkit/pkg/agentkit/runtimes"
@@ -26,6 +34,30 @@ const (
 	ApprovalNever               = "never"
 	ApprovalAuto                = "auto"
 	ApprovalAlways              = "always"
+
+	BrokeredClassRead         = "read"
+	BrokeredClassWrite        = "write"
+	BrokeredClassCoordination = "coordination"
+
+	jsonSchemaTypeKey              = "type"
+	jsonSchemaTypeObject           = "object"
+	jsonSchemaTypeNumber           = "number"
+	jsonSchemaTypeString           = "string"
+	jsonSchemaTypeInteger          = "integer"
+	jsonSchemaTypeArray            = "array"
+	jsonSchemaTypeBoolean          = "boolean"
+	jsonSchemaTypeNull             = "null"
+	jsonSchemaEnumKey              = "enum"
+	jsonSchemaDefaultKey           = "default"
+	jsonSchemaRequiredKey          = "required"
+	jsonSchemaDependentRequiredKey = "dependentRequired"
+	jsonSchemaMinimumKey           = "minimum"
+	jsonSchemaMaximumKey           = "maximum"
+	brokeredDigestDescriptionKey   = "description"
+	brokeredDigestNumberKey        = "\u0000agentkit_json_number"
+	brokeredUnsafeCookieKey        = "cookie"
+	credentialHeaderAPIKey         = "api-key"
+	maxExactJSONFloatInteger       = float64(1<<53 - 1)
 )
 
 // Validate reports every problem with the config at once via errors.Join (plan
@@ -128,6 +160,8 @@ func (c *AgentConfig) Validate() error {
 		validateApproval(add, i, t)
 	}
 
+	validateBrokeredTools(add, c.BrokeredTools, seen)
+
 	// --- env requirements ---------------------------------------------------
 	seenEnv := map[string]bool{}
 	for i, e := range c.Env {
@@ -164,6 +198,855 @@ func (c *AgentConfig) Validate() error {
 	}
 
 	return errors.Join(errs...)
+}
+
+func validateBrokeredTools(add func(string, ...any), tools []BrokeredTool, ownedToolNames map[string]bool) {
+	if len(tools) > 0 && len(ownedToolNames) > 0 {
+		add("tools and brokeredTools cannot be mixed in v0; direct AgentKit-owned tools are disabled in brokered Foundry mode")
+	}
+	seen := map[string]bool{}
+	for i, tool := range tools {
+		path := fmt.Sprintf("brokeredTools[%d]", i)
+		if tool.Name == "" {
+			add("%s.name is required", path)
+		} else {
+			if !isBrokeredToolName(tool.Name) {
+				add("%s.name %q must match [A-Za-z0-9_-]{1,64}", path, tool.Name)
+			}
+			if seen[tool.Name] {
+				add("%s: duplicate brokered tool name %q", path, tool.Name)
+			}
+			if ownedToolNames[tool.Name] {
+				add("%s.name %q cannot be both owned and brokered", path, tool.Name)
+			}
+			seen[tool.Name] = true
+		}
+		if tool.Description == "" {
+			add("%s.description is required", path)
+		} else if hasUnsafeBrokeredText(tool.Description) {
+			add("%s.description must not contain URLs or secret-like material", path)
+		}
+		switch tool.BrokeredClass {
+		case BrokeredClassRead, BrokeredClassWrite, BrokeredClassCoordination:
+		case "":
+			add("%s.brokeredClass is required", path)
+		default:
+			add("%s.brokeredClass %q is not supported (expected read, write, or coordination)", path, tool.BrokeredClass)
+		}
+		validateBrokeredToolParameters(add, path+".parameters", tool.Parameters)
+		if tool.SchemaDigest != "" {
+			if !isSchemaDigest(tool.SchemaDigest) {
+				add("%s.schemaDigest must be sha256:<64 lowercase hex>", path)
+			} else if actual, err := BrokeredToolSchemaDigest(tool); err != nil {
+				add("%s.schemaDigest could not be checked: %v", path, err)
+			} else if tool.SchemaDigest != actual {
+				add("%s.schemaDigest does not match the safe schema", path)
+			}
+		}
+	}
+}
+
+func validateBrokeredToolParameters(add func(string, ...any), path string, parameters map[string]any) {
+	if parameters == nil {
+		add("%s must be a JSON Schema object", path)
+		return
+	}
+	if _, err := json.Marshal(parameters); err != nil {
+		add("%s must be JSON serializable: %v", path, err)
+		return
+	}
+	normalized, ok := normalizeJSONContainers(parameters).(map[string]any)
+	if !ok {
+		add("%s must be a JSON Schema object", path)
+		return
+	}
+	canonical, err := canonicalJSON(normalized)
+	if err != nil {
+		add("%s must be JSON serializable: %v", path, err)
+		return
+	}
+	if len(canonical) > 64*1024 {
+		add("%s schema is too large", path)
+	}
+	schema := normalized
+	validateJSONSchemaSubset(add, path, schema)
+	if typ, _ := schema[jsonSchemaTypeKey].(string); typ != jsonSchemaTypeObject {
+		add("%s must set type: object", path)
+	}
+	rejectUnsafeBrokeredSchemaKeys(add, path, schema)
+	validateBrokeredSchemaValueConstraints(add, path, schema)
+}
+
+func normalizeJSONContainers(value any) any {
+	if value == nil {
+		return nil
+	}
+	rv := reflect.ValueOf(value)
+	for rv.Kind() == reflect.Interface || rv.Kind() == reflect.Pointer {
+		if rv.IsNil() {
+			return nil
+		}
+		rv = rv.Elem()
+	}
+	if number, ok := rv.Interface().(json.Number); ok {
+		return number
+	}
+	switch rv.Kind() {
+	case reflect.Map:
+		if rv.IsNil() {
+			return nil
+		}
+		if rv.Type().Key().Kind() != reflect.String {
+			return value
+		}
+		out := make(map[string]any, rv.Len())
+		iter := rv.MapRange()
+		for iter.Next() {
+			out[iter.Key().String()] = normalizeJSONContainers(iter.Value().Interface())
+		}
+		return out
+	case reflect.Slice:
+		if rv.IsNil() {
+			return nil
+		}
+		if rv.Type().Elem().Kind() == reflect.Uint8 {
+			return value
+		}
+		out := make([]any, rv.Len())
+		for i := 0; i < rv.Len(); i++ {
+			out[i] = normalizeJSONContainers(rv.Index(i).Interface())
+		}
+		return out
+	case reflect.Array:
+		out := make([]any, rv.Len())
+		for i := 0; i < rv.Len(); i++ {
+			out[i] = normalizeJSONContainers(rv.Index(i).Interface())
+		}
+		return out
+	case reflect.Bool:
+		return rv.Bool()
+	case reflect.String:
+		return rv.String()
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return rv.Int()
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return rv.Uint()
+	case reflect.Float32:
+		return float32(rv.Float())
+	case reflect.Float64:
+		return rv.Float()
+	default:
+		return rv.Interface()
+	}
+}
+
+func hasAnySchemaKey(schema map[string]any, keys ...string) bool {
+	for _, key := range keys {
+		if _, ok := schema[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func validateJSONSchemaSubset(add func(string, ...any), path string, schema map[string]any) {
+	for _, key := range []string{"allOf", "anyOf", "oneOf", "not", "$ref", "if", "then", "else", "contains", "minContains", "maxContains", "propertyNames", "dependentSchemas", "patternProperties", "unevaluatedProperties", "unevaluatedItems", "prefixItems", "uniqueItems"} {
+		if _, ok := schema[key]; ok {
+			add("%s.%s is not supported for deterministic brokered tool schemas", path, key)
+		}
+	}
+	if value, ok := schema[jsonSchemaTypeKey]; ok {
+		validateJSONSchemaType(add, path, value)
+	}
+	if properties, ok := schema["properties"]; ok {
+		props, ok := properties.(map[string]any)
+		if !ok {
+			add("%s.properties must be an object", path)
+		} else {
+			for name, child := range props {
+				childSchema, ok := child.(map[string]any)
+				if !ok {
+					add("%s.properties.%s must be a JSON Schema object", path, name)
+					continue
+				}
+				validateJSONSchemaSubset(add, path+".properties."+name, childSchema)
+			}
+		}
+	}
+	if items, ok := schema["items"]; ok {
+		switch typed := items.(type) {
+		case map[string]any:
+			validateJSONSchemaSubset(add, path+".items", typed)
+		case []any:
+			add("%s.items array form is not supported for brokered tool schemas", path)
+		default:
+			add("%s.items must be an object", path)
+		}
+	}
+	if required, ok := schema[jsonSchemaRequiredKey]; ok && !isStringArray(required) {
+		add("%s.required must be a string array", path)
+	}
+	if dependentRequired, ok := schema[jsonSchemaDependentRequiredKey]; ok {
+		values, ok := dependentRequired.(map[string]any)
+		if !ok {
+			add("%s.dependentRequired must be an object", path)
+		} else {
+			for name, value := range values {
+				if !isStringArray(value) {
+					add("%s.dependentRequired.%s must be a string array", path, name)
+				}
+			}
+		}
+	}
+	if enumValue, ok := schema[jsonSchemaEnumKey]; ok {
+		items, ok := enumValue.([]any)
+		if !ok {
+			add("%s.enum must be an array", path)
+		} else if len(items) == 0 {
+			add("%s.enum must contain at least one value", path)
+		}
+	}
+	if _, ok := schema["pattern"]; ok {
+		add("%s.pattern is not supported for deterministic brokered tool schemas", path)
+	}
+	if additional, ok := schema["additionalProperties"]; ok {
+		switch typed := additional.(type) {
+		case bool:
+		case map[string]any:
+			validateJSONSchemaSubset(add, path+".additionalProperties", typed)
+		default:
+			add("%s.additionalProperties must be a boolean or object", path)
+		}
+	}
+	if hasAnySchemaKey(schema, jsonSchemaEnumKey, "const", "default") && hasAnySchemaKey(schema, jsonSchemaMinimumKey, "maximum", "exclusiveMinimum", "exclusiveMaximum", "minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties", "pattern") {
+		add("%s combines enum/const/default with constraints unsupported by deterministic brokered synthesis", path)
+	}
+	if _, ok := schema["multipleOf"]; ok {
+		add("%s.multipleOf is not supported for deterministic brokered tool schemas", path)
+	}
+	for _, key := range []string{jsonSchemaMinimumKey, jsonSchemaMaximumKey, "exclusiveMinimum", "exclusiveMaximum"} {
+		if value, ok := schema[key]; ok {
+			if !isFiniteJSONNumber(value) {
+				add("%s.%s must be a number", path, key)
+			}
+		}
+	}
+	for _, key := range []string{"minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties"} {
+		if value, ok := schema[key]; ok {
+			if !isNonNegativeJSONInteger(value) {
+				add("%s.%s must be a non-negative integer", path, key)
+			}
+		}
+	}
+}
+
+func isFiniteJSONNumber(value any) bool {
+	switch typed := value.(type) {
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return true
+	case float32:
+		return !math.IsNaN(float64(typed)) && !math.IsInf(float64(typed), 0)
+	case float64:
+		return !math.IsNaN(typed) && !math.IsInf(typed, 0)
+	case json.Number:
+		number, ok := parseJSONNumber(typed)
+		return ok && jsonNumberIsRepresentable(typed, number)
+	default:
+		return false
+	}
+}
+
+func isNonNegativeJSONInteger(value any) bool {
+	switch typed := value.(type) {
+	case int:
+		return typed >= 0
+	case int8:
+		return typed >= 0
+	case int16:
+		return typed >= 0
+	case int32:
+		return typed >= 0
+	case int64:
+		return typed >= 0
+	case uint, uint8, uint16, uint32, uint64:
+		return true
+	case float32:
+		number := float64(typed)
+		return !math.IsNaN(number) && !math.IsInf(number, 0) && number >= 0 && math.Trunc(number) == number
+	case float64:
+		return !math.IsNaN(typed) && !math.IsInf(typed, 0) && typed >= 0 && math.Trunc(typed) == typed
+	case json.Number:
+		number, ok := parseJSONNumber(typed)
+		return ok && number.Sign() >= 0 && jsonNumberIsExactInteger(typed, number)
+	default:
+		return false
+	}
+}
+
+func parseJSONNumber(value json.Number) (*big.Rat, bool) {
+	raw := value.String()
+	if !json.Valid([]byte(raw)) {
+		return nil, false
+	}
+	return new(big.Rat).SetString(raw)
+}
+
+func jsonNumberIsExactInteger(value json.Number, number *big.Rat) bool {
+	return number.IsInt() && jsonNumberIsRepresentable(value, number)
+}
+
+func jsonNumberIsRepresentable(value json.Number, number *big.Rat) bool {
+	raw := value.String()
+	if !strings.ContainsAny(raw, ".eE") {
+		return true
+	}
+	parsed, err := strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+		return false
+	}
+	roundTrip, ok := new(big.Rat).SetString(strconv.FormatFloat(parsed, 'g', -1, 64))
+	return ok && roundTrip.Cmp(number) == 0
+}
+
+func validateJSONSchemaType(add func(string, ...any), path string, value any) {
+	if value == nil {
+		return
+	}
+	valid := func(v string) bool {
+		switch v {
+		case jsonSchemaTypeObject, jsonSchemaTypeString, jsonSchemaTypeInteger, jsonSchemaTypeNumber, jsonSchemaTypeBoolean, jsonSchemaTypeArray, jsonSchemaTypeNull:
+			return true
+		default:
+			return false
+		}
+	}
+	switch typed := value.(type) {
+	case string:
+		if !valid(typed) {
+			add("%s.type %q is not supported", path, typed)
+		}
+	case []any:
+		if len(typed) == 0 {
+			add("%s.type must not be empty", path)
+		}
+		for _, item := range typed {
+			text, ok := item.(string)
+			if !ok {
+				add("%s.type must contain only strings", path)
+				continue
+			}
+			if !valid(text) {
+				add("%s.type %q is not supported", path, text)
+			}
+		}
+	default:
+		add("%s.type must be a string or string array", path)
+	}
+}
+
+func validateBrokeredSchemaValueConstraints(add func(string, ...any), path string, value any) {
+	schema, ok := value.(map[string]any)
+	if !ok {
+		return
+	}
+	types, ok := brokeredSchemaTypes(add, path, schema)
+	if ok && len(types) > 0 {
+		for _, keyword := range []string{"const", jsonSchemaDefaultKey} {
+			if child, exists := schema[keyword]; exists && !matchesAnySchemaType(child, types) {
+				add("%s.%s must match the declared JSON Schema type", path, keyword)
+			}
+		}
+		if enum, exists := schema[jsonSchemaEnumKey]; exists {
+			items, ok := enum.([]any)
+			if !ok {
+				add("%s.enum must be an array", path)
+			} else {
+				for i, item := range items {
+					if !matchesAnySchemaType(item, types) {
+						add("%s.enum[%d] must match the declared JSON Schema type", path, i)
+					}
+				}
+			}
+		}
+	}
+	if properties, ok := schema["properties"].(map[string]any); ok {
+		for name, child := range properties {
+			if childSchema, ok := child.(map[string]any); ok {
+				validateBrokeredSchemaValueConstraints(add, path+".properties."+name, childSchema)
+			}
+		}
+	}
+	if items, ok := schema["items"].(map[string]any); ok {
+		validateBrokeredSchemaValueConstraints(add, path+".items", items)
+	} else if tupleItems, ok := schema["items"].([]any); ok {
+		for i, child := range tupleItems {
+			if childSchema, ok := child.(map[string]any); ok {
+				validateBrokeredSchemaValueConstraints(add, fmt.Sprintf("%s.items[%d]", path, i), childSchema)
+			}
+		}
+	}
+	if additional, ok := schema["additionalProperties"].(map[string]any); ok {
+		validateBrokeredSchemaValueConstraints(add, path+".additionalProperties", additional)
+	}
+}
+
+func brokeredSchemaTypes(add func(string, ...any), path string, schema map[string]any) ([]string, bool) {
+	raw, exists := schema[jsonSchemaTypeKey]
+	if !exists {
+		return nil, true
+	}
+	switch typed := raw.(type) {
+	case string:
+		if !isSupportedBrokeredSchemaType(typed) {
+			add("%s.type %q is not supported", path, typed)
+			return nil, false
+		}
+		return []string{typed}, true
+	case []any:
+		out := make([]string, 0, len(typed))
+		for _, item := range typed {
+			name, ok := item.(string)
+			if !ok || !isSupportedBrokeredSchemaType(name) {
+				add("%s.type must be a string or string array", path)
+				return nil, false
+			}
+			out = append(out, name)
+		}
+		return out, true
+	default:
+		add("%s.type must be a string or string array", path)
+		return nil, false
+	}
+}
+
+func isSupportedBrokeredSchemaType(schemaType string) bool {
+	switch schemaType {
+	case "null", "boolean", "integer", jsonSchemaTypeNumber, jsonSchemaTypeString, "array", jsonSchemaTypeObject:
+		return true
+	default:
+		return false
+	}
+}
+
+func matchesAnySchemaType(value any, types []string) bool {
+	for _, schemaType := range types {
+		if matchesSchemaType(value, schemaType) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchesSchemaType(value any, schemaType string) bool {
+	switch schemaType {
+	case jsonSchemaTypeNull:
+		return value == nil
+	case jsonSchemaTypeBoolean:
+		_, ok := value.(bool)
+		return ok
+	case jsonSchemaTypeInteger:
+		switch typed := value.(type) {
+		case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+			return true
+		case float64:
+			return !math.IsNaN(typed) && !math.IsInf(typed, 0) && typed == math.Trunc(typed) && math.Abs(typed) <= maxExactJSONFloatInteger
+		case json.Number:
+			number, ok := parseJSONNumber(typed)
+			return ok && jsonNumberIsExactInteger(typed, number)
+		default:
+			return false
+		}
+	case jsonSchemaTypeNumber:
+		switch typed := value.(type) {
+		case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+			return true
+		case float32:
+			return !math.IsNaN(float64(typed)) && !math.IsInf(float64(typed), 0)
+		case float64:
+			return !math.IsNaN(typed) && !math.IsInf(typed, 0)
+		case json.Number:
+			number, ok := parseJSONNumber(typed)
+			return ok && jsonNumberIsRepresentable(typed, number)
+		default:
+			return false
+		}
+	case jsonSchemaTypeString:
+		_, ok := value.(string)
+		return ok
+	case jsonSchemaTypeArray:
+		_, ok := value.([]any)
+		return ok
+	case jsonSchemaTypeObject:
+		_, ok := value.(map[string]any)
+		return ok
+	default:
+		return false
+	}
+}
+
+func isStringArray(value any) bool {
+	switch typed := value.(type) {
+	case []string:
+		return true
+	case []any:
+		for _, item := range typed {
+			if _, ok := item.(string); !ok {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func rejectUnsafeBrokeredSchemaKeys(add func(string, ...any), path string, value any) {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, child := range typed {
+			childPath := path + "." + key
+			if isUnsafeBrokeredKey(key) {
+				add("%s is not safe for brokered tool schemas", childPath)
+			}
+			if key == jsonSchemaRequiredKey || key == jsonSchemaDependentRequiredKey {
+				rejectUnsafeBrokeredPropertyNameValues(add, childPath, child)
+			}
+			rejectUnsafeBrokeredSchemaKeys(add, childPath, child)
+		}
+	case []any:
+		for i, child := range typed {
+			rejectUnsafeBrokeredSchemaKeys(add, fmt.Sprintf("%s[%d]", path, i), child)
+		}
+	case []map[string]any:
+		for i, child := range typed {
+			rejectUnsafeBrokeredSchemaKeys(add, fmt.Sprintf("%s[%d]", path, i), child)
+		}
+	case string:
+		if hasUnsafeBrokeredText(typed) {
+			add("%s contains URL or secret-like material", path)
+		}
+	}
+}
+
+func rejectUnsafeBrokeredPropertyNameValues(add func(string, ...any), path string, value any) {
+	switch typed := value.(type) {
+	case string:
+		if isUnsafeBrokeredKey(typed) {
+			add("%s value %q is not safe for brokered tool schemas", path, typed)
+		}
+	case []any:
+		for i, child := range typed {
+			rejectUnsafeBrokeredPropertyNameValues(add, fmt.Sprintf("%s[%d]", path, i), child)
+		}
+	case []string:
+		for i, child := range typed {
+			rejectUnsafeBrokeredPropertyNameValues(add, fmt.Sprintf("%s[%d]", path, i), child)
+		}
+	case map[string]any:
+		for key, child := range typed {
+			childPath := path + "." + key
+			if isUnsafeBrokeredKey(key) {
+				add("%s is not safe for brokered tool schemas", childPath)
+			}
+			rejectUnsafeBrokeredPropertyNameValues(add, childPath, child)
+		}
+	}
+}
+
+func isBrokeredToolName(value string) bool {
+	if len(value) == 0 || len(value) > 64 {
+		return false
+	}
+	for _, r := range value {
+		isAlpha := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
+		isDigit := r >= '0' && r <= '9'
+		if !isAlpha && !isDigit && r != '_' && r != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func isSchemaDigest(value string) bool {
+	if len(value) != len("sha256:")+64 || !strings.HasPrefix(value, "sha256:") || value != strings.ToLower(value) {
+		return false
+	}
+	_, err := hex.DecodeString(strings.TrimPrefix(value, "sha256:"))
+	return err == nil
+}
+
+func hasUnsafeBrokeredText(value string) bool {
+	lowered := strings.ToLower(value)
+	normalized := normalizeKey(lowered)
+	return containsSecretPrefix(value) || strings.Contains(value, "://") || containsBrokeredWord(lowered, "bearer") || containsBrokeredWord(lowered, "basic") || strings.Contains(lowered, "authorization") || strings.Contains(lowered, "secret") || strings.Contains(lowered, "token") || strings.Contains(lowered, "password") || strings.Contains(lowered, "passphrase") || strings.Contains(lowered, "pwd") || strings.Contains(lowered, "api key") || strings.Contains(lowered, "apikey") || strings.Contains(normalized, "apikey") || strings.Contains(normalized, "xapikey") || strings.Contains(normalized, "subscriptionkey") || strings.Contains(normalized, "xfunctionskey") || strings.Contains(lowered, brokeredUnsafeCookieKey) || strings.Contains(lowered, "set-cookie") || strings.Contains(lowered, "x-api-key") || strings.Contains(lowered, credentialHeaderAPIKey) || strings.Contains(lowered, "subscription-key") || strings.Contains(lowered, "x-functions-key") || strings.Contains(lowered, "ocp-apim-subscription-key") || strings.Contains(lowered, "private key") || strings.Contains(lowered, "privatekey") || strings.Contains(lowered, "key material") || strings.Contains(lowered, ".svc") || strings.Contains(lowered, "cluster.local")
+}
+
+func containsBrokeredWord(value string, word string) bool {
+	start := 0
+	for {
+		idx := strings.Index(value[start:], word)
+		if idx < 0 {
+			return false
+		}
+		idx += start
+		after := idx + len(word)
+		beforeOK := idx == 0 || !isBrokeredWordByte(value[idx-1])
+		afterOK := after == len(value) || !isBrokeredWordByte(value[after])
+		if beforeOK && afterOK {
+			return true
+		}
+		start = after
+	}
+}
+
+func isBrokeredWordByte(value byte) bool {
+	return (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') || (value >= '0' && value <= '9') || value == '_'
+}
+
+func isUnsafeBrokeredKey(value string) bool {
+	normalized := normalizeKey(value)
+	switch normalized {
+	case "auth", "authorization", "apikey", "bearer", brokeredUnsafeCookieKey, "credential", "credentials", "endpoint", "endpoints", "executionendpoint", "executionurl", "header", "headers", "ocpapimsubscriptionkey", "password", "proxyauthorization", "secret", "secretref", "setcookie", "subscriptionkey", "token", "tokens", "url", "urls", "xapikey", "xfunctionskey":
+		return true
+	}
+	authLike := (strings.HasPrefix(normalized, "auth") && !strings.HasPrefix(normalized, "author")) || strings.HasSuffix(normalized, "auth")
+	return authLike || strings.Contains(normalized, "authorization") || strings.Contains(normalized, "header") || strings.Contains(normalized, "url") || strings.Contains(normalized, "endpoint") || strings.Contains(normalized, brokeredUnsafeCookieKey) || strings.Contains(normalized, "secret") || strings.Contains(normalized, "token") || strings.Contains(normalized, "password") || strings.Contains(normalized, "passphrase") || strings.Contains(normalized, "pwd") || strings.Contains(normalized, "apikey") || strings.Contains(normalized, "accesskey") || strings.Contains(normalized, "privatekey") || strings.Contains(normalized, "keymaterial") || strings.Contains(normalized, "credential") || strings.Contains(normalized, "executionurl") || strings.Contains(normalized, "executionendpoint")
+}
+
+func normalizeKey(value string) string {
+	var b strings.Builder
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r + ('a' - 'A'))
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func canonicalNumber(value float64, bitSize int) ([]byte, error) {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return nil, fmt.Errorf("JSON numbers must be finite")
+	}
+	return []byte(strconv.FormatFloat(value, 'f', -1, bitSize)), nil
+}
+
+func canonicalJSONString(value string) ([]byte, error) {
+	var encoded bytes.Buffer
+	encoder := json.NewEncoder(&encoded)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		return nil, err
+	}
+	return unescapeJSONLineSeparators(bytes.TrimSuffix(encoded.Bytes(), []byte("\n"))), nil
+}
+
+func unescapeJSONLineSeparators(encoded []byte) []byte {
+	out := make([]byte, 0, len(encoded))
+	for i := 0; i < len(encoded); {
+		if encoded[i] != '\\' {
+			out = append(out, encoded[i])
+			i++
+			continue
+		}
+		start := i
+		for i < len(encoded) && encoded[i] == '\\' {
+			i++
+		}
+		runLength := i - start
+		if runLength%2 == 1 && i+5 <= len(encoded) && encoded[i] == 'u' {
+			escape := string(encoded[i : i+5])
+			if escape == "u2028" || escape == "u2029" {
+				out = append(out, encoded[start:i-1]...)
+				if escape == "u2028" {
+					out = append(out, []byte("\u2028")...)
+				} else {
+					out = append(out, []byte("\u2029")...)
+				}
+				i += 5
+				continue
+			}
+		}
+		out = append(out, encoded[start:i]...)
+	}
+	return out
+}
+
+func canonicalJSONNumberString(value string) (string, error) {
+	if !json.Valid([]byte(value)) {
+		return "", fmt.Errorf("invalid JSON number %q", value)
+	}
+	number, ok := new(big.Rat).SetString(value)
+	if !ok {
+		return "", fmt.Errorf("invalid JSON number %q", value)
+	}
+	if number.IsInt() {
+		if number.Sign() == 0 && strings.HasPrefix(value, "-") {
+			return "-0", nil
+		}
+		return number.Num().String(), nil
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return "", err
+	}
+	if math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+		return "", fmt.Errorf("JSON numbers must be finite")
+	}
+	roundTrip, ok := new(big.Rat).SetString(strconv.FormatFloat(parsed, 'g', -1, 64))
+	if !ok || roundTrip.Cmp(number) != 0 {
+		return "", fmt.Errorf("JSON number %q cannot be represented exactly", value)
+	}
+	return strconv.FormatFloat(parsed, 'f', -1, 64), nil
+}
+
+func canonicalJSON(value any) ([]byte, error) {
+	switch typed := value.(type) {
+	case nil:
+		return []byte("null"), nil
+	case bool:
+		if typed {
+			return []byte("true"), nil
+		}
+		return []byte("false"), nil
+	case string:
+		return canonicalJSONString(typed)
+	case int:
+		return []byte(strconv.FormatInt(int64(typed), 10)), nil
+	case int8:
+		return []byte(strconv.FormatInt(int64(typed), 10)), nil
+	case int16:
+		return []byte(strconv.FormatInt(int64(typed), 10)), nil
+	case int32:
+		return []byte(strconv.FormatInt(int64(typed), 10)), nil
+	case int64:
+		return []byte(strconv.FormatInt(typed, 10)), nil
+	case uint:
+		return []byte(strconv.FormatUint(uint64(typed), 10)), nil
+	case uint8:
+		return []byte(strconv.FormatUint(uint64(typed), 10)), nil
+	case uint16:
+		return []byte(strconv.FormatUint(uint64(typed), 10)), nil
+	case uint32:
+		return []byte(strconv.FormatUint(uint64(typed), 10)), nil
+	case uint64:
+		return []byte(strconv.FormatUint(typed, 10)), nil
+	case float32:
+		return canonicalNumber(float64(typed), 32)
+	case float64:
+		return canonicalNumber(typed, 64)
+	case json.Number:
+		formatted, err := canonicalJSONNumberString(typed.String())
+		if err != nil {
+			return nil, err
+		}
+		return []byte(formatted), nil
+	case []any:
+		return canonicalJSONArray(typed)
+	case []string:
+		items := make([]any, len(typed))
+		for i, item := range typed {
+			items[i] = item
+		}
+		return canonicalJSONArray(items)
+	case []int:
+		items := make([]any, len(typed))
+		for i, item := range typed {
+			items[i] = item
+		}
+		return canonicalJSONArray(items)
+	case []float64:
+		items := make([]any, len(typed))
+		for i, item := range typed {
+			items[i] = item
+		}
+		return canonicalJSONArray(items)
+	case []bool:
+		items := make([]any, len(typed))
+		for i, item := range typed {
+			items[i] = item
+		}
+		return canonicalJSONArray(items)
+	case map[string]any:
+		return canonicalJSONObject(typed)
+	default:
+		return nil, fmt.Errorf("unsupported JSON value %T", value)
+	}
+}
+
+func canonicalJSONArray(items []any) ([]byte, error) {
+	var out bytes.Buffer
+	out.WriteByte('[')
+	for i, item := range items {
+		if i > 0 {
+			out.WriteByte(',')
+		}
+		encoded, err := canonicalJSON(item)
+		if err != nil {
+			return nil, err
+		}
+		out.Write(encoded)
+	}
+	out.WriteByte(']')
+	return out.Bytes(), nil
+}
+
+func canonicalJSONObject(object map[string]any) ([]byte, error) {
+	keys := make([]string, 0, len(object))
+	for key := range object {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var out bytes.Buffer
+	out.WriteByte('{')
+	for i, key := range keys {
+		if i > 0 {
+			out.WriteByte(',')
+		}
+		encodedKey, err := canonicalJSONString(key)
+		if err != nil {
+			return nil, err
+		}
+		encodedValue, err := canonicalJSON(object[key])
+		if err != nil {
+			return nil, err
+		}
+		out.Write(encodedKey)
+		out.WriteByte(':')
+		out.Write(encodedValue)
+	}
+	out.WriteByte('}')
+	return out.Bytes(), nil
+}
+
+// BrokeredToolSchemaDigest digests the exact safe schema surface AgentKit exposes to a model.
+func BrokeredToolSchemaDigest(tool BrokeredTool) (string, error) {
+	payload := map[string]any{
+		"name":                       tool.Name,
+		brokeredDigestDescriptionKey: tool.Description,
+		"brokeredClass":              tool.BrokeredClass,
+		"parameters":                 tool.Parameters,
+	}
+	encodedPayload, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	var normalizedPayload map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(encodedPayload))
+	decoder.UseNumber()
+	if err := decoder.Decode(&normalizedPayload); err != nil {
+		return "", err
+	}
+	canonical, err := canonicalJSON(normalizedPayload)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(canonical)
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 
 func validateContext(add func(string, ...any), ctx Context, tools []Tool) {
@@ -454,7 +1337,7 @@ func isHTTPHeaderName(v string) bool {
 
 func isCredentialHeaderName(name string) bool {
 	switch strings.ToLower(name) {
-	case "authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key", "api-key", "ocp-apim-subscription-key", "subscription-key", "x-functions-key":
+	case "authorization", "proxy-authorization", brokeredUnsafeCookieKey, "set-cookie", "x-api-key", credentialHeaderAPIKey, "ocp-apim-subscription-key", "subscription-key", "x-functions-key":
 		return true
 	default:
 		return false
@@ -464,6 +1347,15 @@ func isCredentialHeaderName(name string) bool {
 func hasSecretPrefix(v string) bool {
 	for _, p := range []string{"sk-", "sk_", "ghp_", "github_pat_", "xoxb-", "AKIA"} {
 		if strings.HasPrefix(v, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsSecretPrefix(v string) bool {
+	for _, p := range []string{"sk-", "sk_", "ghp_", "github_pat_", "xoxb-", "AKIA"} {
+		if strings.Contains(v, p) {
 			return true
 		}
 	}

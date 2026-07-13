@@ -78,6 +78,7 @@ class BrokeredToolDefinition:
     description: str
     brokered_class: Literal["read", "write", "coordination"]
     parameters: Mapping[str, Any] = field(default_factory=dict)
+    schema_digest: str | None = None
 
 
 @dataclass(frozen=True)

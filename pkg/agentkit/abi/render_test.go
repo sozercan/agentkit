@@ -1,6 +1,8 @@
 package abi
 
 import (
+	"encoding/json"
+	"math"
 	"os"
 	"strings"
 	"testing"
@@ -16,6 +18,15 @@ import (
 const (
 	testAPIKeyEnvName = "OPENAI_API_KEY" //nolint:gosec // G101: env var NAME, not a credential
 	testInstructions  = "Be helpful and cite sources."
+)
+
+const (
+	jsonSchemaTypeKey       = "type"
+	jsonSchemaTypeObject    = "object"
+	jsonSchemaTypeNumber    = "number"
+	jsonSchemaPropertiesKey = "properties"
+	jsonSchemaMinimumKey    = "minimum"
+	jsonSchemaDefaultKey    = "default"
 )
 
 func sampleConfig() *config.AgentConfig {
@@ -243,5 +254,106 @@ func TestRenderAgentYAMLIncludesModelWorkloadIdentityAuth(t *testing.T) {
 		if !strings.Contains(s, want) {
 			t.Fatalf("rendered agent.yaml missing %q\n---\n%s", want, s)
 		}
+	}
+}
+
+func TestRenderAgentYAMLIncludesBrokeredTools(t *testing.T) {
+	cfg := sampleConfig()
+	cfg.Tools = nil
+	cfg.BrokeredTools = []config.BrokeredTool{{
+		Name:          "check-network-telemetry",
+		Description:   "Read telemetry.",
+		BrokeredClass: config.BrokeredClassRead,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey: jsonSchemaTypeObject,
+			jsonSchemaPropertiesKey: map[string]any{
+				"site":        map[string]any{jsonSchemaTypeKey: "string", jsonSchemaMinimumKey: 0.000001},
+				"typedFloats": map[string]float64{jsonSchemaMinimumKey: 0.000001},
+				"empty":       map[string]any{},
+			},
+		},
+	}}
+	out, err := Render(effective.FromConfig(cfg, testInstructions))
+	if err != nil {
+		t.Fatalf("render error: %v", err)
+	}
+	s := string(out)
+	for _, want := range []string{"brokeredTools:", "name: check-network-telemetry", "description: Read telemetry.", "brokeredClass: read", "properties:", "site:", "minimum: 0.000001", "typedFloats:", "empty: {}"} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("rendered agent.yaml missing %q\n---\n%s", want, s)
+		}
+	}
+	for _, never := range []string{"url:", "secretRef:", "headers:", "auth" + ":", "1e-06"} {
+		if strings.Contains(s, never) {
+			t.Fatalf("rendered brokered agent.yaml leaked %q\n---\n%s", never, s)
+		}
+	}
+}
+
+func TestRenderAgentYAMLFormatsJSONNumberBrokeredSchemaValuesAsNumbers(t *testing.T) {
+	cfg := sampleConfig()
+	cfg.Tools = nil
+	cfg.BrokeredTools = []config.BrokeredTool{{
+		Name:          "numeric-tool",
+		Description:   "Read numeric data.",
+		BrokeredClass: config.BrokeredClassRead,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey: jsonSchemaTypeObject,
+			jsonSchemaPropertiesKey: map[string]any{
+				"small": map[string]any{jsonSchemaTypeKey: jsonSchemaTypeNumber, jsonSchemaMinimumKey: json.Number("1e-7")},
+			},
+		},
+	}}
+
+	out, err := Render(effective.FromConfig(cfg, testInstructions))
+	if err != nil {
+		t.Fatalf("render error: %v", err)
+	}
+	if !strings.Contains(string(out), "minimum: 0.0000001") || strings.Contains(string(out), "1e-7") {
+		t.Fatalf("rendered agent.yaml did not preserve json.Number as fixed YAML number\n---\n%s", out)
+	}
+}
+
+func TestRenderAgentYAMLPreservesNegativeZeroBrokeredSchemaFloats(t *testing.T) {
+	cfg := sampleConfig()
+	cfg.Tools = nil
+	tool := config.BrokeredTool{
+		Name:          "negative-zero-tool",
+		Description:   "Preserve negative zero.",
+		BrokeredClass: config.BrokeredClassRead,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey: jsonSchemaTypeObject,
+			jsonSchemaPropertiesKey: map[string]any{
+				"offset":        map[string]any{jsonSchemaTypeKey: jsonSchemaTypeNumber, jsonSchemaDefaultKey: math.Copysign(0, -1)},
+				"jsonOffset":    map[string]any{jsonSchemaTypeKey: jsonSchemaTypeNumber, jsonSchemaDefaultKey: json.Number("-0e0")},
+				"largeInteger":  map[string]any{jsonSchemaTypeKey: "integer", jsonSchemaDefaultKey: json.Number("9007199254740995.0")},
+				"typedNested":   map[string][]float64{"enum": {math.Copysign(0, -1)}},
+				"typedNil":      map[string]any{jsonSchemaDefaultKey: map[string]string(nil)},
+				"typedNilSlice": map[string]any{jsonSchemaDefaultKey: []string(nil)},
+			},
+		},
+	}
+	digest, err := config.BrokeredToolSchemaDigest(tool)
+	if err != nil {
+		t.Fatalf("digest error: %v", err)
+	}
+	tool.SchemaDigest = digest
+	cfg.BrokeredTools = []config.BrokeredTool{tool}
+
+	out, err := Render(effective.FromConfig(cfg, testInstructions))
+	if err != nil {
+		t.Fatalf("render error: %v", err)
+	}
+	if strings.Count(string(out), "default: -0.0") != 2 {
+		t.Fatalf("rendered agent.yaml did not preserve negative zero as a float\n---\n%s", out)
+	}
+	if !strings.Contains(string(out), "default: 9007199254740995") || strings.Contains(string(out), "9007199254740995.0") {
+		t.Fatalf("rendered agent.yaml did not preserve a large integral decimal as an integer\n---\n%s", out)
+	}
+	if strings.Count(string(out), yamlNegativeZero) != 3 {
+		t.Fatalf("rendered agent.yaml did not normalize negative zero in typed nested containers\n---\n%s", out)
+	}
+	if strings.Count(string(out), "default: null") != 2 {
+		t.Fatalf("rendered agent.yaml did not preserve typed nil containers as null\n---\n%s", out)
 	}
 }

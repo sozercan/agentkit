@@ -49,3 +49,40 @@ A new single-agent adapter should provide:
 
 Adapters remain separate images with separate framework dependencies, while this
 package is installed into each image as the shared façade/runtime core.
+
+
+## Brokered tool schema export
+
+`agentkit-serve-common` includes a small deployment helper for Foundry hosted
+Orka-brokered mode:
+
+```sh
+agentkit-brokered-tools ./orka-tools/*.yaml -o brokered-tools.generated.yaml
+```
+
+It reads Orka Tool CRD YAML/JSON documents and writes a safe `brokeredTools:`
+`agent.yaml` fragment containing only name, description, brokered class, JSON
+parameters schema, and optional schema digest. Execution URLs, auth headers,
+Secret refs, tokens, and other credential-shaped schema fields are rejected or
+omitted before the fragment is model-visible.
+
+Inputs must use the canonical `core.orka.ai/v1alpha1` `Tool` shape. The exporter
+reads `spec.brokeredToolClass`; unclassified tools are not brokered and are
+skipped, and an input set with no classified tools fails rather than defaulting
+their class to `read`.
+
+
+## Foundry brokered conformance app
+
+The common package also installs `agentkit-foundry-conformance`, a tiny
+Azure Responses SDK app for Phase A0 hosted brokered smokes. It serves
+`/readiness` and `/responses`, emits a deterministic `conformance_read`
+`function_call`, and completes after a matching `function_call_output`
+continuation.
+
+Install the optional `foundry-conformance` extra when using this SDK-backed
+entrypoint; normal runtime adapter images install the common package without it.
+
+```sh
+uv run --extra foundry-conformance agentkit-foundry-conformance --host 0.0.0.0 --port 8088
+```

@@ -1,0 +1,11 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/microsoft/AgentSchema/refs/heads/main/schemas/v1.0/ContainerAgent.yaml
+# Copy this to agent.yaml inside an azd project and set image to the pushed tag.
+kind: hosted
+name: agentkit-foundry-brokered-conformance
+image: docker.io/YOUR_ORG/agentkit-foundry-brokered-conformance:TAG
+protocols:
+  - protocol: responses
+    version: 2.0.0
+resources:
+  cpu: "0.25"
+  memory: 0.5Gi

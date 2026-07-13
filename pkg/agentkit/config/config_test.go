@@ -1,10 +1,18 @@
 package config
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
 	"github.com/sozercan/agentkit/pkg/agentkit/runtimes"
+)
+
+const (
+	safeLookupToolName      = "safe_lookup"
+	jsonSchemaPropertiesKey = "properties"
+	brokeredSiteField       = "site"
+	brokeredSafeDescription = "safe schema"
 )
 
 // TestKindProbeRejectsKindlessFile is the regression guard for the AIKit
@@ -442,6 +450,231 @@ expose:
 	}
 	if verr := cfg.Validate(); verr != nil {
 		t.Fatalf("valid remote MCP tool failed validation: %v", verr)
+	}
+}
+
+func TestValidateRejectsUnsupportedBrokeredSchemaCompositionKeywords(t *testing.T) {
+	for _, keyword := range []string{"allOf", "anyOf", "oneOf", "$ref", "if", "then", "else", "contains", "propertyNames", "dependentSchemas", "patternProperties", "unevaluatedProperties", "uniqueItems"} {
+		cfg := validMinimalConfig()
+		cfg.BrokeredTools = []BrokeredTool{{
+			Name:          safeLookupToolName,
+			Description:   brokeredSafeDescription,
+			BrokeredClass: BrokeredClassRead,
+			Parameters: map[string]any{
+				jsonSchemaTypeKey: jsonSchemaTypeObject,
+				keyword:           []any{},
+			},
+		}}
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "not supported") {
+			t.Fatalf("keyword %q: expected unsupported schema rejection, got: %v", keyword, err)
+		}
+	}
+}
+
+func TestValidateAcceptsBrokeredPropertyNamedType(t *testing.T) {
+	cfg := validMinimalConfig()
+	cfg.BrokeredTools = []BrokeredTool{{
+		Name:          safeLookupToolName,
+		Description:   brokeredSafeDescription,
+		BrokeredClass: BrokeredClassRead,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey: jsonSchemaTypeObject,
+			jsonSchemaPropertiesKey: map[string]any{
+				jsonSchemaTypeKey: map[string]any{jsonSchemaTypeKey: jsonSchemaTypeString},
+			},
+		},
+	}}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("property named type should validate: %v", err)
+	}
+}
+
+func TestValidateRejectsInvalidBrokeredSchemaTypeValuesAndDefaults(t *testing.T) {
+	cases := []map[string]any{
+		{jsonSchemaTypeKey: jsonSchemaTypeObject, jsonSchemaPropertiesKey: map[string]any{brokeredSiteField: map[string]any{jsonSchemaTypeKey: nil}}},
+		{jsonSchemaTypeKey: jsonSchemaTypeObject, jsonSchemaPropertiesKey: map[string]any{"n": map[string]any{jsonSchemaTypeKey: jsonSchemaTypeInteger, jsonSchemaDefaultKey: "1"}}},
+		{jsonSchemaTypeKey: jsonSchemaTypeObject, jsonSchemaPropertiesKey: map[string]any{"n": map[string]any{jsonSchemaTypeKey: jsonSchemaTypeInteger, jsonSchemaDefaultKey: 9007199254740993.0}}},
+		{jsonSchemaTypeKey: jsonSchemaTypeObject, jsonSchemaPropertiesKey: map[string]any{brokeredSiteField: map[string]any{jsonSchemaTypeKey: jsonSchemaTypeString, jsonSchemaEnumKey: []any{0, "ok"}}}},
+	}
+	for _, schema := range cases {
+		cfg := validMinimalConfig()
+		cfg.BrokeredTools = []BrokeredTool{{
+			Name:          safeLookupToolName,
+			Description:   brokeredSafeDescription,
+			BrokeredClass: BrokeredClassRead,
+			Parameters:    schema,
+		}}
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("expected invalid schema rejection for %#v", schema)
+		}
+	}
+}
+
+func TestValidateRejectsEmptyBrokeredSchemaEnums(t *testing.T) {
+	cases := []map[string]any{
+		{jsonSchemaTypeKey: jsonSchemaTypeObject, jsonSchemaEnumKey: []any{}},
+		{
+			jsonSchemaTypeKey: jsonSchemaTypeObject,
+			jsonSchemaPropertiesKey: map[string]any{
+				brokeredSiteField: map[string]any{jsonSchemaTypeKey: jsonSchemaTypeString, jsonSchemaEnumKey: []any{}},
+			},
+		},
+	}
+	for _, schema := range cases {
+		cfg := validMinimalConfig()
+		cfg.BrokeredTools = []BrokeredTool{{
+			Name:          safeLookupToolName,
+			Description:   brokeredSafeDescription,
+			BrokeredClass: BrokeredClassRead,
+			Parameters:    schema,
+		}}
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "enum must contain at least one value") {
+			t.Fatalf("expected empty enum rejection for %#v, got: %v", schema, err)
+		}
+	}
+}
+
+func TestValidateAcceptsLargeBrokeredIntegerConstraintsWithoutInt64Narrowing(t *testing.T) {
+	cfg := validMinimalConfig()
+	cfg.BrokeredTools = []BrokeredTool{{
+		Name:          safeLookupToolName,
+		Description:   brokeredSafeDescription,
+		BrokeredClass: BrokeredClassRead,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey: jsonSchemaTypeObject,
+			"minProperties":   1e19,
+		},
+	}}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("large integral JSON Schema constraint should validate: %v", err)
+	}
+
+	cfg.BrokeredTools[0].Parameters["minProperties"] = 1.5
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must be a non-negative integer") {
+		t.Fatalf("fractional JSON Schema constraint should fail validation, got: %v", err)
+	}
+}
+
+func TestValidatePreservesLargeIntegerSchemaValuesBeforeTypeChecking(t *testing.T) {
+	cfg := validMinimalConfig()
+	cfg.BrokeredTools = []BrokeredTool{{
+		Name:          safeLookupToolName,
+		Description:   brokeredSafeDescription,
+		BrokeredClass: BrokeredClassRead,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey: jsonSchemaTypeObject,
+			jsonSchemaPropertiesKey: map[string]any{
+				"n": map[string]any{
+					jsonSchemaTypeKey:    jsonSchemaTypeInteger,
+					jsonSchemaDefaultKey: int64(9007199254740993),
+					jsonSchemaEnumKey:    []any{int64(9007199254740993)},
+				},
+			},
+		},
+	}}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("large integer schema values should validate without float normalization: %v", err)
+	}
+}
+
+func TestValidateNormalizesJSONContainersWithoutChangingScalarMeaning(t *testing.T) {
+	type count int64
+	pointerNumber := json.Number("2.0")
+	namedSchema := map[string]any{jsonSchemaTypeKey: jsonSchemaTypeInteger, jsonSchemaDefaultKey: count(1)}
+	numberSchema := map[string]any{jsonSchemaTypeKey: jsonSchemaTypeInteger, jsonSchemaDefaultKey: json.Number("1.0")}
+	fractionalSchema := map[string]any{jsonSchemaTypeKey: jsonSchemaTypeNumber, jsonSchemaDefaultKey: json.Number("0.1")}
+	properties := map[string]any{
+		"fractional": fractionalSchema,
+		"named":      namedSchema,
+		"number":     numberSchema,
+		"pointer":    map[string]any{jsonSchemaTypeKey: jsonSchemaTypeInteger, jsonSchemaDefaultKey: &pointerNumber},
+	}
+	cfg := validMinimalConfig()
+	cfg.BrokeredTools = []BrokeredTool{{
+		Name:          safeLookupToolName,
+		Description:   brokeredSafeDescription,
+		BrokeredClass: BrokeredClassRead,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey:       jsonSchemaTypeObject,
+			jsonSchemaPropertiesKey: properties,
+		},
+	}}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("JSON-serializable named and json.Number integer values should validate: %v", err)
+	}
+
+	numberSchema[jsonSchemaDefaultKey] = json.Number("1.00000000000000001")
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "cannot be represented exactly") {
+		t.Fatalf("lossy non-integral json.Number must fail exact representation validation, got: %v", err)
+	}
+	numberSchema[jsonSchemaDefaultKey] = json.Number("100000000000000000001.0")
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must match the declared JSON Schema type") {
+		t.Fatalf("large float-form json.Number must fail integer validation, got: %v", err)
+	}
+	numberSchema[jsonSchemaDefaultKey] = json.Number("100000000000000000001")
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("large lexical integer json.Number should validate exactly: %v", err)
+	}
+	numberSchema[jsonSchemaDefaultKey] = json.Number("1/1")
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must be JSON serializable") {
+		t.Fatalf("non-JSON json.Number syntax must fail serialization validation, got: %v", err)
+	}
+	numberSchema[jsonSchemaDefaultKey] = json.Number("1.0")
+	fractionalSchema[jsonSchemaDefaultKey] = json.Number("1e-400")
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "cannot be represented exactly") {
+		t.Fatalf("underflowing json.Number must fail exact representation validation, got: %v", err)
+	}
+	fractionalSchema[jsonSchemaDefaultKey] = json.Number("0.1")
+
+	namedSchema[jsonSchemaDefaultKey] = map[string]any(nil)
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must match the declared JSON Schema type") {
+		t.Fatalf("typed nil map must retain JSON null semantics, got: %v", err)
+	}
+}
+
+func TestValidateRejectsLossyTypelessJSONNumberSchemaValues(t *testing.T) {
+	cfg := validMinimalConfig()
+	cfg.BrokeredTools = []BrokeredTool{{
+		Name:          safeLookupToolName,
+		Description:   brokeredSafeDescription,
+		BrokeredClass: BrokeredClassWrite,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey: jsonSchemaTypeObject,
+			jsonSchemaPropertiesKey: map[string]any{
+				"ratio": map[string]any{jsonSchemaDefaultKey: json.Number("0.100000000000000005")},
+			},
+		},
+	}}
+
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "cannot be represented exactly") {
+		t.Fatalf("lossy typeless json.Number must fail validation, got: %v", err)
+	}
+}
+
+func TestValidateMeasuresBrokeredSchemaSizeWithCanonicalJSON(t *testing.T) {
+	cfg := validMinimalConfig()
+	cfg.BrokeredTools = []BrokeredTool{{
+		Name:          safeLookupToolName,
+		Description:   brokeredSafeDescription,
+		BrokeredClass: BrokeredClassRead,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey:            jsonSchemaTypeObject,
+			brokeredDigestDescriptionKey: strings.Repeat("<", 11_000),
+		},
+	}}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("canonical schema below the byte limit should validate despite json.Marshal HTML escaping: %v", err)
+	}
+
+	cfg.BrokeredTools[0].Parameters[brokeredDigestDescriptionKey] = strings.Repeat("a", 64*1024)
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "schema is too large") {
+		t.Fatalf("canonical schema above the byte limit should fail validation, got: %v", err)
 	}
 }
 
@@ -915,4 +1148,502 @@ expose:
 	if !strings.Contains(verr.Error(), "observability.logs.levelEnv is not supported") {
 		t.Fatalf("expected logs support error, got: %v", verr)
 	}
+}
+
+func TestBrokeredToolSchemaDigestMatchesPythonCanonicalJSON(t *testing.T) {
+	tool := BrokeredTool{
+		Name:          "check-network-telemetry",
+		Description:   "São & R&D <safe>",
+		BrokeredClass: BrokeredClassRead,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey: jsonSchemaTypeObject,
+			jsonSchemaPropertiesKey: map[string]any{
+				brokeredSiteField: map[string]any{jsonSchemaTypeKey: jsonSchemaTypeString, brokeredDigestDescriptionKey: "São & R&D <safe>"},
+			},
+			jsonSchemaRequiredKey: []any{brokeredSiteField},
+		},
+	}
+
+	digest, err := BrokeredToolSchemaDigest(tool)
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	if digest != "sha256:7066de4e62dd1a6550701772aad901e1efcf5eb81a4f639252f82e6c7be8d4c1" {
+		t.Fatalf("digest = %q", digest)
+	}
+}
+
+func TestBrokeredToolSchemaDigestPreservesIntegralJSONNumberDecimals(t *testing.T) {
+	decimalTool := BrokeredTool{
+		Name:          "numeric-tool",
+		Description:   brokeredSafeDescription,
+		BrokeredClass: BrokeredClassRead,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey: jsonSchemaTypeObject,
+			jsonSchemaPropertiesKey: map[string]any{
+				"id": map[string]any{jsonSchemaDefaultKey: json.Number("9007199254740995.0")},
+			},
+		},
+	}
+	integerTool := decimalTool
+	integerTool.Parameters = map[string]any{
+		jsonSchemaTypeKey: jsonSchemaTypeObject,
+		jsonSchemaPropertiesKey: map[string]any{
+			"id": map[string]any{jsonSchemaDefaultKey: int64(9007199254740995)},
+		},
+	}
+
+	decimalDigest, err := BrokeredToolSchemaDigest(decimalTool)
+	if err != nil {
+		t.Fatalf("decimal digest error: %v", err)
+	}
+	integerDigest, err := BrokeredToolSchemaDigest(integerTool)
+	if err != nil {
+		t.Fatalf("integer digest error: %v", err)
+	}
+	if decimalDigest != integerDigest {
+		t.Fatalf("integral decimal digest = %s, integer digest = %s", decimalDigest, integerDigest)
+	}
+}
+
+func TestCanonicalJSONStringMatchesPythonForUnicodeLineSeparators(t *testing.T) {
+	value := "line\u2028paragraph\u2029literal\\u2028"
+
+	encoded, err := canonicalJSONString(value)
+	if err != nil {
+		t.Fatalf("canonicalJSONString error: %v", err)
+	}
+	want := "\"line\u2028paragraph\u2029literal\\\\u2028\""
+	if string(encoded) != want {
+		t.Fatalf("canonicalJSONString = %q, want %q", encoded, want)
+	}
+}
+
+func TestBrokeredToolSchemaDigestNormalizesIntegerValuedFloatConstraints(t *testing.T) {
+	tool := BrokeredTool{
+		Name:          "numeric-tool",
+		Description:   "Numeric constraints.",
+		BrokeredClass: BrokeredClassRead,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey: jsonSchemaTypeObject,
+			jsonSchemaPropertiesKey: map[string]any{
+				"retries": map[string]any{jsonSchemaTypeKey: jsonSchemaTypeNumber, jsonSchemaMinimumKey: 1.0},
+			},
+		},
+	}
+
+	digest, err := BrokeredToolSchemaDigest(tool)
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	if digest != "sha256:7ad9d43791e157981bcd65fd8452c9e71a64064875cc1330ced42d4956bf7d75" {
+		t.Fatalf("digest = %q", digest)
+	}
+}
+
+func TestBrokeredToolSchemaDigestCanonicalizesNumericConstraints(t *testing.T) {
+	tool := BrokeredTool{
+		Name:          "num-tool",
+		Description:   "Numeric schema",
+		BrokeredClass: BrokeredClassRead,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey: jsonSchemaTypeObject,
+			jsonSchemaPropertiesKey: map[string]any{
+				"n": map[string]any{jsonSchemaTypeKey: jsonSchemaTypeNumber, jsonSchemaMinimumKey: 1e-6},
+			},
+			jsonSchemaRequiredKey: []any{"n"},
+		},
+	}
+
+	digest, err := BrokeredToolSchemaDigest(tool)
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	if digest != "sha256:83bf12180154a21f8ba19049687e24acee9ef430966af67a83721a10bf7eee50" {
+		t.Fatalf("digest = %q", digest)
+	}
+}
+
+func TestBrokeredToolSchemaDigestCanonicalizesPositiveExponentNumbers(t *testing.T) {
+	tool := BrokeredTool{
+		Name:          "large-num-tool",
+		Description:   "Large numeric schema",
+		BrokeredClass: BrokeredClassRead,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey: jsonSchemaTypeObject,
+			jsonSchemaPropertiesKey: map[string]any{
+				"n": map[string]any{jsonSchemaTypeKey: jsonSchemaTypeNumber, jsonSchemaMaximumKey: 1e20},
+			},
+		},
+	}
+
+	digest, err := BrokeredToolSchemaDigest(tool)
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	if digest != "sha256:51ebe9cdbb967453ba3ae9fb737566028814968d8121ba0d32825f7c8ffb5639" {
+		t.Fatalf("digest = %q", digest)
+	}
+}
+
+func TestValidateAcceptsDigestForTypedNestedBrokeredSchemaMaps(t *testing.T) {
+	tool := BrokeredTool{
+		Name:          safeLookupToolName,
+		Description:   brokeredSafeDescription,
+		BrokeredClass: BrokeredClassRead,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey: jsonSchemaTypeObject,
+			jsonSchemaPropertiesKey: map[string]any{
+				brokeredSiteField: map[string]string{jsonSchemaTypeKey: jsonSchemaTypeString},
+			},
+		},
+	}
+	digest, err := BrokeredToolSchemaDigest(tool)
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	tool.SchemaDigest = digest
+	cfg := validMinimalConfig()
+	cfg.BrokeredTools = []BrokeredTool{tool}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid typed nested schema with digest failed validation: %v", err)
+	}
+}
+
+func TestBrokeredToolSchemaDigestPreservesLargeIntegers(t *testing.T) {
+	tool := BrokeredTool{
+		Name:          "large-int-tool",
+		Description:   "Large integer schema",
+		BrokeredClass: BrokeredClassRead,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey: jsonSchemaTypeObject,
+			jsonSchemaPropertiesKey: map[string]any{
+				"n": map[string]any{jsonSchemaTypeKey: jsonSchemaTypeInteger, "const": int64(9007199254740993)},
+			},
+		},
+	}
+
+	digest, err := BrokeredToolSchemaDigest(tool)
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	if digest != "sha256:d0e703a2d84f12caa3275fbf8632ec8626ecc84fb27e187380ed61d54cef0e23" {
+		t.Fatalf("digest = %q", digest)
+	}
+}
+
+func TestBrokeredToolSchemaDigestCanonicalizesJSONNumberExponentSpellings(t *testing.T) {
+	tool := BrokeredTool{
+		Name:          "json-number-tool",
+		Description:   "JSON number schema",
+		BrokeredClass: BrokeredClassRead,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey: jsonSchemaTypeObject,
+			jsonSchemaPropertiesKey: map[string]any{
+				"n": map[string]any{jsonSchemaTypeKey: jsonSchemaTypeNumber, jsonSchemaMinimumKey: json.Number("1e-7")},
+			},
+		},
+	}
+
+	digest, err := BrokeredToolSchemaDigest(tool)
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	if digest != "sha256:f38729b2c519d7a92f3ddcbb7139271a0a6e25f515e180fa5a16737e5a0efcb4" {
+		t.Fatalf("digest = %q", digest)
+	}
+}
+
+func TestBrokeredToolSchemaDigestCanonicalizesExponentNumberSpellings(t *testing.T) {
+	tool := BrokeredTool{
+		Name:          "exponent-num-tool",
+		Description:   "Exponent numeric schema",
+		BrokeredClass: BrokeredClassRead,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey: jsonSchemaTypeObject,
+			jsonSchemaPropertiesKey: map[string]any{
+				"small": map[string]any{jsonSchemaTypeKey: jsonSchemaTypeNumber, "minimum": 1e-7},
+				"large": map[string]any{jsonSchemaTypeKey: jsonSchemaTypeNumber, jsonSchemaMaximumKey: 1e21},
+			},
+		},
+	}
+
+	digest, err := BrokeredToolSchemaDigest(tool)
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	if digest != "sha256:bb4fac58c3f65a33ed3c4ebfa10e5da9c3dc5a9250a1316f64d25e40e0e645e0" {
+		t.Fatalf("digest = %q", digest)
+	}
+}
+
+func TestValidateAcceptsBrokeredToolsWithMatchingDigest(t *testing.T) {
+	tool := BrokeredTool{
+		Name:          "check-network-telemetry",
+		Description:   "Read sanitized optical telemetry.",
+		BrokeredClass: BrokeredClassRead,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey: jsonSchemaTypeObject,
+			jsonSchemaPropertiesKey: map[string]any{
+				brokeredSiteField: map[string]any{"type": "string"},
+			},
+			jsonSchemaRequiredKey: []any{brokeredSiteField},
+		},
+	}
+	digest, err := BrokeredToolSchemaDigest(tool)
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	tool.SchemaDigest = digest
+	cfg := validMinimalConfig()
+	cfg.BrokeredTools = []BrokeredTool{tool}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid brokered tool failed validation: %v", err)
+	}
+}
+
+func TestValidateRejectsUnsafeBrokeredDescriptions(t *testing.T) {
+	for _, description := range []string{"contains sk-secret", "execution at https://tool.default", "Bearer token required", "execution at tool.default.svc.cluster.local"} {
+		cfg := validMinimalConfig()
+		cfg.BrokeredTools = []BrokeredTool{{
+			Name:          safeLookupToolName,
+			Description:   description,
+			BrokeredClass: BrokeredClassRead,
+			Parameters:    map[string]any{jsonSchemaTypeKey: jsonSchemaTypeObject},
+		}}
+
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "description") {
+			t.Fatalf("description %q: expected unsafe description rejection, got: %v", description, err)
+		}
+	}
+}
+
+func TestValidateRejectsTypedNestedUnsafeBrokeredSchemaValues(t *testing.T) {
+	cfg := validMinimalConfig()
+	cfg.BrokeredTools = []BrokeredTool{{
+		Name:          safeLookupToolName,
+		Description:   brokeredSafeDescription,
+		BrokeredClass: BrokeredClassRead,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey: jsonSchemaTypeObject,
+			jsonSchemaPropertiesKey: map[string]any{
+				brokeredSiteField: map[string]string{jsonSchemaTypeKey: jsonSchemaTypeString, jsonSchemaDefaultKey: "sk-not-a-real-secret"},
+			},
+		},
+	}}
+
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "secret-like") {
+		t.Fatalf("expected typed nested unsafe value rejection, got: %v", err)
+	}
+}
+
+func TestValidateRejectsPrivateKeyBrokeredNamesAndStrings(t *testing.T) {
+	for _, params := range []map[string]any{
+		{jsonSchemaTypeKey: jsonSchemaTypeObject, jsonSchemaPropertiesKey: map[string]any{"privateKey": map[string]any{jsonSchemaTypeKey: jsonSchemaTypeString}}},
+		{jsonSchemaTypeKey: jsonSchemaTypeObject, jsonSchemaPropertiesKey: map[string]any{brokeredSiteField: map[string]any{jsonSchemaTypeKey: jsonSchemaTypeString, jsonSchemaDefaultKey: "BEGIN PRIVATE KEY"}}},
+	} {
+		cfg := validMinimalConfig()
+		cfg.BrokeredTools = []BrokeredTool{{
+			Name:          safeLookupToolName,
+			Description:   brokeredSafeDescription,
+			BrokeredClass: BrokeredClassRead,
+			Parameters:    params,
+		}}
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "safe") && !strings.Contains(err.Error(), "secret-like") {
+			t.Fatalf("expected private key rejection, got: %v", err)
+		}
+	}
+}
+
+func TestValidateRejectsUnsafeBrokeredSchemaStringValues(t *testing.T) {
+	for _, value := range []string{"see https://internal-tool", "Bearer abc", "Bearer: abc", "Bearer=abc", "authorization header", "tool.default.svc.cluster.local", "example ghp_not_real", "AWS key AKIAEXAMPLE"} {
+		cfg := validMinimalConfig()
+		cfg.BrokeredTools = []BrokeredTool{{
+			Name:          safeLookupToolName,
+			Description:   brokeredSafeDescription,
+			BrokeredClass: BrokeredClassRead,
+			Parameters: map[string]any{
+				jsonSchemaTypeKey: jsonSchemaTypeObject,
+				jsonSchemaPropertiesKey: map[string]any{
+					brokeredSiteField: map[string]any{jsonSchemaTypeKey: jsonSchemaTypeString, brokeredDigestDescriptionKey: value},
+				},
+			},
+		}}
+
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "secret-like") && !strings.Contains(err.Error(), "URL") {
+			t.Fatalf("value %q: expected unsafe schema string rejection, got: %v", value, err)
+		}
+	}
+}
+
+func TestValidateRejectsCommonCredentialBrokeredParameterNames(t *testing.T) {
+	for _, field := range []string{"authentication", "authConfig", "clientSecret", "dbPassword", "passphrase", "pwd", "apiKey", credentialHeaderAPIKey, "baseUrl", "callbackURL", "apiEndpoint", "sessionCookie", "cookies"} {
+		cfg := validMinimalConfig()
+		cfg.BrokeredTools = []BrokeredTool{{
+			Name:          safeLookupToolName,
+			Description:   brokeredSafeDescription,
+			BrokeredClass: BrokeredClassRead,
+			Parameters: map[string]any{
+				jsonSchemaTypeKey: jsonSchemaTypeObject,
+				jsonSchemaPropertiesKey: map[string]any{
+					field: map[string]any{jsonSchemaTypeKey: jsonSchemaTypeString},
+				},
+			},
+		}}
+
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "not safe") {
+			t.Fatalf("field %q: expected unsafe brokered schema rejection, got: %v", field, err)
+		}
+	}
+}
+
+func TestValidateRejectsCommonCredentialBrokeredRequiredNames(t *testing.T) {
+	for _, field := range []string{"authentication", "authConfig", "clientSecret", "dbPassword", "passphrase", "pwd", "apiKey", credentialHeaderAPIKey, "baseUrl", "callbackURL", "apiEndpoint", "sessionCookie", "cookies"} {
+		cfg := validMinimalConfig()
+		cfg.BrokeredTools = []BrokeredTool{{
+			Name:          safeLookupToolName,
+			Description:   brokeredSafeDescription,
+			BrokeredClass: BrokeredClassRead,
+			Parameters: map[string]any{
+				jsonSchemaTypeKey:     jsonSchemaTypeObject,
+				jsonSchemaRequiredKey: []any{field},
+			},
+		}}
+
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "not safe") {
+			t.Fatalf("field %q: expected unsafe brokered required rejection, got: %v", field, err)
+		}
+	}
+}
+
+func TestValidateAcceptsHarmlessBrokeredAuthorField(t *testing.T) {
+	cfg := validMinimalConfig()
+	cfg.BrokeredTools = []BrokeredTool{{
+		Name:          safeLookupToolName,
+		Description:   brokeredSafeDescription,
+		BrokeredClass: BrokeredClassRead,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey: jsonSchemaTypeObject,
+			jsonSchemaPropertiesKey: map[string]any{
+				"author": map[string]any{jsonSchemaTypeKey: jsonSchemaTypeString},
+			},
+			jsonSchemaRequiredKey: []any{"author"},
+		},
+	}}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("safe author field should validate: %v", err)
+	}
+}
+
+func TestValidateRejectsUnsafeBrokeredToolSchema(t *testing.T) {
+	for _, unsafeName := range []string{"token", "authHeader", "authorizationHeader", "httpHeaders", "accessKey", "clientSecretValue", "tokenValue", "apiSecretKey", brokeredUnsafeCookieKey, "subscriptionKey", "xFunctionsKey"} {
+		cfg := validMinimalConfig()
+		cfg.BrokeredTools = []BrokeredTool{{
+			Name:          safeLookupToolName,
+			Description:   brokeredSafeDescription,
+			BrokeredClass: BrokeredClassRead,
+			Parameters: map[string]any{
+				jsonSchemaTypeKey: jsonSchemaTypeObject,
+				jsonSchemaPropertiesKey: map[string]any{
+					unsafeName: map[string]any{jsonSchemaTypeKey: jsonSchemaTypeString},
+				},
+			},
+		}}
+
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "not safe") {
+			t.Fatalf("expected unsafe brokered schema rejection for %s, got: %v", unsafeName, err)
+		}
+	}
+}
+
+func TestHasUnsafeBrokeredTextMatchesAuthSchemesAsWords(t *testing.T) {
+	for _, safe := range []string{"This tool basically reads telemetry", "Read crossbearer telemetry labels"} {
+		if hasUnsafeBrokeredText(safe) {
+			t.Fatalf("expected %q to be safe brokered text", safe)
+		}
+	}
+	for _, unsafe := range []string{"Use bearer auth", "Basic authentication required"} {
+		if !hasUnsafeBrokeredText(unsafe) {
+			t.Fatalf("expected %q to be unsafe brokered text", unsafe)
+		}
+	}
+}
+
+func TestValidateRejectsSecretLiteralBrokeredSchemaStringValues(t *testing.T) {
+	cfg := validMinimalConfig()
+	cfg.BrokeredTools = []BrokeredTool{{
+		Name:          safeLookupToolName,
+		Description:   brokeredSafeDescription,
+		BrokeredClass: BrokeredClassRead,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey: jsonSchemaTypeObject,
+			jsonSchemaPropertiesKey: map[string]any{
+				brokeredSiteField: map[string]any{jsonSchemaTypeKey: jsonSchemaTypeString, jsonSchemaDefaultKey: "sk-not-a-real-secret"},
+			},
+		},
+	}}
+
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "secret-like material") {
+		t.Fatalf("expected secret literal brokered schema rejection, got: %v", err)
+	}
+}
+
+func TestValidateRejectsBrokeredToolDigestMismatchAndNameOverlap(t *testing.T) {
+	cfg := validMinimalConfig()
+	cfg.Tools = []Tool{{Name: safeLookupToolName, Command: []string{"echo", "ok"}}}
+	cfg.BrokeredTools = []BrokeredTool{{
+		Name:          safeLookupToolName,
+		Description:   brokeredSafeDescription,
+		BrokeredClass: BrokeredClassRead,
+		Parameters:    map[string]any{jsonSchemaTypeKey: jsonSchemaTypeObject},
+		SchemaDigest:  "sha256:" + strings.Repeat("0", 64),
+	}}
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected validation errors, got nil")
+	}
+	msg := err.Error()
+	for _, want := range []string{"tools and brokeredTools cannot be mixed", "schemaDigest does not match"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("expected %q in error, got: %v", want, err)
+		}
+	}
+}
+
+func TestStrictParseRejectsUnsafeBrokeredTopLevelField(t *testing.T) {
+	in := []byte(`apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: brokered
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: hi
+brokeredTools:
+  - name: safe_lookup
+    description: safe schema
+    brokeredClass: read
+    parameters:
+      type: object
+    url: http://tool.default.svc.cluster.local
+expose:
+  openai: true
+`)
+	_, err := NewFromBytes(in)
+	if err == nil || !strings.Contains(err.Error(), "url") {
+		t.Fatalf("expected strict parse rejection for unsafe field, got: %v", err)
+	}
+}
+
+func validMinimalConfig() *AgentConfig {
+	cfg, err := NewFromBytes(agentBaseYAML(""))
+	if err != nil {
+		panic(err)
+	}
+	return cfg
 }

@@ -17,8 +17,11 @@ Current and reserved names:
 - `foundry-invocations-protocol` — Foundry hosted-agent `/readiness` +
   `/invocations` wrapper.
 - `foundry-responses-minimal` — current Foundry `/responses` wrapper: synchronous
-  and non-streaming. Do not treat this as full Responses parity for background,
-  streaming, polling, cancel, or durable response IDs.
+  and non-streaming. It supports a deterministic schema-only brokered function-call
+  loop when `agent.yaml` contains `brokeredTools`, using hosted-compatible
+  response IDs and a memory or optional file-backed continuation store. Do not
+  treat this as full Responses parity for background, streaming, polling, cancel,
+  or multi-replica platform-managed production state.
 - `orka-harness-v1` — observed-mode native Orka `orka.harness.v1` wire protocol over HTTP+SSE (`HealthResponse`, flat `CapabilitiesResponse`, `StartTurnRequest`, `StartTurnResponse`, and `HarnessEventFrame`).
 - `orka-observed-tools` — AgentKit-owned tools/MCP execute inside the runtime;
   Orka observes lifecycle/output frames and governs externally.
@@ -50,8 +53,9 @@ side-effect governance.
 
 Context-provider schemas are capability-gated per runtime; the MAF adapter
 currently declares skills, search, and memory support. OTel export, local tool
-approval enforcement, log-level observability, and Orka brokered-tool mode remain
-gated until a runtime and protocol contract declare support.
+approval enforcement, log-level observability, and native real-model Orka
+brokered-tool adapters remain gated until a runtime and protocol contract declare
+support.
 
 The shared runtime package now defines the neutral brokered-tool Interface types
 (`BrokeredToolDefinition`, `BrokeredToolCall`, `BrokeredToolResult`,
@@ -61,7 +65,13 @@ read/write/coordination and `/continue` behind
 `AGENTKIT_ORKA_ENABLE_BROKERED_READ=1`,
 `AGENTKIT_ORKA_ENABLE_BROKERED_WRITE=1`, and
 `AGENTKIT_ORKA_ENABLE_BROKERED_COORDINATION=1`; default capabilities still
-advertise observed mode only. Orka remains responsible for coordination policy,
+advertise observed mode only. Foundry hosted `/responses` can also exercise a
+deterministic brokered function-call loop from static `brokeredTools`. For
+A4/A5 fallback validation, `AGENTKIT_FOUNDRY_BROKERED_MODEL_LOOP=1` enables a
+lower-level OpenAI-compatible chat-completions loop that exposes static safe
+brokered schemas as function tools, emits hosted Responses `function_call`
+items, and resumes the model with Orka-provided `function_call_output`. Orka
+remains responsible for coordination policy,
 quotas, child-task lineage, and namespace/agent authorization. Native framework
 adapter brokered hooks are still intentionally gated: today the brokered profiles
 are validated through the offline echo/conformance runtime, while real model

@@ -56,6 +56,17 @@ type Tool struct {
 	Env []string `yaml:"env,omitempty"`
 }
 
+// BrokeredTool is a schema-only Orka-brokered tool declaration for hosted
+// Foundry Responses mode. It deliberately excludes execution URLs, auth headers,
+// Secret refs, and credentials; Orka remains the executor and policy authority.
+type BrokeredTool struct {
+	Name          string         `yaml:"name"`
+	Description   string         `yaml:"description"`
+	BrokeredClass string         `yaml:"brokeredClass"`
+	Parameters    map[string]any `yaml:"parameters"`
+	SchemaDigest  string         `yaml:"schemaDigest,omitempty"`
+}
+
 // variantsSet returns the names of the populated tool-source variants.
 func (t Tool) variantsSet() []string {
 	var set []string

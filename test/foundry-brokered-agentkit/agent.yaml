@@ -1,0 +1,22 @@
+abiVersion: v0
+metadata:
+  name: agentkit-foundry-brokered-local
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: |
+  Broker all tool use through Orka. Never claim a tool completed unless the brokered tool output confirms it.
+tools: []
+brokeredTools:
+  - name: conformance_read
+    description: Read conformance data.
+    brokeredClass: read
+    parameters:
+      type: object
+      properties:
+        probe:
+          type: boolean
+expose:
+  openai: true
+  port: 8088

@@ -3,6 +3,13 @@
 package abi
 
 import (
+	"encoding/json"
+	"math"
+	"math/big"
+	"reflect"
+	"strconv"
+	"strings"
+
 	"github.com/goccy/go-yaml"
 	"github.com/sozercan/agentkit/pkg/agentkit/effective"
 )
@@ -14,10 +21,26 @@ const Version = "v0"
 // Path is where the rendered agent.yaml is baked into the agent image.
 const Path = "/agent/agent.yaml"
 
+const yamlNegativeZero = "-0.0"
+
 // The following types are the WRITER half of the frozen agent.yaml ABI
 // (docs/agent-abi.md). agentkit-serve reads this file with pydantic
 // extra="forbid", so these structs MUST emit EXACTLY the keys documented there.
 // Field order here is the emit order.
+
+type yamlNumber string
+
+func (n yamlNumber) MarshalYAML() ([]byte, error) {
+	return []byte(n), nil
+}
+
+func yamlFloat(value float64, bitSize int) yamlNumber {
+	rendered := strconv.FormatFloat(value, 'f', -1, bitSize)
+	if value == 0 && math.Signbit(value) {
+		rendered = yamlNegativeZero
+	}
+	return yamlNumber(rendered)
+}
 
 type abiMetadata struct {
 	Name string `yaml:"name"`
@@ -53,6 +76,14 @@ type abiTool struct {
 	Auth      *abiAuth        `yaml:"auth,omitempty"`
 	Approval  string          `yaml:"approval,omitempty"`
 	Env       []string        `yaml:"env,omitempty"`
+}
+
+type abiBrokeredTool struct {
+	Name          string         `yaml:"name"`
+	Description   string         `yaml:"description"`
+	BrokeredClass string         `yaml:"brokeredClass"`
+	Parameters    map[string]any `yaml:"parameters"`
+	SchemaDigest  string         `yaml:"schemaDigest,omitempty"`
 }
 
 type abiEnvVar struct {
@@ -97,10 +128,222 @@ type abiAgent struct {
 	Model         abiModel          `yaml:"model"`
 	Instructions  string            `yaml:"instructions"`
 	Tools         []abiTool         `yaml:"tools"`
+	BrokeredTools []abiBrokeredTool `yaml:"brokeredTools,omitempty"`
 	Env           []abiEnvVar       `yaml:"env,omitempty"`
 	Context       *abiContext       `yaml:"context,omitempty"`
 	Observability *abiObservability `yaml:"observability,omitempty"`
 	Expose        abiExpose         `yaml:"expose"`
+}
+
+func expandJSONNumber(value string) string {
+	lower := strings.ToLower(value)
+	if json.Valid([]byte(lower)) {
+		if number, ok := new(big.Rat).SetString(lower); ok && number.IsInt() {
+			if number.Sign() == 0 && strings.HasPrefix(lower, "-") {
+				return yamlNegativeZero
+			}
+			return number.Num().String()
+		}
+	}
+	parts := strings.Split(lower, "e")
+	if len(parts) != 2 {
+		return value
+	}
+	exponent, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return value
+	}
+	mantissa := parts[0]
+	sign := ""
+	if strings.HasPrefix(mantissa, "-") || strings.HasPrefix(mantissa, "+") {
+		if mantissa[0] == '-' {
+			sign = "-"
+		}
+		mantissa = mantissa[1:]
+	}
+	fracLen := 0
+	if dot := strings.IndexByte(mantissa, '.'); dot >= 0 {
+		fracLen = len(mantissa) - dot - 1
+		mantissa = mantissa[:dot] + mantissa[dot+1:]
+	}
+	mantissa = strings.TrimLeft(mantissa, "0")
+	if mantissa == "" {
+		if sign == "-" {
+			return yamlNegativeZero
+		}
+		return "0"
+	}
+	decimalPos := len(mantissa) - fracLen + exponent
+	var out string
+	switch {
+	case decimalPos <= 0:
+		out = "0." + strings.Repeat("0", -decimalPos) + mantissa
+	case decimalPos >= len(mantissa):
+		out = mantissa + strings.Repeat("0", decimalPos-len(mantissa))
+	default:
+		out = mantissa[:decimalPos] + "." + mantissa[decimalPos:]
+	}
+	if strings.Contains(out, ".") {
+		out = strings.TrimRight(out, "0")
+		out = strings.TrimRight(out, ".")
+	}
+	if out == "" || out == "-" {
+		return "0"
+	}
+	return sign + out
+}
+
+func copyMap(in map[string]any) map[string]any {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = copyAny(v)
+	}
+	return out
+}
+
+func copyAny(v any) any {
+	switch typed := v.(type) {
+	case map[string]any:
+		if typed == nil {
+			return nil
+		}
+		return copyMap(typed)
+	case map[string]string:
+		if typed == nil {
+			return nil
+		}
+		out := make(map[string]string, len(typed))
+		for key, value := range typed {
+			out[key] = value
+		}
+		return out
+	case map[string]int:
+		if typed == nil {
+			return nil
+		}
+		out := make(map[string]int, len(typed))
+		for key, value := range typed {
+			out[key] = value
+		}
+		return out
+	case map[string]float64:
+		if typed == nil {
+			return nil
+		}
+		out := make(map[string]any, len(typed))
+		for key, value := range typed {
+			out[key] = yamlFloat(value, 64)
+		}
+		return out
+	case map[string]bool:
+		if typed == nil {
+			return nil
+		}
+		out := make(map[string]bool, len(typed))
+		for key, value := range typed {
+			out[key] = value
+		}
+		return out
+	case []any:
+		if typed == nil {
+			return nil
+		}
+		out := make([]any, len(typed))
+		for i, item := range typed {
+			out[i] = copyAny(item)
+		}
+		return out
+	case []string:
+		if typed == nil {
+			return nil
+		}
+		return append([]string(nil), typed...)
+	case []int:
+		if typed == nil {
+			return nil
+		}
+		return append([]int(nil), typed...)
+	case []float64:
+		if typed == nil {
+			return nil
+		}
+		out := make([]any, len(typed))
+		for i, item := range typed {
+			out[i] = yamlFloat(item, 64)
+		}
+		return out
+	case []bool:
+		if typed == nil {
+			return nil
+		}
+		return append([]bool(nil), typed...)
+	case float32:
+		return yamlFloat(float64(typed), 32)
+	case float64:
+		return yamlFloat(typed, 64)
+	case json.Number:
+		return yamlNumber(expandJSONNumber(typed.String()))
+	default:
+		return copyReflectedJSON(typed)
+	}
+}
+
+func copyReflectedJSON(value any) any {
+	if value == nil {
+		return nil
+	}
+	rv := reflect.ValueOf(value)
+	for rv.Kind() == reflect.Interface || rv.Kind() == reflect.Pointer {
+		if rv.IsNil() {
+			return nil
+		}
+		rv = rv.Elem()
+	}
+	if number, ok := rv.Interface().(json.Number); ok {
+		return yamlNumber(expandJSONNumber(number.String()))
+	}
+	switch rv.Kind() {
+	case reflect.Map:
+		if rv.IsNil() {
+			return nil
+		}
+		if rv.Type().Key().Kind() != reflect.String {
+			return value
+		}
+		out := make(map[string]any, rv.Len())
+		iter := rv.MapRange()
+		for iter.Next() {
+			out[iter.Key().String()] = copyAny(iter.Value().Interface())
+		}
+		return out
+	case reflect.Slice:
+		if rv.IsNil() {
+			return nil
+		}
+		if rv.Type().Elem().Kind() == reflect.Uint8 {
+			return value
+		}
+		out := make([]any, rv.Len())
+		for i := 0; i < rv.Len(); i++ {
+			out[i] = copyAny(rv.Index(i).Interface())
+		}
+		return out
+	case reflect.Array:
+		out := make([]any, rv.Len())
+		for i := 0; i < rv.Len(); i++ {
+			out[i] = copyAny(rv.Index(i).Interface())
+		}
+		return out
+	case reflect.Float32:
+		return yamlFloat(rv.Float(), 32)
+	case reflect.Float64:
+		return yamlFloat(rv.Float(), 64)
+	default:
+		return rv.Interface()
+	}
 }
 
 // Render produces the baked /agent/agent.yaml from an effective Agent. The
@@ -144,6 +387,18 @@ func Render(agent effective.Agent) ([]byte, error) {
 			tool.Auth = &abiAuth{Type: t.Auth.Type, TokenEnv: t.Auth.TokenEnv, Audience: t.Auth.Audience}
 		}
 		out.Tools = append(out.Tools, tool)
+	}
+	for _, t := range agent.BrokeredTools {
+		out.BrokeredTools = append(out.BrokeredTools, abiBrokeredTool{
+			Name:          t.Name,
+			Description:   t.Description,
+			BrokeredClass: t.BrokeredClass,
+			Parameters:    copyMap(t.Parameters),
+			SchemaDigest:  t.SchemaDigest,
+		})
+	}
+	if len(out.BrokeredTools) == 0 {
+		out.BrokeredTools = nil
 	}
 	for _, e := range agent.Env {
 		out.Env = append(out.Env, abiEnvVar{Name: e.Name, Required: e.Required})

@@ -104,8 +104,10 @@ type AgentConfig struct {
 	// Instructions is the system prompt, authored inline (bare string or
 	// {inline: ...}) or sourced from a file (plan §7 source union).
 	Instructions Source `yaml:"instructions"`
-	// Tools are MCP servers. v0: stdio command servers (plan §5.2 ⚠).
+	// Tools are AgentKit-owned MCP servers.
 	Tools []Tool `yaml:"tools,omitempty"`
+	// BrokeredTools are static safe Orka-brokered schemas for Foundry hosted Responses mode.
+	BrokeredTools []BrokeredTool `yaml:"brokeredTools,omitempty"`
 	// Env declares runtime env var requirements by NAME only. Values are injected
 	// by the deployment/runtime environment and never baked into the image.
 	Env []EnvVar `yaml:"env,omitempty"`
