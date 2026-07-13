@@ -22,6 +22,8 @@ from typing import Any, Literal, Mapping
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from .yaml_support import safe_load_lossless
+
 # The ABI schema version this reader understands (agent-abi.md: ``abiVersion: v0``).
 ABI_VERSION = "v0"
 _PROVIDER_OPENAI_COMPATIBLE = "openai-compatible"
@@ -717,12 +719,16 @@ class BrokeredToolSpec(_Strict):
     def _valid_json_schema(cls, value: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(value, dict):
             raise ValueError("brokered tool parameters must be a JSON Schema object")
-        _validate_schema_value_constraints(value, path="brokeredTools[].parameters")
+        try:
+            _validate_schema_value_constraints(value, path="brokeredTools[].parameters")
+        except RecursionError as exc:
+            raise ValueError("brokered tool parameters must be an acyclic JSON-serializable object") from exc
         try:
             encoded = _canonical_json(value)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("brokered tool parameters must be JSON serializable") from exc
-        if len(encoded.encode("utf-8")) > _MAX_BROKERED_SCHEMA_BYTES:
+            encoded_bytes = encoded.encode("utf-8")
+        except (TypeError, ValueError, RecursionError, UnicodeEncodeError) as exc:
+            raise ValueError("brokered tool parameters must be JSON serializable UTF-8") from exc
+        if len(encoded_bytes) > _MAX_BROKERED_SCHEMA_BYTES:
             raise ValueError("brokered tool parameters schema is too large")
         cloned = json.loads(encoded, parse_int=_parse_canonical_int)
         if cloned.get("type") != "object":
@@ -894,8 +900,8 @@ def load(path: str | Path) -> AgentSpec:
         raise ConfigError(f"cannot read agent config {p}: {exc}") from exc
 
     try:
-        data = yaml.safe_load(raw)
-    except yaml.YAMLError as exc:
+        data = safe_load_lossless(raw)
+    except (yaml.YAMLError, ValueError, RecursionError) as exc:
         raise ConfigError(f"agent config {p} is not valid YAML: {exc}") from exc
 
     if not isinstance(data, dict):

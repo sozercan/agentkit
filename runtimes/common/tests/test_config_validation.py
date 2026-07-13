@@ -800,7 +800,6 @@ def test_load_rejects_malformed_nested_brokered_json_schema(tmp_path, bad_child:
     [
         {"type": "object", "properties": {"site": {"type": None}}},
         {"type": "object", "properties": {"n": {"type": "integer", "default": "1"}}},
-        {"type": "object", "properties": {"n": {"type": "integer", "default": 9007199254740993.0}}},
         {"type": "object", "properties": {"site": {"type": "string", "enum": [0, "ok"]}}},
     ],
 )
@@ -820,6 +819,139 @@ def test_load_rejects_invalid_brokered_schema_type_values_and_defaults(tmp_path,
         ),
     )
     assert "brokeredTools.0.parameters" in msg
+
+
+def test_load_preserves_high_precision_integral_brokered_yaml_number(tmp_path):
+    path = tmp_path / "agent.yaml"
+    path.write_text(
+        """abiVersion: v0
+metadata:
+  name: precise-agent
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: Be precise.
+tools: []
+brokeredTools:
+  - name: precise_lookup
+    description: Preserve precise identifiers.
+    brokeredClass: read
+    parameters:
+      type: object
+      properties:
+        identifier:
+          type: integer
+          default: 9007199254740993.0
+expose:
+  openai: true
+  port: 8080
+""",
+        encoding="utf-8",
+    )
+
+    spec = load(path)
+
+    default = spec.brokered_tools[0].parameters["properties"]["identifier"]["default"]
+    assert default == 9007199254740993
+    assert isinstance(default, int)
+
+
+def test_load_rejects_lossy_fractional_brokered_yaml_number(tmp_path):
+    path = tmp_path / "agent.yaml"
+    path.write_text(
+        """abiVersion: v0
+metadata:
+  name: lossy-agent
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: Be precise.
+tools: []
+brokeredTools:
+  - name: lossy_lookup
+    description: Reject lossy ratios.
+    brokeredClass: read
+    parameters:
+      type: object
+      properties:
+        ratio:
+          type: number
+          default: 0.100000000000000005
+expose:
+  openai: true
+  port: 8080
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="cannot be represented exactly"):
+        load(path)
+
+
+def test_load_normalizes_cyclic_brokered_schema_to_config_error(tmp_path):
+    path = tmp_path / "agent.yaml"
+    path.write_text(
+        """abiVersion: v0
+metadata:
+  name: cyclic-agent
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: Be safe.
+tools: []
+brokeredTools:
+  - name: cyclic_lookup
+    description: Reject cyclic schemas.
+    brokeredClass: read
+    parameters: &schema
+      type: object
+      properties:
+        nested: *schema
+expose:
+  openai: true
+  port: 8080
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="acyclic JSON-serializable"):
+        load(path)
+
+
+def test_load_normalizes_surrogate_brokered_schema_to_config_error(tmp_path):
+    path = tmp_path / "agent.yaml"
+    path.write_text(
+        """abiVersion: v0
+metadata:
+  name: surrogate-agent
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: Be safe.
+tools: []
+brokeredTools:
+  - name: surrogate_lookup
+    description: Reject invalid Unicode.
+    brokeredClass: read
+    parameters:
+      type: object
+      properties:
+        text:
+          type: string
+          default: "\\ud800"
+expose:
+  openai: true
+  port: 8080
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="JSON serializable UTF-8"):
+        load(path)
 
 
 def test_load_accepts_integral_float_values_for_integer_brokered_schema(tmp_path):

@@ -54,6 +54,7 @@ _DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024
 _MAX_SYNTHETIC_ARRAY_ITEMS = 32
 _MAX_SYNTHETIC_STRING_LENGTH = 4096
 _MAX_SYNTHETIC_VALUES = 256
+_MAX_OUTPUT_DEPTH = 128
 _STATE_TTL_ENV = "AGENTKIT_FOUNDRY_RESPONSE_STATE_TTL_SECONDS"
 _MAX_PENDING_ENV = "AGENTKIT_FOUNDRY_RESPONSE_STATE_MAX_PENDING"
 _MAX_ARGUMENT_BYTES_ENV = "AGENTKIT_FOUNDRY_BROKERED_MAX_ARGUMENT_BYTES"
@@ -394,18 +395,41 @@ class _FoundryResponseStateStore:
         self.max_entries = max_entries
         self.state_file = Path(state_file) if state_file else None
         self._states: dict[str, _HostedResponseState] = {}
+        self._reservations: set[str] = set()
         self._load()
 
     @property
     def backend_name(self) -> str:
         return "file" if self.state_file else "memory"
 
+    def reserve(self, response_id: str) -> None:
+        self.purge_expired()
+        if response_id in self._states or response_id in self._reservations:
+            return
+        non_evictable = sum(
+            1
+            for state in self._states.values()
+            if state.status != "completed" or state.final_payload is None
+        )
+        if non_evictable + len(self._reservations) >= self.max_entries:
+            raise _StateStoreFull("too many pending brokered responses")
+        self._reservations.add(response_id)
+
+    def release_reservation(self, response_id: str) -> None:
+        self._reservations.discard(response_id)
+
     def add(self, state: _HostedResponseState) -> None:
         self.purge_expired()
-        if len(self._states) >= self.max_entries and state.response_id not in self._states:
-            self.evict_completed_to_capacity(reserve_slots=1)
-        if len(self._states) >= self.max_entries and state.response_id not in self._states:
-            raise _StateStoreFull("too many pending brokered responses")
+        if state.response_id in self._states:
+            self._reservations.discard(state.response_id)
+        else:
+            reserved = state.response_id in self._reservations
+            self._reservations.discard(state.response_id)
+            self.evict_completed_to_capacity(reserve_slots=len(self._reservations) + 1)
+            if len(self._states) + len(self._reservations) >= self.max_entries:
+                if reserved:
+                    self._reservations.add(state.response_id)
+                raise _StateStoreFull("too many pending brokered responses")
         self._states[state.response_id] = state
         self._persist()
 
@@ -565,14 +589,19 @@ def _function_call_outputs_from_input(input_value: Any) -> list[dict[str, Any]]:
 
 
 def _reject_nonfinite_json_values(value: Any, *, path: str = "value") -> None:
-    if isinstance(value, float) and not math.isfinite(value):
-        raise ValueError(f"{path} must be finite")
-    if isinstance(value, Mapping):
-        for key, child in value.items():
-            _reject_nonfinite_json_values(child, path=f"{path}.{key}")
-    elif isinstance(value, list):
-        for idx, child in enumerate(value):
-            _reject_nonfinite_json_values(child, path=f"{path}[{idx}]")
+    pending: list[tuple[Any, str, int]] = [(value, path, 0)]
+    while pending:
+        current, current_path, depth = pending.pop()
+        if depth > _MAX_OUTPUT_DEPTH:
+            raise ValueError(f"{path} is nested too deeply")
+        if isinstance(current, float) and not math.isfinite(current):
+            raise ValueError(f"{current_path} must be finite")
+        if isinstance(current, Mapping):
+            for key, child in current.items():
+                pending.append((child, f"{current_path}.{key}", depth + 1))
+        elif isinstance(current, list):
+            for idx, child in enumerate(current):
+                pending.append((child, f"{current_path}[{idx}]", depth + 1))
 
 
 def _parse_output_float(raw: str) -> float:
@@ -609,8 +638,8 @@ def _json_object_from_output(output: Any) -> dict[str, Any]:
             parse_constant=_reject_output_constant,
             object_pairs_hook=_reject_duplicate_output_keys,
         )
-    except json.JSONDecodeError as exc:
-        raise ValueError("function_call_output.output must be a JSON object string") from exc
+    except (json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError("function_call_output.output must be a JSON object string with bounded nesting") from exc
     if not isinstance(parsed, dict):
         raise ValueError("function_call_output.output must be a JSON object")
     approved = parsed.get("approved")
@@ -1695,56 +1724,60 @@ def create_foundry_app(
                 response_id = _new_response_id(previous_response_id_for_output)
                 call_id = f"call_{response_id}_1"
                 try:
-                    model_result = await model_loop.start(run_request, call_id=call_id)
-                except AgentRunError as exc:
-                    return _error(str(exc), status=exc.status, code=exc.code)
-                if isinstance(model_result, ModelLoopFinal):
-                    return JSONResponse(_responses_payload(spec, RunResult(text=model_result.text, usage=model_result.usage), previous_response_id=previous_response_id_for_output))
-                tool = {tool.name: tool for tool in brokered_tools}.get(model_result.name)
-                if tool is None:
-                    return _error("model requested unknown brokered tool", status=400, code="unknown_brokered_tool")
-                try:
-                    _validate_model_brokered_arguments(model_result.arguments)
-                    _validate_model_arguments_for_tool(model_result.arguments, tool)
-                except AgentRunError as exc:
-                    return _error(str(exc), status=exc.status, code=exc.code)
-                if len(_canonical_output_json(model_result.arguments).encode("utf-8")) > max_argument_bytes:
-                    return _error(
-                        "brokered function_call arguments are too large for pending state",
-                        status=413,
-                        code="brokered_arguments_too_large",
-                    )
-                call = _PendingCall(
-                    call_id=call_id,
-                    item_id=_new_function_call_id(response_id),
-                    tool=tool,
-                    arguments=model_result.arguments,
-                )
-                state = _HostedResponseState(
-                    response_id=response_id,
-                    session_id=run_request.session_id,
-                    pending_calls={call_id: call},
-                    expires_at=time.time() + response_states.ttl_seconds,
-                    model_messages=model_result.messages,
-                    initial_usage=dict(model_result.usage),
-                )
-                try:
-                    response_states.add(state)
+                    response_states.reserve(response_id)
                 except _StateStoreFull:
                     return _error(
                         "too many pending brokered responses",
                         status=429,
                         code="brokered_response_state_full",
                     )
-                return JSONResponse(
-                    _function_call_response_payload(
-                        spec,
-                        response_id=response_id,
-                        call=call,
-                        previous_response_id=previous_response_id_for_output,
-                        usage=model_result.usage,
+                try:
+                    try:
+                        model_result = await model_loop.start(run_request, call_id=call_id)
+                    except AgentRunError as exc:
+                        return _error(str(exc), status=exc.status, code=exc.code)
+                    if isinstance(model_result, ModelLoopFinal):
+                        return JSONResponse(_responses_payload(spec, RunResult(text=model_result.text, usage=model_result.usage), previous_response_id=previous_response_id_for_output))
+                    tool = {tool.name: tool for tool in brokered_tools}.get(model_result.name)
+                    if tool is None:
+                        return _error("model requested unknown brokered tool", status=400, code="unknown_brokered_tool")
+                    try:
+                        _validate_model_brokered_arguments(model_result.arguments)
+                        _validate_model_arguments_for_tool(model_result.arguments, tool)
+                    except AgentRunError as exc:
+                        return _error(str(exc), status=exc.status, code=exc.code)
+                    if len(_canonical_output_json(model_result.arguments).encode("utf-8")) > max_argument_bytes:
+                        return _error(
+                            "brokered function_call arguments are too large for pending state",
+                            status=413,
+                            code="brokered_arguments_too_large",
+                        )
+                    call = _PendingCall(
+                        call_id=call_id,
+                        item_id=_new_function_call_id(response_id),
+                        tool=tool,
+                        arguments=model_result.arguments,
                     )
-                )
+                    state = _HostedResponseState(
+                        response_id=response_id,
+                        session_id=run_request.session_id,
+                        pending_calls={call_id: call},
+                        expires_at=time.time() + response_states.ttl_seconds,
+                        model_messages=model_result.messages,
+                        initial_usage=dict(model_result.usage),
+                    )
+                    response_states.add(state)
+                    return JSONResponse(
+                        _function_call_response_payload(
+                            spec,
+                            response_id=response_id,
+                            call=call,
+                            previous_response_id=previous_response_id_for_output,
+                            usage=model_result.usage,
+                        )
+                    )
+                finally:
+                    response_states.release_reservation(response_id)
             tool = _select_brokered_tool(brokered_tools, run_request)
             if tool is None:
                 return _error(

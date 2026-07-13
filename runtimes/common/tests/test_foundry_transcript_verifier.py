@@ -107,6 +107,51 @@ def test_verify_brokered_transcript_rejects_duplicate_keys_in_top_level_files(tm
         verifier.verify_transcript(transcript)
 
 
+def test_verify_brokered_transcript_rejects_mismatched_function_call_response_id(tmp_path):
+    verifier = _load_verifier()
+    transcript = _write_transcript(tmp_path)
+    initial_path = transcript / "02-initial-response.json"
+    initial = json.loads(initial_path.read_text(encoding="utf-8"))
+    initial["output"][0]["response_id"] = "caresp_other"
+    initial_path.write_text(json.dumps(initial), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="function_call response_id must match"):
+        verifier.verify_transcript(transcript)
+
+
+def test_verify_brokered_transcript_rejects_mismatched_final_message_response_id(tmp_path):
+    verifier = _load_verifier()
+    transcript = _write_transcript(tmp_path)
+    continuation_path = transcript / "04-continuation-response.json"
+    continuation = json.loads(continuation_path.read_text(encoding="utf-8"))
+    continuation["output"][0]["response_id"] = "caresp_other"
+    continuation_path.write_text(json.dumps(continuation), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="final message response_id must match"):
+        verifier.verify_transcript(transcript)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("role", "user", "final message role must be assistant"),
+        ("status", "in_progress", "final message status must be completed"),
+    ],
+)
+def test_verify_brokered_transcript_rejects_noncompleted_assistant_message(
+    tmp_path, field: str, value: str, message: str
+):
+    verifier = _load_verifier()
+    transcript = _write_transcript(tmp_path)
+    continuation_path = transcript / "04-continuation-response.json"
+    continuation = json.loads(continuation_path.read_text(encoding="utf-8"))
+    continuation["output"][0][field] = value
+    continuation_path.write_text(json.dumps(continuation), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        verifier.verify_transcript(transcript)
+
+
 def test_verify_brokered_transcript_rejects_reused_continuation_response_id(tmp_path):
     verifier = _load_verifier()
     transcript = _write_transcript(tmp_path)

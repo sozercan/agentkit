@@ -95,11 +95,14 @@ def _json_compatible(value: Any) -> Any:
     return value
 
 
-def _message_text(response: dict[str, Any]) -> str:
+def _message_text(response: dict[str, Any], *, response_id: str) -> str:
     output = response.get("output")
     _require(isinstance(output, list) and len(output) == 1, "final response output must contain exactly one item")
     message = output[0]
     _require(isinstance(message, dict) and message.get("type") == "message", "final response output[0] must be a message")
+    _require(message.get("response_id") == response_id, "final message response_id must match continuation response id")
+    _require(message.get("role") == "assistant", "final message role must be assistant")
+    _require(message.get("status") == "completed", "final message status must be completed")
     content = message.get("content")
     _require(isinstance(content, list) and bool(content), "final message content must be a non-empty array")
     text = content[0].get("text") if isinstance(content[0], dict) else None
@@ -139,6 +142,7 @@ def verify_transcript(
     call = output[0]
     _require(isinstance(call, dict), "initial response output[0] must be an object")
     _require(call.get("type") == "function_call", "initial output item must be function_call")
+    _require(call.get("response_id") == initial_response_id, "function_call response_id must match initial response id")
     function_name = call.get("name")
     _require(function_name == expected_tool_name, f"function_call name must be {expected_tool_name}")
     call_id = call.get("call_id")
@@ -172,7 +176,7 @@ def verify_transcript(
     continuation_response_id = continuation_response.get("id")
     _require(isinstance(continuation_response_id, str) and continuation_response_id.startswith("caresp_"), "continuation response id must start with caresp_")
     _require(continuation_response_id != initial_response_id, "continuation response id must differ from initial response id")
-    final_text = _message_text(continuation_response)
+    final_text = _message_text(continuation_response, response_id=continuation_response_id)
     if expected_final_text is not None:
         _require(final_text == expected_final_text, "final message text did not match expected conformance result")
 

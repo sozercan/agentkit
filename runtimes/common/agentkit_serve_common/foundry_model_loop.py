@@ -209,15 +209,25 @@ def _choice_message(data: Mapping[str, Any]) -> Mapping[str, Any]:
 def _message_text(message: Mapping[str, Any]) -> str:
     content = message.get("content")
     if isinstance(content, str):
-        return content
-    refusal = message.get("refusal")
-    if content is None and isinstance(refusal, str):
-        return refusal
-    raise AgentRunError(
-        "model response final assistant content must be a string",
-        status=502,
-        code="InvalidModelResponse",
-    )
+        text = content
+    else:
+        refusal = message.get("refusal")
+        if content is not None or not isinstance(refusal, str):
+            raise AgentRunError(
+                "model response final assistant content must be a string",
+                status=502,
+                code="InvalidModelResponse",
+            )
+        text = refusal
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise AgentRunError(
+            "model response final assistant content must contain valid Unicode",
+            status=502,
+            code="InvalidModelResponse",
+        ) from exc
+    return text
 
 
 def _parse_arguments(raw: Any) -> dict[str, Any]:
@@ -288,9 +298,9 @@ def _reject_json_constant(raw: str) -> None:
 
 
 def _usage_token_count(value: Any) -> int:
-    if value is None or isinstance(value, bool):
-        if value is None:
-            return 0
+    if value is None:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise AgentRunError(
             "model response usage must contain non-negative integer token counts",
             status=502,
@@ -302,14 +312,7 @@ def _usage_token_count(value: Any) -> int:
             status=502,
             code="InvalidModelResponse",
         )
-    try:
-        count = int(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise AgentRunError(
-            "model response usage must contain non-negative integer token counts",
-            status=502,
-            code="InvalidModelResponse",
-        ) from exc
+    count = int(value)
     if count < 0:
         raise AgentRunError(
             "model response usage must contain non-negative integer token counts",

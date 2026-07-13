@@ -1567,7 +1567,8 @@ class _FakeChatTransport:
         self.requests.append(json.loads(request.content.decode("utf-8")))
         if not self.responses:
             return httpx.Response(500, json={"error": "unexpected extra model call"})
-        return httpx.Response(200, json=self.responses.pop(0))
+        body = json.dumps(self.responses.pop(0), separators=(",", ":")).encode("utf-8")
+        return httpx.Response(200, content=body, headers={"content-type": "application/json"})
 
 
 def _chat_response(message: dict[str, Any], *, prompt_tokens: int = 1, completion_tokens: int = 1) -> dict[str, Any]:
@@ -1620,6 +1621,7 @@ def test_foundry_brokered_model_loop_sends_placeholder_api_key_when_auth_is_omit
     [
         {"prompt_tokens": {"unexpected": 1}},
         {"completion_tokens": "not-a-number"},
+        {"prompt_tokens": "12"},
         {"total_tokens": 1.5},
     ],
 )
@@ -1802,6 +1804,112 @@ def test_foundry_brokered_rejects_denied_continuation_without_error_object(paylo
 
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_function_call_output"
+
+
+def test_foundry_brokered_rejects_deep_continuation_output_without_consuming_state():
+    app = _app()
+    nested: dict[str, Any] = {}
+    for _ in range(200):
+        nested = {"nested": nested}
+
+    with TestClient(app) as client:
+        initial = _start(client)
+        call = _call(initial)
+        rejected = client.post(
+            "/responses",
+            headers=CONTINUATION_AUTH,
+            json=_continuation(initial["id"], call["call_id"], {"approved": True, "output": nested}),
+        )
+        accepted = client.post(
+            "/responses",
+            headers=CONTINUATION_AUTH,
+            json=_continuation(initial["id"], call["call_id"], {"approved": True, "output": {"ok": True}}),
+        )
+
+    assert rejected.status_code == 400
+    assert rejected.json()["error"]["code"] == "invalid_function_call_output"
+    assert accepted.status_code == 200, accepted.text
+
+
+def test_foundry_brokered_model_loop_reserves_capacity_before_model_call():
+    fake = _FakeChatTransport(
+        [
+            _chat_response(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_model",
+                            "type": "function",
+                            "function": {"name": "check-network-telemetry", "arguments": "{}"},
+                        }
+                    ],
+                }
+            ),
+            _chat_response({"role": "assistant", "content": "must not be called"}),
+        ]
+    )
+    app = _model_loop_app(
+        _spec(tool_name="check-network-telemetry"),
+        fake,
+        max_pending_responses=1,
+    )
+
+    with TestClient(app) as client:
+        first = client.post("/responses", json={"input": "check-network-telemetry"})
+        second = client.post("/responses", json={"input": "check-network-telemetry"})
+
+    assert first.status_code == 200, first.text
+    assert _call(first.json())
+    assert second.status_code == 429
+    assert second.json()["error"]["code"] == "brokered_response_state_full"
+    assert len(fake.requests) == 1
+
+
+def test_foundry_brokered_model_loop_unused_reservation_preserves_completed_replay():
+    fake = _FakeChatTransport(
+        [
+            _chat_response(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_model",
+                            "type": "function",
+                            "function": {"name": "check-network-telemetry", "arguments": "{}"},
+                        }
+                    ],
+                }
+            ),
+            _chat_response({"role": "assistant", "content": "First response completed."}),
+            _chat_response({"role": "assistant", "content": "No tool needed."}),
+        ]
+    )
+    app = _model_loop_app(
+        _spec(tool_name="check-network-telemetry"),
+        fake,
+        max_pending_responses=1,
+    )
+
+    with TestClient(app) as client:
+        initial = client.post("/responses", json={"input": "check-network-telemetry"})
+        call = _call(initial.json())
+        continuation = _continuation(
+            initial.json()["id"],
+            call["call_id"],
+            {"approved": True, "output": {"ok": True}},
+        )
+        completed = client.post("/responses", headers=CONTINUATION_AUTH, json=continuation)
+        direct = client.post("/responses", json={"input": "answer without a tool"})
+        replayed = client.post("/responses", headers=CONTINUATION_AUTH, json=continuation)
+
+    assert completed.status_code == 200, completed.text
+    assert direct.status_code == 200, direct.text
+    assert replayed.status_code == 200, replayed.text
+    assert replayed.json() == completed.json()
+    assert len(fake.requests) == 3
 
 
 def test_foundry_brokered_model_loop_rejects_oversized_output_before_resume_or_state_change(tmp_path):
@@ -2056,6 +2164,24 @@ def test_foundry_brokered_model_loop_returns_assistant_refusal_without_tool_call
 
     assert response.status_code == 200, response.text
     assert _message_text(response.json()) == "I cannot help with that."
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"role": "assistant", "content": "\ud800"},
+        {"role": "assistant", "content": None, "refusal": "\ud800"},
+    ],
+)
+def test_foundry_brokered_model_loop_rejects_surrogate_final_text(message: dict[str, Any]):
+    fake = _FakeChatTransport([_chat_response(message)])
+    app = _model_loop_app(_spec(tool_name="check-network-telemetry"), fake)
+
+    with TestClient(app) as client:
+        response = client.post("/responses", json={"input": "Say hello"})
+
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "InvalidModelResponse"
 
 
 @pytest.mark.parametrize("content", [None, {"text": "not supported"}, ["not supported"]])
