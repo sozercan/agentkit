@@ -22,6 +22,7 @@ from agentkit_serve_common.runtime import RunResult, RuntimeSession
 
 CONTINUATION_PROOF = "test-orka-continuation-proof"
 CONTINUATION_AUTH = {"x-agentkit-brokered-continuation-proof": CONTINUATION_PROOF}
+CONTINUATION_PROOF_BODY_FIELD = "brokered_continuation_proof"
 
 
 def _app(spec: AgentSpec | None = None, factory: NoDirectRunFactory | None = None, **kwargs: Any):
@@ -1148,6 +1149,78 @@ def test_foundry_brokered_accepting_continuation_refreshes_state_expiry(monkeypa
     assert state.expires_at > time.time() + 50
 
 
+def test_foundry_brokered_accepts_body_continuation_proof_without_header():
+    app = _app()
+
+    with TestClient(app) as client:
+        initial = _start(client)
+        call = _call(initial)
+        payload = _continuation(initial["id"], call["call_id"], {"approved": True, "output": {"success": True}})
+        payload[CONTINUATION_PROOF_BODY_FIELD] = CONTINUATION_PROOF
+        response = client.post("/responses", json=payload)
+
+    assert response.status_code == 200, response.text
+    assert _message_text(response.json()) == 'Brokered tool conformance_read completed with output: {"success":true}'
+
+
+def test_foundry_brokered_accepts_either_matching_proof_candidate():
+    app = _app()
+
+    with TestClient(app) as client:
+        first_initial = _start(client)
+        first_call = _call(first_initial)
+        first_payload = _continuation(first_initial["id"], first_call["call_id"], {"approved": True, "output": {"success": True}})
+        first_payload[CONTINUATION_PROOF_BODY_FIELD] = CONTINUATION_PROOF
+        correct_body = client.post(
+            "/responses",
+            headers={"x-agentkit-brokered-continuation-proof": "wrong-header"},
+            json=first_payload,
+        )
+
+        second_initial = _start(client)
+        second_call = _call(second_initial)
+        second_payload = _continuation(second_initial["id"], second_call["call_id"], {"approved": True, "output": {"success": True}})
+        second_payload[CONTINUATION_PROOF_BODY_FIELD] = "wrong-body"
+        correct_header = client.post("/responses", headers=CONTINUATION_AUTH, json=second_payload)
+
+    assert correct_body.status_code == 200, correct_body.text
+    assert correct_header.status_code == 200, correct_header.text
+
+
+def test_foundry_brokered_rejects_wrong_or_non_string_body_continuation_proof():
+    app = _app()
+
+    with TestClient(app) as client:
+        initial = _start(client)
+        call = _call(initial)
+        payload = _continuation(initial["id"], call["call_id"], {"approved": True, "output": {"success": True}})
+        payload[CONTINUATION_PROOF_BODY_FIELD] = "wrong-proof"
+        wrong = client.post("/responses", json=payload)
+        payload[CONTINUATION_PROOF_BODY_FIELD] = 123
+        non_string = client.post("/responses", json=payload)
+        payload[CONTINUATION_PROOF_BODY_FIELD] = ""
+        empty = client.post("/responses", json=payload)
+        payload[CONTINUATION_PROOF_BODY_FIELD] = "wrong-💥"
+        non_ascii = client.post("/responses", json=payload)
+        payload[CONTINUATION_PROOF_BODY_FIELD] = "\ud800"
+        unpaired_surrogate = client.post(
+            "/responses",
+            content=json.dumps(payload, ensure_ascii=True),
+            headers={"content-type": "application/json"},
+        )
+
+    assert wrong.status_code == 403
+    assert wrong.json()["error"]["code"] == "brokered_continuation_forbidden"
+    assert non_string.status_code == 403
+    assert non_string.json()["error"]["code"] == "brokered_continuation_forbidden"
+    assert empty.status_code == 403
+    assert empty.json()["error"]["code"] == "brokered_continuation_forbidden"
+    assert non_ascii.status_code == 403
+    assert non_ascii.json()["error"]["code"] == "brokered_continuation_forbidden"
+    assert unpaired_surrogate.status_code == 403
+    assert unpaired_surrogate.json()["error"]["code"] == "brokered_continuation_forbidden"
+
+
 def test_foundry_brokered_rejects_function_call_output_without_orka_continuation_auth():
     app = _app()
 
@@ -1285,6 +1358,66 @@ def test_foundry_brokered_file_state_survives_restart_for_deterministic_continua
 
     assert duplicate.status_code == 200
     assert duplicate.json() == final.json()
+
+
+def test_foundry_brokered_file_state_tracks_session_and_rejects_cross_session_continuation(monkeypatch, tmp_path):
+    state_file = tmp_path / "foundry-session-state.json"
+    monkeypatch.delenv("FOUNDRY_AGENT_SESSION_ID", raising=False)
+
+    with TestClient(_app(response_state_file=state_file)) as client:
+        initial_response = client.post(
+            "/responses",
+            json={"input": "please read telemetry", "agent_session_id": "session-a"},
+        )
+        assert initial_response.status_code == 200, initial_response.text
+        initial = initial_response.json()
+        call = _call(initial)
+
+    stored = json.loads(state_file.read_text(encoding="utf-8"))["states"][initial["id"]]
+    assert stored["sessionID"] == "session-a"
+
+    payload = _continuation(initial["id"], call["call_id"], {"approved": True, "output": {"success": True}})
+    payload[CONTINUATION_PROOF_BODY_FIELD] = CONTINUATION_PROOF
+    with TestClient(_app(response_state_file=state_file)) as client:
+        missing = client.post("/responses", json=payload)
+
+    assert missing.status_code == 409
+    assert missing.json()["error"]["code"] == "response_session_mismatch"
+
+    payload["agent_session_id"] = "session-b"
+    with TestClient(_app(response_state_file=state_file)) as client:
+        mismatch = client.post("/responses", json=payload)
+
+    assert mismatch.status_code == 409
+    assert mismatch.json()["error"]["code"] == "response_session_mismatch"
+
+    payload["agent_session_id"] = "session-a"
+    with TestClient(_app(response_state_file=state_file)) as client:
+        completed = client.post("/responses", json=payload)
+
+    assert completed.status_code == 200, completed.text
+
+
+def test_foundry_brokered_body_proof_is_not_persisted_or_echoed(tmp_path):
+    state_file = tmp_path / "foundry-proof-state.json"
+    app = _app(response_state_file=state_file)
+
+    with TestClient(app) as client:
+        initial_response = client.post(
+            "/responses",
+            json={"input": "please read telemetry", CONTINUATION_PROOF_BODY_FIELD: CONTINUATION_PROOF},
+        )
+        assert initial_response.status_code == 200, initial_response.text
+        initial = initial_response.json()
+        call = _call(initial)
+        payload = _continuation(initial["id"], call["call_id"], {"approved": True, "output": {"success": True}})
+        payload[CONTINUATION_PROOF_BODY_FIELD] = CONTINUATION_PROOF
+        final_response = client.post("/responses", json=payload)
+
+    assert final_response.status_code == 200, final_response.text
+    assert CONTINUATION_PROOF not in json.dumps(initial, sort_keys=True)
+    assert CONTINUATION_PROOF not in json.dumps(final_response.json(), sort_keys=True)
+    assert CONTINUATION_PROOF not in state_file.read_text(encoding="utf-8")
 
 
 def test_foundry_brokered_file_state_survives_restart_for_model_loop_continuation(tmp_path):
@@ -1740,10 +1873,11 @@ def test_foundry_brokered_model_loop_emits_model_requested_tool_and_resumes_to_f
     with TestClient(app) as client:
         initial = client.post("/responses", json={"input": "Check SFO telemetry"})
         call = _call(initial.json())
+        continuation = _continuation(initial.json()["id"], call["call_id"], {"approved": True, "output": {"status": "healthy"}})
+        continuation[CONTINUATION_PROOF_BODY_FIELD] = CONTINUATION_PROOF
         final = client.post(
             "/responses",
-            headers=CONTINUATION_AUTH,
-            json=_continuation(initial.json()["id"], call["call_id"], {"approved": True, "output": {"status": "healthy"}}),
+            json=continuation,
         )
 
     assert initial.status_code == 200, initial.text
@@ -1759,6 +1893,7 @@ def test_foundry_brokered_model_loop_emits_model_requested_tool_and_resumes_to_f
     assert fake.requests[1]["messages"][-1]["role"] == "tool"
     assert fake.requests[1]["messages"][-1]["tool_call_id"] == call["call_id"]
     assert "tools" not in fake.requests[1]
+    assert CONTINUATION_PROOF not in json.dumps(fake.requests, sort_keys=True)
 
 
 def test_foundry_brokered_model_loop_preserves_total_only_usage_across_resume():

@@ -140,6 +140,52 @@ def test_foundry_protocol_forwards_session_header_and_query_param():
     assert factory.runtime.requests[1].session_id == "session-2"
 
 
+def test_foundry_responses_prefers_body_session_id_over_local_query_and_header(monkeypatch):
+    monkeypatch.delenv("FOUNDRY_AGENT_SESSION_ID", raising=False)
+    factory = EchoFactory()
+    app = create_foundry_app(_spec(), factory)
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/responses?agent_session_id=query-session",
+            headers={"x-agent-session-id": "header-session"},
+            json={"input": "hi", "agent_session_id": "body-session"},
+        )
+
+    assert resp.status_code == 200
+    assert factory.runtime.requests[0].session_id == "body-session"
+    assert "agent_session_id" not in resp.json()
+
+
+def test_foundry_responses_prefers_hosted_session_identity_over_caller_fields(monkeypatch):
+    monkeypatch.setenv("FOUNDRY_AGENT_SESSION_ID", "hosted-session")
+    factory = EchoFactory()
+    app = create_foundry_app(_spec(), factory)
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/responses?agent_session_id=query-session",
+            headers={"x-agent-session-id": "header-session"},
+            json={"input": "hi", "agent_session_id": "body-session"},
+        )
+
+    assert resp.status_code == 200
+    assert factory.runtime.requests[0].session_id == "hosted-session"
+    assert "agent_session_id" not in resp.json()
+
+
+def test_foundry_responses_accepts_body_session_id_compatibility_field(monkeypatch):
+    monkeypatch.delenv("FOUNDRY_AGENT_SESSION_ID", raising=False)
+    factory = EchoFactory()
+    app = create_foundry_app(_spec(), factory)
+
+    with TestClient(app) as client:
+        resp = client.post("/responses", json={"input": "hi", "session_id": "compat-session"})
+
+    assert resp.status_code == 200
+    assert factory.runtime.requests[0].session_id == "compat-session"
+
+
 def test_foundry_responses_ignores_portable_optional_fields():
     app = create_foundry_app(_spec(), EchoFactory())
     with TestClient(app) as client:

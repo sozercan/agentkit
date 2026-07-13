@@ -16,6 +16,7 @@ Orka-governed tool locally. A later continuation must provide a matching
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import math
@@ -65,8 +66,10 @@ _MAX_REQUEST_BODY_BYTES_ENV = "AGENTKIT_FOUNDRY_MAX_REQUEST_BODY_BYTES"
 _MAX_MODEL_MESSAGES_BYTES_ENV = "AGENTKIT_FOUNDRY_BROKERED_MAX_MODEL_MESSAGES_BYTES"
 _CONTINUATION_PROOF_ENV = "AGENTKIT_FOUNDRY_BROKERED_CONTINUATION_PROOF"
 _CONTINUATION_PROOF_HEADER = "x-agentkit-brokered-continuation-proof"
+_CONTINUATION_PROOF_BODY_FIELD = "brokered_continuation_proof"
 _MODEL_LOOP_ENV = "AGENTKIT_FOUNDRY_BROKERED_MODEL_LOOP"
 _STATE_FILE_ENV = "AGENTKIT_FOUNDRY_RESPONSE_STATE_FILE"
+_FOUNDRY_SESSION_ENV = "FOUNDRY_AGENT_SESSION_ID"
 
 
 def _new_response_id(previous_response_id: str | None = None) -> str:
@@ -159,10 +162,45 @@ def _session_id_from_request(request: Request) -> str | None:
         value = request.headers.get(name)
         if value and value.strip():
             return value.strip()
-    value = os.environ.get("FOUNDRY_AGENT_SESSION_ID")
+    value = os.environ.get(_FOUNDRY_SESSION_ENV)
     if value and value.strip():
         return value.strip()
     return None
+
+
+def _effective_responses_session_id(request: Request, data: Mapping[str, Any]) -> str | None:
+    # The hosted platform identity describes the sandbox that actually received
+    # the request, so prefer it over caller-controlled routing fields. Body
+    # fields remain useful for direct/local protocol fidelity when the hosted
+    # runtime environment is unavailable.
+    hosted = os.environ.get(_FOUNDRY_SESSION_ENV)
+    if hosted and hosted.strip():
+        return hosted.strip()
+    for name in ("agent_session_id", "session_id"):
+        value = data.get(name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return _session_id_from_request(request)
+
+
+def _continuation_proof_matches(
+    *,
+    configured: str,
+    request: Request,
+    data: Mapping[str, Any],
+) -> bool:
+    candidates: list[str] = []
+    header = request.headers.get(_CONTINUATION_PROOF_HEADER)
+    if isinstance(header, str) and header:
+        candidates.append(header)
+    body = data.get(_CONTINUATION_PROOF_BODY_FIELD)
+    if isinstance(body, str) and body:
+        candidates.append(body)
+    configured_bytes = configured.encode("utf-8", errors="surrogatepass")
+    return any(
+        hmac.compare_digest(candidate.encode("utf-8", errors="surrogatepass"), configured_bytes)
+        for candidate in candidates
+    )
 
 
 def _responses_content_to_text(content: Any) -> str:
@@ -1484,6 +1522,8 @@ async def _handle_brokered_continuation(
     input_value: Any,
     continuation_proof: str | None,
     request: Request,
+    request_data: Mapping[str, Any],
+    session_id: str | None,
     max_output_bytes: int,
     model_loop: BrokeredChatModelLoop | None = None,
 ) -> JSONResponse:
@@ -1493,8 +1533,11 @@ async def _handle_brokered_continuation(
             status=503,
             code="brokered_continuation_auth_required",
         )
-    provided_proof = request.headers.get(_CONTINUATION_PROOF_HEADER)
-    if provided_proof != continuation_proof:
+    if not _continuation_proof_matches(
+        configured=continuation_proof,
+        request=request,
+        data=request_data,
+    ):
         return _error(
             "function_call_output is restricted to the Orka broker continuation path",
             status=403,
@@ -1532,6 +1575,14 @@ async def _handle_brokered_continuation(
         return _error("previous_response_id state has expired", status=410, code="response_state_expired")
     except KeyError:
         return _error("unknown previous_response_id", status=404, code="unknown_previous_response_id")
+
+    stored_session_id = state.session_id.strip() if isinstance(state.session_id, str) else ""
+    if stored_session_id and session_id != stored_session_id:
+        return _error(
+            "previous_response_id requires the same effective Foundry session",
+            status=409,
+            code="response_session_mismatch",
+        )
 
     item = outputs[0]
     call_id = item.get("call_id")
@@ -1773,6 +1824,7 @@ def create_foundry_app(
         if "input" not in data:
             return _error("Missing 'input' in request", status=400, code="missing_input")
 
+        session_id = _effective_responses_session_id(request, data)
         previous_response_id = data.get("previous_response_id")
         function_outputs = _function_call_outputs_from_input(data["input"])
         if brokered_tools and function_outputs:
@@ -1783,6 +1835,8 @@ def create_foundry_app(
                 input_value=data["input"],
                 continuation_proof=continuation_proof,
                 request=request,
+                request_data=data,
+                session_id=session_id,
                 max_output_bytes=max_output_bytes,
                 model_loop=model_loop,
             )
@@ -1805,7 +1859,7 @@ def create_foundry_app(
         try:
             run_request = _responses_input_to_run_request(
                 data["input"],
-                session_id=_session_id_from_request(request),
+                session_id=session_id,
             )
         except ValueError as exc:
             return _error(str(exc), status=400, code="invalid_input")

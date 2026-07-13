@@ -121,6 +121,8 @@ Continuation request:
 ```json
 {
   "previous_response_id": "<response-id>",
+  "agent_session_id": "<platform-session-id>",
+  "brokered_continuation_proof": "<configured-proof>",
   "input": [
     {
       "type": "function_call_output",
@@ -154,12 +156,32 @@ Canonical denied/error payload:
 known `previous_response_id` has a pending matching `call_id` **and** the request
 uses the Orka-only continuation path. Configure
 `AGENTKIT_FOUNDRY_BROKERED_CONTINUATION_PROOF` and have the Orka hosted-Responses
-adapter send it as `X-AgentKit-Brokered-Continuation-Proof`; ordinary client
-requests must not be able to submit tool results. Unknown response IDs, unknown
-call IDs, orphan tool outputs, duplicate conflicts, malformed outputs, missing or
-wrong continuation auth, and multiple tool outputs all return deterministic error
-envelopes. An identical duplicate continuation from the broker path returns the
-same final response idempotently.
+adapter send it either as `X-AgentKit-Brokered-Continuation-Proof` or as the
+top-level JSON field `brokered_continuation_proof`. AgentKit accepts either
+candidate so a wrong or stripped header does not override a matching body value.
+The proof is never added to model input, persisted response state, or response
+payloads. Ordinary client requests must not be able to submit tool results.
+Unknown response IDs, unknown call IDs, orphan tool outputs, duplicate conflicts,
+malformed outputs, missing or wrong continuation auth, and multiple tool outputs
+all return deterministic error envelopes. An identical duplicate continuation
+from the broker path returns the same final response idempotently.
+
+The body field is an AgentKit/Orka compatibility extension rather than a standard
+OpenAI Responses field. Prove that the target Foundry gateway accepts and forwards
+it before relying on this carrier. A static proof in request bodies is suitable
+only for bounded demos because platform/request logging can expose replayable
+body values; production designs should use a short-lived proof bound to the
+response, call, output digest, and expiry.
+
+For Foundry hosted sessions, `agent_session_id` is a gateway routing field. Orka
+must capture the platform-returned value from the initial public response and
+send it in the continuation body. Inside the container, AgentKit treats
+`FOUNDRY_AGENT_SESSION_ID` as the authoritative sandbox identity and uses body,
+query, or compatibility-header values only when that hosted identity is absent.
+Continuation state with a stored session ID requires the same effective session;
+a missing or different identity is rejected with `response_session_mismatch`.
+AgentKit does not synthesize or echo a public
+`agent_session_id`; Foundry owns that response field.
 
 ## Response IDs and state
 
@@ -174,12 +196,21 @@ function-call responses until the proof is configured.
 By default the state backend is in-memory and suitable for deterministic local
 smoke and single-replica demos only. Set
 `AGENTKIT_FOUNDRY_RESPONSE_STATE_FILE=/path/to/state.json` to persist pending and
-completed brokered response state as an atomically rewritten JSON file; with a
-shared persistent volume and sticky/single-writer deployment this allows a known
-`previous_response_id` to survive a container restart. Deployments without a
-shared file or platform-managed store must pin one replica or use sticky routing;
-otherwise a continuation that lands on a different/restarted container fails
-safely with `unknown_previous_response_id`. Pending state expires after
+completed brokered response state as an atomically rewritten JSON file. For a
+Foundry hosted-session smoke, use an already-expanded path under the persisted
+session home, such as `$HOME/.agentkit/foundry-response-state.json`, and run one
+app process/Uvicorn worker. A literal `$HOME` in an environment value may not be
+expanded by the deployment system, so prefer launcher-side `Path.home()` path
+construction. The public continuation must still carry the same
+`agent_session_id` so Foundry routes it to that sandbox.
+
+An immediate initial/continuation pair proves routing affinity, not file recovery.
+To prove persistence, stop the Foundry session between the two requests and show
+that a new process reloads the pending state. Configure the state TTL and Orka
+approval timeout longer than that test. Deployments without a session-persisted
+file, shared file, or platform-managed store must pin one replica or use sticky
+routing; otherwise a continuation that lands on a different/restarted container
+fails safely with `unknown_previous_response_id`. Pending state expires after
 `AGENTKIT_FOUNDRY_RESPONSE_STATE_TTL_SECONDS` (default: 900 seconds); expired
 continuations fail with `response_state_expired`. The store is bounded by
 `AGENTKIT_FOUNDRY_RESPONSE_STATE_MAX_PENDING` (default: 128), and generated
@@ -194,7 +225,12 @@ The file is sensitive runtime state, not harmless metadata. In model-loop mode
 it includes model messages such as system instructions, conversation history,
 and user prompts, in addition to brokered arguments/outputs and cached final
 payloads. Store it on access-controlled storage and apply an appropriate
-retention/deletion policy.
+retention/deletion policy. Logical TTL is not secure deletion: expired JSON can
+remain in a stopped session's file until the store is loaded and rewritten, and
+the file may remain visible through Foundry session-file APIs. Use synthetic data
+and document the deployment as single-principal/single-tenant unless explicit
+Foundry isolation keys are configured consistently for all requests and session
+operations.
 
 ## Streaming
 
@@ -208,10 +244,11 @@ smokes deterministic while making streaming support an explicit future step.
 - `tools_unsupported`: remove request-level `tools`; use static `brokeredTools`.
 - `tool_choice_unsupported`: brokered Foundry mode owns tool selection.
 - `brokered_continuation_auth_required`: set `AGENTKIT_FOUNDRY_BROKERED_CONTINUATION_PROOF` before accepting brokered continuations.
-- `brokered_continuation_forbidden`: only Orka should send `X-AgentKit-Brokered-Continuation-Proof` with the configured proof.
+- `brokered_continuation_forbidden`: only Orka should send the configured proof in `X-AgentKit-Brokered-Continuation-Proof` or top-level `brokered_continuation_proof`.
 - `missing_previous_response_id`: a `function_call_output` cannot start a new run.
 - `unknown_previous_response_id`: state is missing, expired/purged, or routed to a
   different replica.
+- `response_session_mismatch`: the continuation reached a different effective Foundry session than the one that created the pending response.
 - `response_pending_function_call_output`: finish the pending brokered tool call before sending a normal follow-up turn against that response.
 - `brokered_tool_selection_required`: name exactly one configured brokered tool in deterministic mode when multiple schemas or any non-conformance single schema are configured.
 - `brokered_response_state_full`: too many uncontinued brokered responses are pending. Completed entries are evicted before this error is returned.
