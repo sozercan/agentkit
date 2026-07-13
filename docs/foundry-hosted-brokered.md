@@ -56,6 +56,11 @@ startup fails if a configured digest no longer matches the safe schema in
 `agent.yaml`. Orka still validates every live call against current Tool CRDs at
 execution time.
 
+The exporter accepts canonical `core.orka.ai/v1alpha1` `Tool` resources and
+reads the governed class from `spec.brokeredToolClass`. Tools without that field
+are not brokered and are omitted; exporting an input set with no brokered tools
+fails instead of silently downgrading a tool to `read`.
+
 Example export command:
 
 ```sh
@@ -210,14 +215,22 @@ fails safely with `unknown_previous_response_id`. Pending state expires after
 continuations fail with `response_state_expired`. The store is bounded by
 `AGENTKIT_FOUNDRY_RESPONSE_STATE_MAX_PENDING` (default: 128), and generated
 brokered arguments are bounded by `AGENTKIT_FOUNDRY_BROKERED_MAX_ARGUMENT_BYTES`
-(default: 8192) before state is accepted. A platform-managed state backend is
-still required before treating multi-replica production as fully supported.
-Logical TTL is not secure deletion: expired JSON can remain in a stopped
-session's file until the store is loaded and rewritten. State files can contain
-tool arguments, model/user history, accepted outputs, and final payloads, and may
-be visible through Foundry session-file APIs. Use synthetic data and document the
-deployment as single-principal/single-tenant unless explicit Foundry isolation
-keys are configured consistently for all requests and session operations.
+(default: 8192) before state is accepted. Brokered continuation outputs are
+bounded by `AGENTKIT_FOUNDRY_BROKERED_MAX_OUTPUT_BYTES` (default: 65536) before
+they are persisted, replayed, embedded in deterministic responses, or sent back
+through the model loop. A platform-managed state backend is still required
+before treating multi-replica production as fully supported.
+
+The file is sensitive runtime state, not harmless metadata. In model-loop mode
+it includes model messages such as system instructions, conversation history,
+and user prompts, in addition to brokered arguments/outputs and cached final
+payloads. Store it on access-controlled storage and apply an appropriate
+retention/deletion policy. Logical TTL is not secure deletion: expired JSON can
+remain in a stopped session's file until the store is loaded and rewritten, and
+the file may remain visible through Foundry session-file APIs. Use synthetic data
+and document the deployment as single-principal/single-tenant unless explicit
+Foundry isolation keys are configured consistently for all requests and session
+operations.
 
 ## Streaming
 
@@ -240,6 +253,7 @@ smokes deterministic while making streaming support an explicit future step.
 - `brokered_tool_selection_required`: name exactly one configured brokered tool in deterministic mode when multiple schemas or any non-conformance single schema are configured.
 - `brokered_response_state_full`: too many uncontinued brokered responses are pending. Completed entries are evicted before this error is returned.
 - `brokered_arguments_too_large`: generated brokered call arguments exceeded the configured pending-state byte budget.
+- `brokered_output_too_large`: a brokered `function_call_output` exceeded the configured output byte budget.
 - `unknown_call_id`: the output did not match the pending function call.
 - `conflicting_duplicate_continuation`: the same `call_id` was already completed
   with different output.
@@ -259,7 +273,7 @@ It returns the deterministic `conformance_read` function call on the first
 Local runnable entrypoint check:
 
 ```sh
-uv run --directory runtimes/common --extra dev agentkit-foundry-conformance --dry-run
+uv run --directory runtimes/common --extra dev --extra foundry-conformance agentkit-foundry-conformance --dry-run
 ```
 
 Container entrypoint example for the A0 spike image:
@@ -295,7 +309,7 @@ deploy/foundry/scripts/local_brokered_conformance_container.sh \
 Local proof:
 
 ```sh
-uv run --directory runtimes/common --extra dev pytest -q tests/test_foundry_conformance.py
+uv run --directory runtimes/common --extra dev --extra foundry-conformance pytest -q tests/test_foundry_conformance.py
 ```
 
 Live direct-endpoint proof after deployment:
@@ -328,6 +342,7 @@ Local proof for this production adapter path:
 ```sh
 docker build . -f test/foundry-brokered-agentkit/Dockerfile -t agentkit-foundry-brokered:local
 docker run --rm \
+  -e AGENTKIT_AUTH_TOKEN=local-dummy-token \
   -e AGENTKIT_FOUNDRY_BROKERED_CONTINUATION_PROOF=local-dev-proof \
   -p 127.0.0.1:18092:8088 \
   agentkit-foundry-brokered:local

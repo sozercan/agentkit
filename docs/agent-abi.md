@@ -57,19 +57,20 @@ tools:
       type: bearer
       tokenEnv: TOOLBOX_TOKEN
 
-# Static safe schemas for Foundry hosted Orka-brokered mode. These are schema-only;
-# no execution URL, auth header, token, or Secret ref is allowed here.
-brokeredTools:
-  - name: check-network-telemetry
-    description: Read sanitized optical telemetry.
-    brokeredClass: read
-    parameters:
-      type: object
-      properties:
-        site:
-          type: string
-      required: [site]
-    schemaDigest: sha256:<optional deploy-time digest>
+# Alternative to `tools` above for Foundry hosted Orka-brokered mode. v0 does
+# not allow owned `tools` and `brokeredTools` together, so remove/comment the
+# `tools` block before enabling this schema-only block.
+# brokeredTools:
+#   - name: check-network-telemetry
+#     description: Read sanitized optical telemetry.
+#     brokeredClass: read
+#     parameters:
+#       type: object
+#       properties:
+#         site:
+#           type: string
+#       required: [site]
+#     schemaDigest: sha256:<optional deploy-time digest>
 
 env:
   - name: REQUIRED_FOO

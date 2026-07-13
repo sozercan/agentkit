@@ -22,6 +22,8 @@ from typing import Any, Literal, Mapping
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from .yaml_support import safe_load_lossless
+
 # The ABI schema version this reader understands (agent-abi.md: ``abiVersion: v0``).
 ABI_VERSION = "v0"
 _PROVIDER_OPENAI_COMPATIBLE = "openai-compatible"
@@ -54,6 +56,7 @@ _CREDENTIAL_HEADER_NAMES = {
 _BROKERED_CLASSES = {"read", "write", "coordination"}
 _BROKERED_SCHEMA_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _MAX_BROKERED_SCHEMA_BYTES = 64 * 1024
+_MAX_EXACT_JSON_FLOAT_INTEGER = (1 << 53) - 1
 _UNSAFE_BROKERED_FIELD_NAMES = {
     "auth",
     "authorization",
@@ -182,6 +185,12 @@ def _canonical_json(value: Any) -> str:
             parts.append(json.dumps(key, ensure_ascii=False, separators=(",", ":")) + ":" + _canonical_json(value[key]))
         return "{" + ",".join(parts) + "}"
     raise TypeError(f"unsupported JSON value {type(value).__name__}")
+
+
+def _parse_canonical_int(value: str) -> int | float:
+    if value == "-0":
+        return -0.0
+    return int(value)
 
 
 def brokered_tool_schema_digest(
@@ -317,8 +326,12 @@ def _validate_json_schema_subset(schema: Any, *, path: str) -> None:
         for key, value in dependent_required.items():
             if not isinstance(key, str) or not isinstance(value, list) or not all(isinstance(item, str) for item in value):
                 raise ValueError(f"{path}.dependentRequired values must be string arrays")
-    if "enum" in schema and not isinstance(schema["enum"], list):
-        raise ValueError(f"{path}.enum must be an array")
+    if "enum" in schema:
+        enum_values = schema["enum"]
+        if not isinstance(enum_values, list):
+            raise ValueError(f"{path}.enum must be an array")
+        if not enum_values:
+            raise ValueError(f"{path}.enum must contain at least one value")
     if "pattern" in schema:
         raise ValueError(f"{path}.pattern is not supported for deterministic brokered tool schemas")
     if "additionalProperties" in schema:
@@ -618,7 +631,12 @@ def _value_matches_schema_type(value: Any, schema_type: str) -> bool:
     if schema_type == "boolean":
         return isinstance(value, bool)
     if schema_type == "integer":
-        return isinstance(value, int) and not isinstance(value, bool)
+        return (isinstance(value, int) and not isinstance(value, bool)) or (
+            isinstance(value, float)
+            and math.isfinite(value)
+            and value.is_integer()
+            and abs(value) <= _MAX_EXACT_JSON_FLOAT_INTEGER
+        )
     if schema_type == "number":
         return isinstance(value, (int, float)) and not isinstance(value, bool)
     if schema_type == "string":
@@ -702,12 +720,17 @@ class BrokeredToolSpec(_Strict):
         if not isinstance(value, dict):
             raise ValueError("brokered tool parameters must be a JSON Schema object")
         try:
+            _validate_schema_value_constraints(value, path="brokeredTools[].parameters")
+        except RecursionError as exc:
+            raise ValueError("brokered tool parameters must be an acyclic JSON-serializable object") from exc
+        try:
             encoded = _canonical_json(value)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("brokered tool parameters must be JSON serializable") from exc
-        if len(encoded.encode("utf-8")) > _MAX_BROKERED_SCHEMA_BYTES:
+            encoded_bytes = encoded.encode("utf-8")
+        except (TypeError, ValueError, RecursionError, UnicodeEncodeError) as exc:
+            raise ValueError("brokered tool parameters must be JSON serializable UTF-8") from exc
+        if len(encoded_bytes) > _MAX_BROKERED_SCHEMA_BYTES:
             raise ValueError("brokered tool parameters schema is too large")
-        cloned = json.loads(encoded)
+        cloned = json.loads(encoded, parse_int=_parse_canonical_int)
         if cloned.get("type") != "object":
             raise ValueError("brokered tool parameters schema must set type: object")
         _validate_json_schema_subset(cloned, path="brokeredTools[].parameters")
@@ -877,8 +900,8 @@ def load(path: str | Path) -> AgentSpec:
         raise ConfigError(f"cannot read agent config {p}: {exc}") from exc
 
     try:
-        data = yaml.safe_load(raw)
-    except yaml.YAMLError as exc:
+        data = safe_load_lossless(raw)
+    except (yaml.YAMLError, ValueError, RecursionError) as exc:
         raise ConfigError(f"agent config {p} is not valid YAML: {exc}") from exc
 
     if not isinstance(data, dict):
