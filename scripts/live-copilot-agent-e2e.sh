@@ -190,7 +190,7 @@ main() {
     docker buildx inspect --bootstrap
   fi
   make build-agentkit TAG="${tag}"
-  make build-serve-maf TAG="${tag}"
+  make build-serve-maf TAG="${tag}" PLATFORM="${platform}"
 
   log "Building live MAF agent image"
   docker buildx build ${buildx_args[@]+"${buildx_args[@]}"} . -f test/agentkitfile-maf-live.yaml \

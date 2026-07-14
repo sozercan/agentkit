@@ -28,6 +28,10 @@ _ORKA_BROKERED_TOOL_CLASSES = ("read", "write", "coordination")
 def _load_orka_tool_crd_documents(raw: str) -> list[Any]:
     return [doc for doc in safe_load_all_lossless(raw) if doc is not None]
 
+_ORKA_TOOL_API_VERSION = "core.orka.ai/v1alpha1"
+_ORKA_TOOL_KIND = "Tool"
+_ORKA_BROKERED_TOOL_CLASSES = ("read", "write", "coordination")
+
 
 def brokered_tool_definitions(spec: AgentSpec) -> list[BrokeredToolDefinition]:
     """Return runtime-safe brokered tool definitions from an AgentSpec."""

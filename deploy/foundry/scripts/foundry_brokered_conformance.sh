@@ -29,6 +29,8 @@ Optional:
   AGENTKIT_EXPECTED_CALL_ID_PREFIX  Optional required call_id prefix, e.g. call_.
   AGENTKIT_EXPECTED_FINAL_TEXT  Optional exact final assistant text; defaults are derived for SDK/AgentKit fixtures.
   AGENTKIT_CONTINUATION_PROOF   Optional x-agentkit-brokered-continuation-proof header.
+  AGENTKIT_CONTINUATION_PROOF_BODY  Optional proof sent only in the live continuation body.
+                                    It is omitted from the archived request transcript.
 EOF
 }
 
@@ -100,7 +102,15 @@ continuation_response="$transcript_dir/04-continuation-response.json"
 summary_file="$transcript_dir/summary.json"
 expected_output_file="$transcript_dir/.expected-output.json"
 expected_final_text_file="$transcript_dir/.expected-final-text.txt"
-trap 'rm -f -- "$expected_output_file" "$expected_final_text_file"' EXIT
+rm -f "$continuation_response" "$summary_file" "$summary_file.tmp" "$expected_output_file" "$expected_final_text_file"
+continuation_response_wire="$(mktemp "${TMPDIR:-/tmp}/agentkit-foundry-continuation-response.XXXXXX")"
+continuation_request_wire="$(mktemp "${TMPDIR:-/tmp}/agentkit-foundry-continuation-request.XXXXXX")"
+
+cleanup() {
+  rm -f "$continuation_response_wire" "$continuation_request_wire" "$summary_file.tmp" \
+    "$expected_output_file" "$expected_final_text_file"
+}
+trap cleanup EXIT
 printf '%s' "$conformance_output" >"$expected_output_file"
 printf '%s' "$expected_final_text" >"$expected_final_text_file"
 
@@ -118,7 +128,12 @@ printf '%s\n' "$initial_curl_config" | curl -fsS \
   -d "@$initial_request" >"$initial_response"
 unset initial_curl_config
 
-read -r response_id call_id < <(EXPECTED_TOOL_NAME="$expected_tool_name" EXPECTED_ARGUMENTS="$expected_arguments" EXPECTED_CALL_ID="$expected_call_id" EXPECTED_CALL_ID_PREFIX="$expected_call_id_prefix" python3 - "$initial_response" <<'PY'
+EXPECTED_TOOL_NAME="$expected_tool_name" \
+EXPECTED_ARGUMENTS="$expected_arguments" \
+EXPECTED_CALL_ID="$expected_call_id" \
+EXPECTED_CALL_ID_PREFIX="$expected_call_id_prefix" \
+CONFORMANCE_OUTPUT="$conformance_output" \
+python3 - "$initial_response" <<'PY' >"$continuation_request"
 import json
 import os
 import sys
@@ -145,25 +160,39 @@ if expected_call_id != "auto":
 if expected_call_id_prefix:
     assert call_id.startswith(expected_call_id_prefix), call
 assert json.loads(call.get("arguments") or "{}") == expected_arguments, call
-print(response_id, call_id)
-PY
-)
 
-PREVIOUS_RESPONSE_ID="$response_id" CALL_ID="$call_id" CONFORMANCE_OUTPUT="$conformance_output" python3 - <<'PY' >"$continuation_request"
-import json
-import os
-# Validate the configured output is JSON before placing it in the Responses item.
-json.loads(os.environ["CONFORMANCE_OUTPUT"])
-print(json.dumps({
-    "previous_response_id": os.environ["PREVIOUS_RESPONSE_ID"],
+conformance_output = os.environ["CONFORMANCE_OUTPUT"]
+json.loads(conformance_output)
+continuation = {
+    "previous_response_id": response_id,
     "input": [{
         "type": "function_call_output",
-        "call_id": os.environ["CALL_ID"],
-        "output": os.environ["CONFORMANCE_OUTPUT"],
+        "call_id": call_id,
+        "output": conformance_output,
         "status": "completed",
     }],
-}, separators=(",", ":")))
+}
+agent_session_id = body.get("agent_session_id")
+if agent_session_id is not None:
+    assert isinstance(agent_session_id, str) and agent_session_id.strip(), body
+    continuation["agent_session_id"] = agent_session_id
+print(json.dumps(continuation, separators=(",", ":")))
 PY
+
+cp "$continuation_request" "$continuation_request_wire"
+if [[ -n "${AGENTKIT_CONTINUATION_PROOF_BODY:-}" ]]; then
+  AGENTKIT_CONTINUATION_PROOF_BODY="$AGENTKIT_CONTINUATION_PROOF_BODY" \
+    python3 -c '
+import json
+import os
+import sys
+from pathlib import Path
+
+body = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+body["brokered_continuation_proof"] = os.environ["AGENTKIT_CONTINUATION_PROOF_BODY"]
+print(json.dumps(body, separators=(",", ":")))
+' "$continuation_request" >"$continuation_request_wire"
+fi
 
 continuation_curl_config="$({
   write_curl_header "Authorization: Bearer ${token}"
@@ -175,8 +204,74 @@ printf '%s\n' "$continuation_curl_config" | curl -fsS \
   --config - \
   -H 'content-type: application/json' \
   "$AGENT_RESPONSES_ENDPOINT" \
-  -d "@$continuation_request" >"$continuation_response"
+  -d "@$continuation_request_wire" >"$continuation_response_wire"
 unset continuation_curl_config
+
+AGENTKIT_CONTINUATION_PROOF="${AGENTKIT_CONTINUATION_PROOF:-}" \
+AGENTKIT_CONTINUATION_PROOF_BODY="${AGENTKIT_CONTINUATION_PROOF_BODY:-}" \
+python3 - "$continuation_response_wire" <<'PY'
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+_JSON_ESCAPE_RE = re.compile(r'(?:\\u[0-9A-Fa-f]{4}){1,2}|\\["\\/bfnrt]')
+
+def decoded_fragment_contains_proof(value, proof):
+    seen = set()
+    while value not in seen:
+        seen.add(value)
+        if proof in value:
+            return True
+
+        def decode_escape(match):
+            try:
+                return json.loads(f'"{match.group(0)}"')
+            except (ValueError, RecursionError):
+                return match.group(0)
+
+        decoded = _JSON_ESCAPE_RE.sub(decode_escape, value)
+        if decoded == value:
+            return False
+        value = decoded
+    return False
+
+
+def contains_proof(value, proof):
+    pending = [value]
+    decoded_strings = set()
+    while pending:
+        current = pending.pop()
+        if isinstance(current, str):
+            if decoded_fragment_contains_proof(current, proof):
+                return True
+            if current in decoded_strings:
+                continue
+            decoded_strings.add(current)
+            try:
+                pending.append(json.loads(current))
+            except (ValueError, RecursionError):
+                pass
+        elif isinstance(current, list):
+            pending.extend(current)
+        elif isinstance(current, dict):
+            pending.extend(current.keys())
+            pending.extend(current.values())
+    return False
+
+
+raw = Path(sys.argv[1]).read_text(encoding="utf-8")
+try:
+    decoded = json.loads(raw)
+except json.JSONDecodeError:
+    decoded = None
+for name in ("AGENTKIT_CONTINUATION_PROOF", "AGENTKIT_CONTINUATION_PROOF_BODY"):
+    proof = os.environ.get(name, "")
+    if proof and (contains_proof(raw, proof) or contains_proof(decoded, proof)):
+        raise SystemExit("gateway response contains continuation proof; refusing to archive transcript")
+PY
+mv "$continuation_response_wire" "$continuation_response"
 
 verifier_args=(
   "$transcript_dir"
@@ -191,8 +286,7 @@ if [[ -n "$expected_call_id_prefix" ]]; then
   verifier_args+=(--expected-call-id-prefix "$expected_call_id_prefix")
 fi
 python3 deploy/foundry/scripts/verify_brokered_transcript.py "${verifier_args[@]}" >"$summary_file.tmp"
-rm -f "$summary_file.tmp"
-rm -f "$expected_output_file" "$expected_final_text_file"
+cleanup
 trap - EXIT
 
 echo "Foundry brokered conformance passed. Sanitized transcript: ${transcript_dir}"

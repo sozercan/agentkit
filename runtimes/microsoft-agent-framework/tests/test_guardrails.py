@@ -492,6 +492,126 @@ def test_runtime_session_cache_is_bounded(monkeypatch):
     assert list(runtime.sessions) == ["s2", "s3"]
 
 
+def test_session_cache_evicts_idle_entry_when_new_session_acquires(monkeypatch):
+    from agentkit_serve_common.config import AgentSpec
+    from agentkit_serve_common.conversation import RunRequest
+    from agentkit_serve_common.runtime import RunResult
+
+    import asyncio
+
+    b_started = asyncio.Event()
+    release_b = asyncio.Event()
+    seen_sessions = {}
+
+    async def fake_run_agent(agent, request, *, session=None, include_history=True):
+        seen_sessions[session.session_id] = session
+        if session.session_id == "b":
+            b_started.set()
+            await release_b.wait()
+        return RunResult(text="ok")
+
+    monkeypatch.setattr(agent_factory, "run_agent", fake_run_agent)
+    monkeypatch.setenv("AGENTKIT_SESSION_CACHE_MAX", "1")
+    spec = AgentSpec.model_validate({
+        "abiVersion": "v0",
+        "metadata": {"name": "x"},
+        "model": {"provider": "openai-compatible", "baseURL": "https://api.openai.com/v1", "name": "gpt-4o-mini"},
+        "instructions": "hi",
+        "tools": [],
+        "expose": {"openai": True, "port": 8080},
+    })
+    runtime = agent_factory.MAFRuntime(spec)
+    runtime.agent = object()
+
+    async def exercise():
+        await runtime.run(RunRequest(prompt="one", session_id="a"))
+        b_task = asyncio.create_task(runtime.run(RunRequest(prompt="two", session_id="b")))
+        await asyncio.wait_for(b_started.wait(), timeout=1)
+        state_while_b_runs = (
+            list(runtime.sessions),
+            runtime.sessions.get("b") is seen_sessions["b"],
+            runtime.session_claims.get("b"),
+            runtime.session_locks["b"].locked(),
+        )
+        release_b.set()
+        await b_task
+        return state_while_b_runs
+
+    assert asyncio.run(exercise()) == (["b"], True, 1, True)
+
+
+def test_session_cache_overflow_keeps_current_session_serialized(monkeypatch):
+    from agentkit_serve_common.config import AgentSpec
+    from agentkit_serve_common.conversation import RunRequest
+    from agentkit_serve_common.runtime import RunResult
+
+    import asyncio
+
+    busy_started = asyncio.Event()
+    release_busy = asyncio.Event()
+    first_current_started = asyncio.Event()
+    release_first_current = asyncio.Event()
+    second_current_started = asyncio.Event()
+    current_sessions = []
+
+    async def fake_run_agent(agent, request, *, session=None, include_history=True):
+        if session.session_id == "busy":
+            busy_started.set()
+            await release_busy.wait()
+        elif session.session_id == "current":
+            current_sessions.append(session)
+            if len(current_sessions) == 1:
+                first_current_started.set()
+                await release_first_current.wait()
+            else:
+                second_current_started.set()
+        return RunResult(text="ok")
+
+    monkeypatch.setattr(agent_factory, "run_agent", fake_run_agent)
+    monkeypatch.setenv("AGENTKIT_SESSION_CACHE_MAX", "1")
+    spec = AgentSpec.model_validate({
+        "abiVersion": "v0",
+        "metadata": {"name": "x"},
+        "model": {"provider": "openai-compatible", "baseURL": "https://api.openai.com/v1", "name": "gpt-4o-mini"},
+        "instructions": "hi",
+        "tools": [],
+        "expose": {"openai": True, "port": 8080},
+    })
+    runtime = agent_factory.MAFRuntime(spec)
+    runtime.agent = object()
+
+    async def exercise():
+        busy = asyncio.create_task(runtime.run(RunRequest(prompt="hold", session_id="busy")))
+        await asyncio.wait_for(busy_started.wait(), timeout=1)
+
+        first_current = asyncio.create_task(runtime.run(RunRequest(prompt="one", session_id="current")))
+        await asyncio.wait_for(first_current_started.wait(), timeout=1)
+        cached_during_overflow = list(runtime.sessions)
+
+        second_current = asyncio.create_task(runtime.run(RunRequest(prompt="two", session_id="current")))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        serialized_while_first_running = not second_current_started.is_set()
+
+        release_first_current.set()
+        await asyncio.wait_for(second_current_started.wait(), timeout=1)
+        release_busy.set()
+        await asyncio.gather(busy, first_current, second_current)
+        cached_after_saturation = list(runtime.sessions)
+        await runtime.run(RunRequest(prompt="three", session_id="current"))
+        return cached_during_overflow, serialized_while_first_running, cached_after_saturation
+
+    cached_during_overflow, serialized_while_first_running, cached_after_saturation = asyncio.run(exercise())
+    same_session_entry = len(current_sessions) == 3 and all(session is current_sessions[0] for session in current_sessions)
+
+    assert (cached_during_overflow, serialized_while_first_running, cached_after_saturation, same_session_entry) == (
+        ["busy", "current"],
+        True,
+        ["current"],
+        True,
+    )
+
+
 def test_context_credential_uses_async_default_for_search(monkeypatch):
     from agentkit_serve_common.config import ContextProviderSpec
 
@@ -633,6 +753,53 @@ def test_reused_session_does_not_duplicate_explicit_history(monkeypatch):
     assert include_history_values == [True, False]
 
 
+def test_failed_first_turn_keeps_explicit_history_on_retry(monkeypatch):
+    from agentkit_serve_common.config import AgentSpec
+    from agentkit_serve_common.conversation import ConversationTurn, RunRequest
+    from agentkit_serve_common.runtime import RunResult
+
+    include_history_values = []
+    seen_sessions = []
+
+    async def fake_run_agent(agent, request, *, session=None, include_history=True):
+        include_history_values.append(include_history)
+        seen_sessions.append(session)
+        if len(include_history_values) == 1:
+            raise RuntimeError("provider unavailable")
+        return RunResult(text="ok")
+
+    monkeypatch.setattr(agent_factory, "run_agent", fake_run_agent)
+    spec = AgentSpec.model_validate({
+        "abiVersion": "v0",
+        "metadata": {"name": "x"},
+        "model": {"provider": "openai-compatible", "baseURL": "https://api.openai.com/v1", "name": "gpt-4o-mini"},
+        "instructions": "hi",
+        "tools": [],
+        "expose": {"openai": True, "port": 8080},
+    })
+    runtime = agent_factory.MAFRuntime(spec)
+    runtime.agent = object()
+    request = RunRequest(
+        prompt="current",
+        history=(ConversationTurn(role="user", text="old"),),
+        session_id="s1",
+    )
+
+    import asyncio
+    import pytest
+
+    async def exercise():
+        with pytest.raises(RuntimeError, match="provider unavailable"):
+            await runtime.run(request)
+        await runtime.run(request)
+        await runtime.run(request)
+
+    asyncio.run(exercise())
+
+    assert include_history_values == [True, True, False]
+    assert seen_sessions[0] is seen_sessions[1] is seen_sessions[2]
+
+
 def test_remote_mcp_disables_ping(monkeypatch):
     tool = ToolSpec.model_validate({
         "name": "toolbox",
@@ -665,8 +832,9 @@ def test_build_mcp_skills_provider_uses_pinned_streamable_http_factory(monkeypat
         return FakeTransport()
 
     class FakeClientSession:
-        def __init__(self, read, write):
+        def __init__(self, read, write, *, read_timeout_seconds):
             calls["session_args"] = (read, write)
+            calls["session_timeout"] = read_timeout_seconds
 
         async def __aenter__(self):
             return self
@@ -683,6 +851,7 @@ def test_build_mcp_skills_provider_uses_pinned_streamable_http_factory(monkeypat
     monkeypatch.setattr(streamable_mod, "streamablehttp_client", fake_streamablehttp_client)
     monkeypatch.setattr(session_mod, "ClientSession", FakeClientSession)
     monkeypatch.setenv("TOOLBOX_ENDPOINT", "https://example.test/toolboxes/t/mcp")
+    monkeypatch.setenv("AGENTKIT_MCP_TIMEOUT", "7")
     spec = AgentSpec.model_validate({
         "abiVersion": "v0",
         "metadata": {"name": "x"},
@@ -703,6 +872,7 @@ def test_build_mcp_skills_provider_uses_pinned_streamable_http_factory(monkeypat
     assert "httpx_client_factory" in calls
     assert "http_client" not in calls
     assert calls["initialized"] is True
+    assert calls["session_timeout"].total_seconds() == 7
 
 
 

@@ -7,9 +7,15 @@ import (
 	"github.com/moby/buildkit/util/system"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sozercan/agentkit/pkg/agentkit/abi"
+	"github.com/sozercan/agentkit/pkg/agentkit/config"
 	"github.com/sozercan/agentkit/pkg/agentkit/effective"
 	"github.com/sozercan/agentkit/pkg/agentkit/runtimes"
 	"github.com/sozercan/agentkit/pkg/utils"
+)
+
+const (
+	imageProtocols     = "openai,foundry,orka"
+	orkaHarnessVersion = "orka.harness.v1"
 )
 
 // NewImageConfig builds the OCI image config for the agent image. It deliberately
@@ -17,10 +23,7 @@ import (
 // loopback by default, and exposes the serve port.
 func NewImageConfig(agent effective.Agent, platform *specs.Platform) *specs.Image {
 	img := &specs.Image{
-		Platform: specs.Platform{
-			Architecture: platform.Architecture,
-			OS:           utils.PlatformLinux,
-		},
+		Platform: *platform,
 	}
 	img.RootFS.Type = "layers"
 
@@ -50,20 +53,27 @@ func NewImageConfig(agent effective.Agent, platform *specs.Platform) *specs.Imag
 		capabilities = strings.Join(runtimeSpec.Capabilities, ",")
 	}
 
-	img.Config.Labels = map[string]string{
+	generatedLabels := map[string]string{
 		// Current AgentKit label namespace.
-		utils.LabelPrefix + ".runtime": agent.Runtime,
-		utils.LabelPrefix + ".name":    agent.Metadata.Name,
-		utils.LabelPrefix + ".abi":     abi.Version,
+		config.ImageLabelNativeRuntime: agent.Runtime,
+		config.ImageLabelNativeName:    agent.Metadata.Name,
+		config.ImageLabelNativeABI:     abi.Version,
 		// Cross-orchestrator metadata consumed by Orka and other registries.
-		"ai.agentkit.abi":                abi.Version,
-		"ai.agentkit.runtime":            agent.Runtime,
-		"ai.agentkit.protocols":          "openai,foundry,orka",
-		"ai.agentkit.capabilities":       capabilities,
-		"ai.orka.harness.version":        "orka.harness.v1",
-		"org.opencontainers.image.title": agent.Metadata.Name,
+		config.ImageLabelPortableABI:          abi.Version,
+		config.ImageLabelPortableRuntime:      agent.Runtime,
+		config.ImageLabelPortableProtocols:    imageProtocols,
+		config.ImageLabelPortableCapabilities: capabilities,
+		config.ImageLabelOrkaHarnessVersion:   orkaHarnessVersion,
+		config.ImageLabelOCITitle:             agent.Metadata.Name,
 	}
+
+	img.Config.Labels = make(map[string]string, len(agent.Metadata.Labels)+len(generatedLabels))
 	for k, v := range agent.Metadata.Labels {
+		img.Config.Labels[k] = v
+	}
+	// Generated identity and capability labels are applied last so they remain
+	// authoritative even if an invalid effective.Agent bypasses config validation.
+	for k, v := range generatedLabels {
 		img.Config.Labels[k] = v
 	}
 

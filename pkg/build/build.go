@@ -7,9 +7,7 @@ import (
 
 	"github.com/containerd/platforms"
 	controlapi "github.com/moby/buildkit/api/services/control"
-	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/exporter/containerimage/exptypes"
-	"github.com/moby/buildkit/frontend/dockerui"
 	"github.com/moby/buildkit/frontend/gateway/client"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
@@ -36,22 +34,33 @@ const (
 func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 	opts := c.BuildOpts().Opts
 
-	cfg, err := getAgentkitfileConfig(ctx, c)
+	loaded, err := loadAgentkitfile(ctx, c)
 	if err != nil {
 		return nil, errors.Wrap(err, "getting agentkitfile")
 	}
+	cfg := loaded.config
 
 	if err := validateAgentConfig(cfg); err != nil {
 		return nil, errors.Wrap(err, "validating agentkitfile")
 	}
 
 	target := opts[keyTarget]
-	matched, route, rc, ok := lookupRoute(target, cfg.Runtime)
+	effectiveRuntime := canonicalEffectiveRuntime(cfg.Runtime)
+	matched, route, rc, ok := lookupRoute(target, effectiveRuntime)
 	if !ok {
-		return nil, errors.Errorf("no route for target %q with runtime %q", target, cfg.Runtime)
+		if targetRuntime, namesRuntime := targetRuntimeSegment(target); namesRuntime && targetRuntime != effectiveRuntime {
+			return nil, errors.Errorf(
+				"no route for target %q: target runtime %q does not match effective runtime %q",
+				target,
+				targetRuntime,
+				effectiveRuntime,
+			)
+		}
+		return nil, errors.Errorf("no route for target %q with effective runtime %q", target, effectiveRuntime)
 	}
-	_ = matched
-
+	if handler := contextRouteHandlers[matched]; handler != nil {
+		return handler(ctx, c, cfg, rc, loaded.instructions)
+	}
 	return route.Handler(ctx, c, cfg, rc)
 }
 
@@ -64,6 +73,10 @@ func validateAgentConfig(cfg *config.AgentConfig) error {
 // then solves the agent image for every target platform in parallel — mirroring
 // AIKit's buildInference multi-platform errgroup.
 func HandleAgent(ctx context.Context, c client.Client, cfg *config.AgentConfig, rc *RuntimeConfig) (*client.Result, error) {
+	return handleAgent(ctx, c, cfg, rc, localContextReader{client: c})
+}
+
+func handleAgent(ctx context.Context, c client.Client, cfg *config.AgentConfig, rc *RuntimeConfig, reader contextFileReader) (*client.Result, error) {
 	opts := c.BuildOpts().Opts
 
 	cacheImports, err := parseCacheOptions(opts)
@@ -73,7 +86,7 @@ func HandleAgent(ctx context.Context, c client.Client, cfg *config.AgentConfig, 
 
 	// Resolve instructions (inline → as-is; file → read from build context) BEFORE
 	// converting, so the baked agent.yaml carries a fully-resolved scalar (ABI).
-	instructions, err := resolveInstructions(ctx, c, cfg)
+	instructions, err := resolveInstructionSource(ctx, reader, cfg.Instructions)
 	if err != nil {
 		return nil, errors.Wrap(err, "resolving instructions")
 	}
@@ -193,74 +206,6 @@ func buildImage(ctx context.Context, c client.Client, agentSpec effective.Agent,
 	return &result, nil
 }
 
-// getAgentkitfileConfig resolves the agentkitfile from the build context
-// (git/http/local — copied verbatim from AIKit's getAikitfileConfig) and parses
-// it with the strict, kind-probed loader.
-func getAgentkitfileConfig(ctx context.Context, c client.Client) (*config.AgentConfig, error) {
-	opts := c.BuildOpts().Opts
-	filename := opts[keyFilename]
-	if filename == "" {
-		filename = defaultAgentkitfileName
-	}
-
-	name := "load agentkitfile"
-	if filename != defaultAgentkitfileName {
-		name += " from " + filename
-	}
-
-	contextName := opts[localNameContext]
-
-	var st *llb.State
-	var ok bool
-	keepGit := true
-	switch {
-	case strings.HasPrefix(contextName, "git"):
-		st, ok, _ = dockerui.DetectGitContext(contextName, &keepGit)
-		if !ok {
-			return nil, errors.Errorf("invalid git context %s", contextName)
-		}
-	case strings.HasPrefix(contextName, "http") || strings.HasPrefix(contextName, "https"):
-		st, ok, _ = dockerui.DetectGitContext(contextName, &keepGit)
-		if !ok {
-			st, filename, _ = dockerui.DetectHTTPContext(contextName)
-		}
-	default:
-		localSt := llb.Local(localNameDockerfile,
-			llb.IncludePatterns([]string{filename}),
-			llb.SessionID(c.BuildOpts().SessionID),
-			llb.SharedKeyHint(defaultAgentkitfileName),
-			dockerui.WithInternalName(name),
-		)
-		st = &localSt
-	}
-
-	def, err := st.Marshal(ctx)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to marshal local source")
-	}
-	res, err := c.Solve(ctx, client.SolveRequest{Definition: def.ToPB()})
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to resolve agentkitfile")
-	}
-	ref, err := res.SingleRef()
-	if err != nil {
-		return nil, err
-	}
-	dt, err := ref.ReadFile(ctx, client.ReadRequest{Filename: filename})
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to read agentkitfile")
-	}
-
-	cfg, err := config.NewFromBytes(dt)
-	if err != nil {
-		return nil, errors.Wrap(err, "getting config")
-	}
-	if err := parseBuildArgs(opts, cfg); err != nil {
-		return nil, errors.Wrap(err, "parsing build args")
-	}
-	return cfg, nil
-}
-
 // getBuildArg returns the value of build-arg:<k>, or "".
 func getBuildArg(opts map[string]string, k string) string {
 	if opts != nil {
@@ -305,7 +250,10 @@ func parseCacheOptions(opts map[string]string) ([]client.CacheOptionsEntry, erro
 		if err := json.Unmarshal([]byte(cacheImportsStr), &cacheImportsUM); err != nil {
 			return nil, errors.Wrapf(err, "failed to unmarshal %s", keyCacheImports)
 		}
-		for _, um := range cacheImportsUM {
+		for i, um := range cacheImportsUM {
+			if um == nil {
+				return nil, errors.Errorf("%s entry %d is null", keyCacheImports, i)
+			}
 			cacheImports = append(cacheImports, client.CacheOptionsEntry{Type: um.Type, Attrs: um.Attrs})
 		}
 	}

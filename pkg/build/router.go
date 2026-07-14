@@ -14,9 +14,10 @@ import (
 // RouteHandler builds a result for a resolved <runtime>/<outputkind> route.
 type RouteHandler func(ctx context.Context, c client.Client, cfg *config.AgentConfig, rc *RuntimeConfig) (*client.Result, error)
 
-// Route is one entry in the flat router (plan §7.1). Output kinds are
-// re-packagings of the one agent layer, so v0 has a single handler (image);
-// adding agentpack/compose later is a new route, not a Build() rewrite.
+type contextRouteHandler func(ctx context.Context, c client.Client, cfg *config.AgentConfig, rc *RuntimeConfig, reader contextFileReader) (*client.Result, error)
+
+// Route is one entry in the flat router (plan §7.1). Keep this as the original
+// single-field public layout: downstream packages may use unkeyed Route literals.
 type Route struct {
 	Handler RouteHandler
 }
@@ -46,14 +47,19 @@ func (rc *RuntimeConfig) AdapterRef(opts map[string]string) string {
 // runtime name to its config. Both are DERIVED in init() from runtimes.Runtimes
 // (the single source of truth) — dispatch as data.
 var (
-	routes         = map[string]Route{}
-	runtimeConfigs = map[string]*RuntimeConfig{}
+	routes = map[string]Route{}
+	// Keep request-scoped context dispatch outside the exported Route value so
+	// its historical one-field unkeyed literals remain source-compatible.
+	contextRouteHandlers = map[string]contextRouteHandler{}
+	runtimeConfigs       = map[string]*RuntimeConfig{}
 )
 
 // registerRuntime wires a runtime adapter and its image output route.
 func registerRuntime(rc *RuntimeConfig) {
 	runtimeConfigs[rc.Name] = rc
-	routes[rc.Name+"/"+utils.OutputKindImage] = Route{Handler: HandleAgent}
+	key := rc.Name + "/" + utils.OutputKindImage
+	routes[key] = Route{Handler: HandleAgent}
+	contextRouteHandlers[key] = handleAgent
 }
 
 func init() {
@@ -85,6 +91,23 @@ func defaultRuntime() string {
 	return runtimes.DefaultRuntime()
 }
 
+func canonicalEffectiveRuntime(runtime string) string {
+	if runtime == "" {
+		runtime = defaultRuntime()
+	}
+	return runtimes.CanonicalRuntime(runtime)
+}
+
+func targetRuntimeSegment(target string) (string, bool) {
+	if target == "" {
+		return "", false
+	}
+	segment, _, _ := strings.Cut(target, "/")
+	runtime := runtimes.CanonicalRuntime(segment)
+	_, registered := runtimeConfigs[runtime]
+	return runtime, registered
+}
+
 // lookupRoute resolves a build target plus the effective runtime to a route and
 // its RuntimeConfig.
 //
@@ -93,12 +116,9 @@ func defaultRuntime() string {
 // target resolves to "<runtime>/image". A bare runtime ("pydantic-ai") resolves
 // to "<runtime>/image". Otherwise exact match, then longest-prefix match.
 func lookupRoute(target, runtime string) (matched string, route Route, rc *RuntimeConfig, ok bool) {
-	if runtime == "" {
-		runtime = defaultRuntime()
-	}
-	// Resolve a user-written alias (e.g. "maf") to its canonical name so the
-	// registry lookup and the "<runtime>/image" route key always agree.
-	runtime = runtimes.CanonicalRuntime(runtime)
+	// Resolve an omitted or aliased runtime to the canonical adapter identity so
+	// the registry lookup and the "<runtime>/image" route key always agree.
+	runtime = canonicalEffectiveRuntime(runtime)
 	rc, rcOK := runtimeConfigs[runtime]
 	if !rcOK {
 		return "", Route{}, nil, false
@@ -109,6 +129,14 @@ func lookupRoute(target, runtime string) (matched string, route Route, rc *Runti
 	// canonicalize the target's runtime segment before any comparison/lookup, or
 	// an alias target would miss every branch and fail to route.
 	target = canonicalizeTargetRuntime(target)
+
+	// A target that names a registered runtime must agree with the effective
+	// runtime. Otherwise route and RuntimeConfig would describe different
+	// adapters (for example, langgraph/image with pydantic-ai config).
+	targetRuntime, namesRuntime := targetRuntimeSegment(target)
+	if namesRuntime && targetRuntime != runtime {
+		return "", Route{}, nil, false
+	}
 
 	// Empty or bare-runtime target → the runtime's image route.
 	if target == "" || target == runtime {

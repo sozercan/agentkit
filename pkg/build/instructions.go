@@ -11,52 +11,62 @@ import (
 )
 
 // contextFileReader is the small seam between authored instruction sources and
-// the BuildKit context. Tests use an in-memory Adapter; production uses the
-// BuildKit gateway client Adapter below.
+// the BuildKit context. Tests use an in-memory adapter; production binds it to
+// either a resolved remote reference or the local context session input.
 type contextFileReader interface {
 	ReadFile(ctx context.Context, path string) ([]byte, error)
 }
 
-// buildkitContextReader reads files from the build context through BuildKit.
-type buildkitContextReader struct {
+// localContextReader reads files from BuildKit's local context session input.
+type localContextReader struct {
 	client client.Client
 }
 
-func (r buildkitContextReader) ReadFile(ctx context.Context, path string) ([]byte, error) {
-	localSt := llb.Local(localNameContext,
-		llb.IncludePatterns([]string{path}),
+func (r localContextReader) ReadFile(ctx context.Context, path string) ([]byte, error) {
+	state := llb.Local(localNameContext,
+		llb.FollowPaths([]string{path}),
 		llb.SessionID(r.client.BuildOpts().SessionID),
 		llb.SharedKeyHint("agentkit-instructions"),
 		dockerui.WithInternalName("load instructions "+path),
 	)
-	def, err := localSt.Marshal(ctx)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to marshal instructions source")
-	}
-	res, err := r.client.Solve(ctx, client.SolveRequest{Definition: def.ToPB()})
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to resolve instructions source")
-	}
-	ref, err := res.SingleRef()
+	ref, err := solveStateReference(ctx, r.client, &state, "local instructions source")
 	if err != nil {
 		return nil, err
 	}
-	dt, err := ref.ReadFile(ctx, client.ReadRequest{Filename: path})
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to read context file")
+	return readReferenceFile(ctx, ref, path, "local build context")
+}
+
+// referenceContextReader reuses one solved remote context reference, ensuring
+// relative instruction files come from the same Git or HTTP archive snapshot as
+// the Agentkitfile.
+type referenceContextReader struct {
+	ref         client.Reference
+	description string
+}
+
+func (r referenceContextReader) ReadFile(ctx context.Context, path string) ([]byte, error) {
+	return readRemoteReferenceFile(ctx, r.ref, client.ReadRequest{Filename: path}, r.description)
+}
+
+type unsupportedContextReader struct {
+	err error
+}
+
+func (r unsupportedContextReader) ReadFile(context.Context, string) ([]byte, error) {
+	if r.err == nil {
+		return nil, errors.New("instructions.file is not supported by this build context")
 	}
-	return dt, nil
+	return nil, r.err
 }
 
-// resolveInstructions returns the fully-resolved system prompt: inline content
-// as-is, or file contents read from the build context.
-func resolveInstructions(ctx context.Context, c client.Client, cfg *config.AgentConfig) (string, error) {
-	return resolveInstructionSource(ctx, buildkitContextReader{client: c}, cfg.Instructions)
-}
-
+// resolveInstructionSource returns the fully-resolved system prompt: inline
+// content as-is, or file contents read from the supplied build-context reader.
 func resolveInstructionSource(ctx context.Context, reader contextFileReader, source config.Source) (string, error) {
 	if source.File == "" {
 		return source.Inline, nil
+	}
+	if reader == nil {
+		return "", errors.Errorf("failed to read instructions file %s: build context reader is nil", source.File)
 	}
 
 	dt, err := reader.ReadFile(ctx, source.File)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 import time
 from datetime import UTC, datetime, timedelta
 from types import TracebackType
@@ -9,12 +11,15 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+import agentkit_serve_common.orka as orka_module
 from agentkit_serve_common.config import AgentSpec
 from agentkit_serve_common.conversation import RunRequest
 from agentkit_serve_common.orka import ORKA_HARNESS_VERSION, create_orka_app
 from agentkit_serve_common.runtime import (
+    AgentRunError,
     BrokeredToolCall,
     BrokeredToolDefinition,
+    BrokeredToolResult,
     OfflineEchoRuntimeFactory,
     RunResult,
     RuntimeSession,
@@ -23,6 +28,8 @@ from agentkit_serve_common.runtime import (
 
 AUTH = {"authorization": "Bearer test-token"}
 TERMINAL_TYPES = {"TurnCompleted", "TurnFailed", "TurnCancelled"}
+EXPECTED_MAX_OUTPUT_BYTES = 512 * 1024
+ORKA_CLIENT_MAX_SSE_TOKEN_BYTES = 1 << 20
 
 
 def _deadline() -> str:
@@ -80,6 +87,43 @@ class EchoFactory:
 
     def build_runtime(self, spec: AgentSpec) -> RuntimeSession:
         return self.runtime
+
+
+class StaticOutputRuntime:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    async def __aenter__(self) -> RuntimeSession:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool | None:
+        return None
+
+    async def run(self, request: RunRequest) -> RunResult:
+        return RunResult(text=self.text)
+
+
+class StaticOutputFactory:
+    def __init__(self, text: str) -> None:
+        self.runtime = StaticOutputRuntime(text)
+
+    def build_runtime(self, spec: AgentSpec) -> RuntimeSession:
+        return self.runtime
+
+
+class RaisingRuntime(StaticOutputRuntime):
+    async def run(self, request: RunRequest) -> RunResult:
+        raise RuntimeError(self.text)
+
+
+class RaisingFactory(StaticOutputFactory):
+    def __init__(self, message: str) -> None:
+        self.runtime = RaisingRuntime(message)
 
 
 def _start_payload(**overrides: Any) -> dict[str, Any]:
@@ -198,6 +242,17 @@ def _wait_for_event_type(client: TestClient, turn_id: str, event_type: str) -> d
     raise AssertionError(f"timed out waiting for {event_type}")
 
 
+def _wait_for_tool_call_id(client: TestClient, turn_id: str, tool_call_id: str) -> dict[str, Any]:
+    for _ in range(100):
+        events = client.app.state.turns[turn_id].events
+        for event in events:
+            frame = event.as_frame()
+            if frame["type"] == "ToolCallRequested" and frame["toolCallID"] == tool_call_id:
+                return frame
+        time.sleep(0.01)
+    raise AssertionError(f"timed out waiting for tool call {tool_call_id}")
+
+
 def _frames(resp_text: str) -> list[dict[str, Any]]:
     frames: list[dict[str, Any]] = []
     for raw in resp_text.strip().split("\n\n"):
@@ -207,6 +262,26 @@ def _frames(resp_text: str) -> list[dict[str, Any]]:
         assert len(data_lines) == 1, raw
         frames.append(json.loads(data_lines[0]))
     return frames
+
+
+def _assert_sse_lines_fit_orka_client(raw: bytes) -> None:
+    data_lines = [line for line in raw.splitlines() if line.startswith(b"data: ")]
+    assert data_lines
+    assert max(map(len, data_lines)) < ORKA_CLIENT_MAX_SSE_TOKEN_BYTES
+
+
+def _compact_json_bytes(value: Any) -> bytes:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
+
+
+def _json_object_with_size(size: int) -> dict[str, str]:
+    empty = _compact_json_bytes({"value": ""})
+    remaining = size - len(empty)
+    assert remaining >= 0
+    value = "é" * (remaining // len("é".encode())) + "x" * (remaining % len("é".encode()))
+    output = {"value": value}
+    assert len(_compact_json_bytes(output)) == size
+    return output
 
 
 def _create_turn(client: TestClient, **overrides: Any) -> str:
@@ -274,6 +349,7 @@ def test_orka_health_and_capabilities_are_open_and_match_contract():
         "supportsSuspend": False,
         "supportsWorkspaceSnapshot": False,
         "maxConcurrentTurns": 1,
+        "maxOutputBytes": EXPECTED_MAX_OUTPUT_BYTES,
         "metadata": {"agentName": "orka-test", "model": "gpt-4o-mini", "agentkitProvider": "openai-compatible"},
     }
 
@@ -292,7 +368,6 @@ def test_orka_turn_lifecycle_streams_contract_frames_and_one_terminal():
     _assert_frame_identity(frames[1], seq=2, typ="RuntimeOutput")
     assert frames[1]["contentText"] == "echo: hello"
     assert frames[1]["content"] == {
-        "message": "echo: hello",
         "usage": {"completion_tokens": 2, "prompt_tokens": 1, "total_tokens": 3},
     }
     _assert_frame_identity(frames[2], seq=3, typ="TurnCompleted")
@@ -314,6 +389,174 @@ def test_orka_events_support_after_seq_replay():
     assert [frame["seq"] for frame in all_events] == [1, 2, 3]
     assert replay.status_code == 200
     assert [frame["type"] for frame in _frames(replay.text)] == ["RuntimeOutput", "TurnCompleted"]
+
+
+def test_orka_observed_output_uses_utf8_bytes_accepts_exact_limit_and_replays_safely():
+    output = "é" * (EXPECTED_MAX_OUTPUT_BYTES // len("é".encode()))
+    assert len(output.encode()) == EXPECTED_MAX_OUTPUT_BYTES
+    app = create_orka_app(_spec(), StaticOutputFactory(output), AUTH["authorization"].removeprefix("Bearer "))
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(client, turnID="turn-output-boundary")
+        response = client.get(f"/v1/turns/{turn_id}/events", headers=AUTH)
+        replay = client.get(f"/v1/turns/{turn_id}/events?afterSeq=1", headers=AUTH)
+
+    frames = _frames(response.text)
+    assert [frame["type"] for frame in frames] == ["TurnStarted", "RuntimeOutput", "TurnCompleted"]
+    assert frames[1]["contentText"] == output
+    assert frames[1]["content"] == {"usage": {}}
+    assert frames[2]["completed"]["result"] == output
+    assert [frame["type"] for frame in _frames(replay.text)] == ["RuntimeOutput", "TurnCompleted"]
+    _assert_sse_lines_fit_orka_client(response.content)
+    _assert_sse_lines_fit_orka_client(replay.content)
+
+
+def test_orka_observed_output_over_utf8_limit_fails_without_retaining_payload_and_replays_terminal():
+    output = "é" * (EXPECTED_MAX_OUTPUT_BYTES // len("é".encode())) + "x"
+    output_bytes = len(output.encode())
+    assert output_bytes == EXPECTED_MAX_OUTPUT_BYTES + 1
+    app = create_orka_app(_spec(), StaticOutputFactory(output), AUTH["authorization"].removeprefix("Bearer "))
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(client, turnID="turn-output-over-limit")
+        response = client.get(f"/v1/turns/{turn_id}/events", headers=AUTH)
+        replay = client.get(f"/v1/turns/{turn_id}/events?afterSeq=1", headers=AUTH)
+        retained = client.app.state.turns[turn_id].events
+
+    frames = _frames(response.text)
+    assert [frame["type"] for frame in frames] == ["TurnStarted", "TurnFailed"]
+    assert frames[-1]["failed"] == {
+        "reason": "MaxOutputBytesExceeded",
+        "message": (
+            f"runtime output is {output_bytes} UTF-8 bytes; "
+            f"maxOutputBytes is {EXPECTED_MAX_OUTPUT_BYTES}"
+        ),
+        "retryable": False,
+    }
+    assert [frame["type"] for frame in _frames(replay.text)] == ["TurnFailed"]
+    assert all(event.content_text != output for event in retained)
+    assert all(event.completed is None or event.completed.get("result") != output for event in retained)
+    _assert_sse_lines_fit_orka_client(response.content)
+    _assert_sse_lines_fit_orka_client(replay.content)
+
+
+def test_orka_observed_output_that_expands_past_scanner_limit_fails_with_visible_terminal():
+    output = "\x00" * 200_000
+    assert len(output.encode()) < EXPECTED_MAX_OUTPUT_BYTES
+    app = create_orka_app(_spec(), StaticOutputFactory(output), AUTH["authorization"].removeprefix("Bearer "))
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(client, turnID="turn-output-json-expansion")
+        response = client.get(f"/v1/turns/{turn_id}/events", headers=AUTH)
+
+    frames = _frames(response.text)
+    assert [frame["type"] for frame in frames] == ["TurnStarted", "TurnFailed"]
+    assert frames[-1]["failed"]["reason"] == "HarnessFrameTooLarge"
+    assert "Orka client limit is 1048575" in frames[-1]["failed"]["message"]
+    _assert_sse_lines_fit_orka_client(response.content)
+
+
+def test_orka_observed_output_with_unpaired_surrogate_fails_with_visible_terminal():
+    app = create_orka_app(
+        _spec(),
+        StaticOutputFactory("\ud800"),
+        AUTH["authorization"].removeprefix("Bearer "),
+    )
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(client, turnID="turn-output-invalid-utf8")
+        response = client.get(f"/v1/turns/{turn_id}/events", headers=AUTH)
+
+    frames = _frames(response.text)
+    assert [frame["type"] for frame in frames] == ["TurnStarted", "TurnFailed"]
+    assert frames[-1]["failed"] == {
+        "reason": "InvalidOutputEncoding",
+        "message": "runtime output is not valid UTF-8",
+        "retryable": False,
+    }
+    _assert_sse_lines_fit_orka_client(response.content)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [pytest.param("\x00" * 200_000, id="oversized"), pytest.param("\ud800", id="invalid-utf8")],
+)
+def test_orka_runtime_failure_with_unstreamable_detail_uses_bounded_terminal_fallback(message: str):
+    app = create_orka_app(
+        _spec(),
+        RaisingFactory(message),
+        AUTH["authorization"].removeprefix("Bearer "),
+    )
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(client, turnID="turn-unstreamable-failure-detail")
+        response = client.get(f"/v1/turns/{turn_id}/events", headers=AUTH)
+
+    frames = _frames(response.text)
+    assert [frame["type"] for frame in frames] == ["TurnStarted", "TurnFailed"]
+    assert frames[-1]["failed"] == {
+        "reason": "TerminalFrameRejected",
+        "message": "terminal failure details could not be emitted safely",
+        "retryable": False,
+    }
+    _assert_sse_lines_fit_orka_client(response.content)
+
+
+def test_orka_turn_state_rejects_nonterminal_events_after_terminal():
+    async def exercise() -> list[str]:
+        state = orka_module.TurnState(
+            runtime_session_id="runtime-session-1",
+            turn_id="turn-terminal-finality",
+            correlation_id="corr-1",
+        )
+        await state.append("TurnStarted", summary="turn started")
+        await state.append(
+            "TurnFailed",
+            summary="turn failed",
+            failed={"reason": "TestFailure", "message": "failed", "retryable": False},
+        )
+        with pytest.raises(orka_module.AgentRunError, match="already terminal"):
+            await state.append("RuntimeOutput", summary="late output", content_text="late")
+        return [event.type for event in state.events]
+
+    assert asyncio.run(exercise()) == ["TurnStarted", "TurnFailed"]
+
+
+def test_orka_rejects_an_unstreamable_start_frame_without_retaining_a_poisoned_turn():
+    app = create_orka_app(_spec(), EchoFactory(), AUTH["authorization"].removeprefix("Bearer "))
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        rejected = client.post(
+            "/v1/turns",
+            json=_start_payload(turnID="turn-unstreamable-start", metadata={"large": "\x00" * 200_000}),
+            headers=AUTH,
+        )
+        accepted = client.post(
+            "/v1/turns",
+            json=_start_payload(turnID="turn-after-unstreamable-start"),
+            headers=AUTH,
+        )
+
+    assert rejected.status_code == 413
+    assert "TurnStarted SSE data line" in rejected.text
+    assert accepted.status_code == 202
+    assert "turn-unstreamable-start" not in app.state.turns
+
+
+def test_orka_rejects_start_frame_text_that_is_not_valid_utf8_without_retaining_turn():
+    app = create_orka_app(_spec(), EchoFactory(), AUTH["authorization"].removeprefix("Bearer "))
+    payload = _start_payload(turnID="turn-invalid-utf8-start", metadata={"invalid": "\ud800"})
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        rejected = client.post(
+            "/v1/turns",
+            content=json.dumps(payload, ensure_ascii=True).encode(),
+            headers={**AUTH, "content-type": "application/json"},
+        )
+
+    assert rejected.status_code == 400
+    assert rejected.json() == {"detail": "TurnStarted contains text that is not valid UTF-8"}
+    assert "turn-invalid-utf8-start" not in app.state.turns
 
 
 def test_orka_duplicate_turn_rejection_matches_orka_conformance_contract():
@@ -437,16 +680,49 @@ def test_orka_protected_endpoints_require_bearer_token():
     assert cancel.status_code == 401
 
 
-def test_orka_rejects_turn_ids_that_do_not_fit_route_path():
+@pytest.mark.parametrize("turn_id", ["", " ", ".", "..", " turn", "turn ", "turn/one", r"turn\one"])
+def test_orka_rejects_turn_ids_that_are_not_trimmed_single_path_segments(turn_id: str):
     app = create_orka_app(_spec(), EchoFactory(), auth_token="test-token")
 
     with TestClient(app) as client:
-        slash = client.post("/v1/turns", json=_start_payload(turnID="bad/id"), headers=AUTH)
-        query = client.post("/v1/turns", json=_start_payload(turnID="bad?id"), headers=AUTH)
+        response = client.post("/v1/turns", json=_start_payload(turnID=turn_id), headers=AUTH)
 
-    assert slash.status_code == 400
-    assert query.status_code == 400
-    assert "URL-safe" in slash.text
+    assert response.status_code == 400
+    assert "turnID" in response.text
+
+
+@pytest.mark.parametrize(
+    ("turn_id", "escaped_turn_id"),
+    [
+        pytest.param("turn:one", "turn:one", id="colon"),
+        pytest.param("turn one", "turn%20one", id="space"),
+        pytest.param("türn-雪", "t%C3%BCrn-%E9%9B%AA", id="unicode"),
+        pytest.param("turn$&+=@", "turn$&+=@", id="orka-path-safe-reserved"),
+        pytest.param("turn,one", "turn%2Cone", id="escaped-reserved"),
+        pytest.param("turn?one", "turn%3Fone", id="query-delimiter"),
+        pytest.param("\x1cturn\x1c", "%1Cturn%1C", id="go-non-space-control"),
+        pytest.param("t" * 1024, "t" * 1024, id="long-segment"),
+    ],
+)
+def test_orka_accepts_and_path_escapes_valid_turn_segments_exactly_like_orka(turn_id: str, escaped_turn_id: str):
+    app = create_orka_app(_spec(), EchoFactory(), auth_token=AUTH["authorization"].removeprefix("Bearer "))
+
+    with TestClient(app) as client:
+        response = client.post("/v1/turns", json=_start_payload(turnID=turn_id), headers=AUTH)
+        if response.status_code == 202:
+            event_stream_path = response.json()["eventStreamPath"]
+            events = client.get(event_stream_path, headers=AUTH)
+        else:
+            event_stream_path = ""
+            events = None
+
+    assert response.status_code == 202, response.text
+    assert event_stream_path == f"/v1/turns/{escaped_turn_id}/events"
+    assert events is not None
+    assert events.status_code == 200
+    frames = _frames(events.text)
+    assert frames[0]["turnID"] == turn_id
+    assert frames[-1]["type"] == "TurnCompleted"
 
 
 def test_orka_cancel_accepts_contract_request_and_produces_cancelled_terminal_frame():
@@ -496,6 +772,39 @@ def test_orka_cancel_rejects_runtime_session_or_correlation_mismatch():
     assert "runtimeSessionID" in wrong_session.text
     assert wrong_correlation.status_code == 400
     assert "correlationID" in wrong_correlation.text
+
+
+@pytest.mark.parametrize(
+    ("field_name", "mismatched_value"),
+    [
+        ("namespace", "other-namespace"),
+        ("taskName", "other-task"),
+        ("sessionName", "other-session-name"),
+    ],
+)
+def test_orka_cancel_rejects_turn_owner_mismatch_without_cancelling_turn(field_name: str, mismatched_value: str):
+    app = create_orka_app(_spec(), EchoFactory(delay=60), auth_token="test-token")
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(client, turnID=f"turn-cancel-{field_name}", input={"prompt": "slow", "contextRefs": [], "env": []})
+        state = client.app.state.turns[turn_id]
+        mismatch = client.post(
+            f"/v1/turns/{turn_id}/cancel",
+            json=_cancel_payload(turnID=turn_id, **{field_name: mismatched_value}),
+            headers=AUTH,
+        )
+
+        assert mismatch.status_code == 400
+        assert mismatch.json() == {"detail": "cancel namespace/taskName/sessionName must match turn"}
+        assert state.task is not None
+        assert state.task.cancelling() == 0
+        assert state.terminal_event is None
+
+        accepted = client.post(f"/v1/turns/{turn_id}/cancel", json=_cancel_payload(turnID=turn_id), headers=AUTH)
+        frames = _frames(client.get(f"/v1/turns/{turn_id}/events", headers=AUTH).text)
+
+    assert accepted.status_code == 202
+    assert frames[-1]["type"] == "TurnCancelled"
 
 
 def test_orka_cancel_rejects_body_turn_id_mismatch():
@@ -555,6 +864,70 @@ def test_orka_terminal_turn_retention_is_bounded():
     assert [frame["type"] for frame in _frames(kept.text)] == ["RuntimeOutput", "TurnCompleted"]
 
 
+def test_orka_lifespan_awaits_cancelled_turn_and_terminal_callback_before_runtime_close(monkeypatch):
+    turn_started = threading.Event()
+
+    class ShutdownRuntime:
+        def __init__(self) -> None:
+            self.state: Any = None
+            self.close_observations: list[tuple[bool, str | None]] = []
+
+        async def __aenter__(self) -> RuntimeSession:
+            return self
+
+        async def __aexit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            tb: TracebackType | None,
+        ) -> bool | None:
+            terminal_type = self.state.terminal_event.type if self.state.terminal_event is not None else None
+            self.close_observations.append((self.state.task.done(), terminal_type))
+            return None
+
+        async def run(self, request: RunRequest) -> RunResult:
+            raise AssertionError("patched turn runner should own the active task")
+
+    class ShutdownFactory:
+        def __init__(self) -> None:
+            self.runtime = ShutdownRuntime()
+
+        def build_runtime(self, spec: AgentSpec) -> RuntimeSession:
+            return self.runtime
+
+    async def uncaught_cancel_run_turn(
+        get_runtime,
+        turns,
+        terminal_order,
+        state,
+        run_request,
+        *,
+        max_terminal_turns,
+        brokered_tools=None,
+    ) -> None:
+        del turns, terminal_order, state, max_terminal_turns, brokered_tools
+        await get_runtime(run_request)
+        turn_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(orka_module, "_run_turn", uncaught_cancel_run_turn)
+    factory = ShutdownFactory()
+    app = create_orka_app(_spec(), factory, auth_token="test-token")
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(client, turnID="turn-shutdown", input={"prompt": "slow", "contextRefs": [], "env": []})
+        assert turn_started.wait(timeout=2)
+        state = client.app.state.turns[turn_id]
+        factory.runtime.state = state
+        assert state.task is not None
+        assert not state.task.done()
+
+    assert factory.runtime.close_observations == [(True, "TurnCancelled")]
+    assert state.task.done()
+    assert state.terminal_event is not None
+    assert state.terminal_event.type == "TurnCancelled"
+
+
 class EnvRuntime:
     def __init__(self, token: str) -> None:
         self.token = token
@@ -591,6 +964,81 @@ class EnvFactory:
 
         token = os.environ["MODEL_TOKEN"]
         runtime = EnvRuntime(token)
+        self.runtimes.append(runtime)
+        return runtime
+
+
+class SlowCloseEnvRuntime(EnvRuntime):
+    def __init__(
+        self,
+        token: str,
+        *,
+        close_delay: float,
+        close_error: BaseException | None = None,
+        close_release: threading.Event | None = None,
+    ) -> None:
+        super().__init__(token)
+        self.close_delay = close_delay
+        self.close_error = close_error
+        self.close_release = close_release
+        self.close_calls = 0
+        self.close_completed = 0
+        self.close_cancelled = 0
+        self.close_failed = 0
+        self.close_started = threading.Event()
+        self.close_finished = threading.Event()
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool | None:
+        self.close_calls += 1
+        self.close_started.set()
+        try:
+            if self.close_release is not None:
+                await asyncio.to_thread(self.close_release.wait)
+            else:
+                await asyncio.sleep(self.close_delay)
+        except asyncio.CancelledError:
+            self.close_cancelled += 1
+            raise
+        if self.close_error is not None:
+            self.close_failed += 1
+            self.close_finished.set()
+            raise self.close_error
+        self.close_completed += 1
+        self.exited += 1
+        self.close_finished.set()
+        return None
+
+
+class SlowFirstCloseEnvFactory:
+    def __init__(
+        self,
+        *,
+        close_delay: float = 0.25,
+        close_error: BaseException | None = None,
+        close_release: threading.Event | None = None,
+    ) -> None:
+        self.close_delay = close_delay
+        self.close_error = close_error
+        self.close_release = close_release
+        self.runtimes: list[SlowCloseEnvRuntime] = []
+
+    def build_runtime(self, spec: AgentSpec) -> RuntimeSession:
+        import os
+
+        delay = self.close_delay if not self.runtimes else 0
+        close_error = self.close_error if not self.runtimes else None
+        close_release = self.close_release if not self.runtimes else None
+        runtime = SlowCloseEnvRuntime(
+            os.environ["MODEL_TOKEN"],
+            close_delay=delay,
+            close_error=close_error,
+            close_release=close_release,
+        )
         self.runtimes.append(runtime)
         return runtime
 
@@ -647,6 +1095,283 @@ def test_orka_runtime_session_cache_is_bounded_and_closes_evicted_runtime(monkey
         assert factory.runtimes[1].exited == 0
 
     assert factory.runtimes[1].exited == 1
+
+
+def test_orka_capacity_eviction_cleanup_survives_turn_deadline_and_blocks_new_runtime(monkeypatch):
+    monkeypatch.delenv("MODEL_TOKEN", raising=False)
+    close_release = threading.Event()
+    capacity_wait_started = threading.Event()
+    original_asyncio_wait = asyncio.wait
+
+    async def observed_asyncio_wait(fs, *, timeout=None, return_when=asyncio.ALL_COMPLETED):
+        waitables = tuple(fs)
+        if return_when == asyncio.FIRST_COMPLETED and any(
+            isinstance(item, asyncio.Task) and item.get_name() == "agentkit-orka-runtime-close" for item in waitables
+        ):
+            capacity_wait_started.set()
+        return await original_asyncio_wait(waitables, timeout=timeout, return_when=return_when)
+
+    monkeypatch.setattr(orka_module.asyncio, "wait", observed_asyncio_wait)
+    factory = SlowFirstCloseEnvFactory(close_release=close_release)
+    app = create_orka_app(_spec(), factory, auth_token=AUTH["authorization"].removeprefix("Bearer "), max_runtime_sessions=1)
+
+    with TestClient(app) as client:
+        try:
+            first_id = _create_turn(
+                client,
+                turnID="turn-session-one",
+                runtimeSessionID="runtime-session-one",
+                correlationID="corr-one",
+                input={"prompt": "one", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "one-token"}]},
+            )
+            first_frames = _frames(client.get(f"/v1/turns/{first_id}/events", headers=AUTH).text)
+            assert first_frames[-1]["type"] == "TurnCompleted"
+
+            second_deadline = (datetime.now(UTC) + timedelta(milliseconds=500)).isoformat().replace("+00:00", "Z")
+            second_id = _create_turn(
+                client,
+                turnID="turn-session-two",
+                runtimeSessionID="runtime-session-two",
+                correlationID="corr-two",
+                deadline=second_deadline,
+                input={"prompt": "two", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "two-token"}]},
+            )
+            second_frames = _frames(client.get(f"/v1/turns/{second_id}/events", headers=AUTH).text)
+            assert second_frames[-1]["type"] == "TurnFailed"
+            assert second_frames[-1]["failed"]["reason"] == "DeadlineExceeded"
+
+            third_deadline = (datetime.now(UTC) + timedelta(milliseconds=500)).isoformat().replace("+00:00", "Z")
+            third_id = _create_turn(
+                client,
+                turnID="turn-session-three",
+                runtimeSessionID="runtime-session-three",
+                correlationID="corr-three",
+                deadline=third_deadline,
+                input={"prompt": "three", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "three-token"}]},
+            )
+            third_frames = _frames(client.get(f"/v1/turns/{third_id}/events", headers=AUTH).text)
+            assert third_frames[-1]["type"] == "TurnFailed"
+            assert third_frames[-1]["failed"]["reason"] == "DeadlineExceeded"
+            assert len(factory.runtimes) == 1
+
+            capacity_wait_started.clear()
+            fourth_id = _create_turn(
+                client,
+                turnID="turn-session-four",
+                runtimeSessionID="runtime-session-four",
+                correlationID="corr-four",
+                input={"prompt": "four", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "four-token"}]},
+            )
+            assert capacity_wait_started.wait(timeout=2)
+            close_release.set()
+            fourth_frames = _frames(client.get(f"/v1/turns/{fourth_id}/events", headers=AUTH).text)
+            assert fourth_frames[-1]["type"] == "TurnCompleted"
+        finally:
+            close_release.set()
+        assert factory.runtimes[0].close_finished.wait(timeout=2)
+
+    assert len(factory.runtimes) == 2
+    assert factory.runtimes[0].close_calls == 1
+    assert factory.runtimes[0].close_cancelled == 0
+    assert factory.runtimes[0].close_completed == 1
+    assert factory.runtimes[1].close_calls == 1
+    assert factory.runtimes[1].close_completed == 1
+
+
+def test_orka_env_replacement_cleanup_survives_turn_cancellation(monkeypatch):
+    monkeypatch.delenv("MODEL_TOKEN", raising=False)
+    close_release = threading.Event()
+    factory = SlowFirstCloseEnvFactory(close_release=close_release)
+    app = create_orka_app(_spec(), factory, auth_token=AUTH["authorization"].removeprefix("Bearer "), max_runtime_sessions=2)
+
+    with TestClient(app) as client:
+        try:
+            first_id = _create_turn(
+                client,
+                turnID="turn-env-one",
+                runtimeSessionID="runtime-session-rotating",
+                correlationID="corr-one",
+                input={"prompt": "one", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "one-token"}]},
+            )
+            first_frames = _frames(client.get(f"/v1/turns/{first_id}/events", headers=AUTH).text)
+            assert first_frames[-1]["type"] == "TurnCompleted"
+
+            second_id = _create_turn(
+                client,
+                turnID="turn-env-two",
+                runtimeSessionID="runtime-session-rotating",
+                correlationID="corr-two",
+                input={"prompt": "two", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "two-token"}]},
+            )
+            assert factory.runtimes[0].close_started.wait(timeout=2)
+            cancel = client.post(
+                f"/v1/turns/{second_id}/cancel",
+                json=_cancel_payload(
+                    turnID=second_id,
+                    runtimeSessionID="runtime-session-rotating",
+                    correlationID="corr-two",
+                ),
+                headers=AUTH,
+            )
+            second_frames = _frames(client.get(f"/v1/turns/{second_id}/events", headers=AUTH).text)
+
+            assert cancel.status_code == 202
+            assert second_frames[-1]["type"] == "TurnCancelled"
+            assert not factory.runtimes[0].close_finished.is_set()
+
+            third_deadline = (datetime.now(UTC) + timedelta(milliseconds=500)).isoformat().replace("+00:00", "Z")
+            third_id = _create_turn(
+                client,
+                turnID="turn-env-three",
+                runtimeSessionID="runtime-session-rotating",
+                correlationID="corr-three",
+                deadline=third_deadline,
+                input={"prompt": "three", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "two-token"}]},
+            )
+            third_frames = _frames(client.get(f"/v1/turns/{third_id}/events", headers=AUTH).text)
+            assert third_frames[-1]["type"] == "TurnFailed"
+            assert third_frames[-1]["failed"]["reason"] == "DeadlineExceeded"
+            assert len(factory.runtimes) == 1
+        finally:
+            close_release.set()
+        assert factory.runtimes[0].close_finished.wait(timeout=2)
+
+        fourth_id = _create_turn(
+            client,
+            turnID="turn-env-four",
+            runtimeSessionID="runtime-session-rotating",
+            correlationID="corr-four",
+            input={"prompt": "four", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "two-token"}]},
+        )
+        fourth_frames = _frames(client.get(f"/v1/turns/{fourth_id}/events", headers=AUTH).text)
+        assert fourth_frames[-1]["type"] == "TurnCompleted"
+
+    assert len(factory.runtimes) == 2
+    assert factory.runtimes[0].close_calls == 1
+    assert factory.runtimes[0].close_cancelled == 0
+    assert factory.runtimes[0].close_completed == 1
+    assert factory.runtimes[0].close_finished.is_set()
+    assert factory.runtimes[1].close_calls == 1
+    assert factory.runtimes[1].close_completed == 1
+
+
+def test_orka_capacity_eviction_close_failure_fails_uncancelled_turn_without_double_close(monkeypatch):
+    monkeypatch.delenv("MODEL_TOKEN", raising=False)
+    factory = SlowFirstCloseEnvFactory(close_delay=0, close_error=RuntimeError("runtime close failed"))
+    app = create_orka_app(_spec(), factory, auth_token=AUTH["authorization"].removeprefix("Bearer "), max_runtime_sessions=1)
+
+    with pytest.raises(AgentRunError, match="runtime cleanup failed"):
+        with TestClient(app) as client:
+            first_id = _create_turn(
+                client,
+                turnID="turn-close-failure-one",
+                runtimeSessionID="runtime-session-one",
+                correlationID="corr-one",
+                input={"prompt": "one", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "one-token"}]},
+            )
+            first_frames = _frames(client.get(f"/v1/turns/{first_id}/events", headers=AUTH).text)
+            assert first_frames[-1]["type"] == "TurnCompleted"
+
+            second_id = _create_turn(
+                client,
+                turnID="turn-close-failure-two",
+                runtimeSessionID="runtime-session-two",
+                correlationID="corr-two",
+                input={"prompt": "two", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "two-token"}]},
+            )
+            second_frames = _frames(client.get(f"/v1/turns/{second_id}/events", headers=AUTH).text)
+
+            assert second_frames[-1]["type"] == "TurnFailed"
+            assert second_frames[-1]["failed"] == {
+                "reason": "RuntimeCloseFailed",
+                "message": "runtime cleanup failed; restart required before opening another runtime session",
+                "retryable": False,
+            }
+
+            third_id = _create_turn(
+                client,
+                turnID="turn-after-close-failure",
+                runtimeSessionID="runtime-session-three",
+                correlationID="corr-three",
+                input={"prompt": "three", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "three-token"}]},
+            )
+            third_frames = _frames(client.get(f"/v1/turns/{third_id}/events", headers=AUTH).text)
+            assert third_frames[-1]["type"] == "TurnFailed"
+            assert third_frames[-1]["failed"] == {
+                "reason": "RuntimeCloseFailed",
+                "message": "runtime cleanup failed; restart required before opening another runtime session",
+                "retryable": False,
+            }
+            assert len(factory.runtimes) == 1
+
+    assert len(factory.runtimes) == 1
+    assert factory.runtimes[0].close_calls == 1
+    assert factory.runtimes[0].close_failed == 1
+    assert factory.runtimes[0].close_completed == 0
+
+
+def test_orka_shutdown_closes_active_runtime_after_orphaned_close_failure(monkeypatch):
+    monkeypatch.delenv("MODEL_TOKEN", raising=False)
+    factory = SlowFirstCloseEnvFactory(close_delay=1.0, close_error=RuntimeError("orphaned close failed"))
+    app = create_orka_app(_spec(), factory, auth_token=AUTH["authorization"].removeprefix("Bearer "), max_runtime_sessions=2)
+
+    with pytest.raises(AgentRunError, match="runtime cleanup failed"):
+        with TestClient(app) as client:
+            first_id = _create_turn(
+                client,
+                turnID="turn-orphan-failure-one",
+                runtimeSessionID="runtime-session-one",
+                correlationID="corr-one",
+                input={"prompt": "one", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "one-token"}]},
+            )
+            first_frames = _frames(client.get(f"/v1/turns/{first_id}/events", headers=AUTH).text)
+            assert first_frames[-1]["type"] == "TurnCompleted"
+
+            second_id = _create_turn(
+                client,
+                turnID="turn-orphan-failure-two",
+                runtimeSessionID="runtime-session-two",
+                correlationID="corr-two",
+                input={"prompt": "two", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "two-token"}]},
+            )
+            second_frames = _frames(client.get(f"/v1/turns/{second_id}/events", headers=AUTH).text)
+            assert second_frames[-1]["type"] == "TurnCompleted"
+
+            short_deadline = (datetime.now(UTC) + timedelta(milliseconds=500)).isoformat().replace("+00:00", "Z")
+            third_id = _create_turn(
+                client,
+                turnID="turn-orphan-failure-three",
+                runtimeSessionID="runtime-session-three",
+                correlationID="corr-three",
+                deadline=short_deadline,
+                input={"prompt": "three", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "three-token"}]},
+            )
+            third_frames = _frames(client.get(f"/v1/turns/{third_id}/events", headers=AUTH).text)
+            assert third_frames[-1]["type"] == "TurnFailed"
+            assert third_frames[-1]["failed"]["reason"] == "DeadlineExceeded"
+            assert factory.runtimes[0].close_finished.wait(timeout=2)
+
+            fourth_id = _create_turn(
+                client,
+                turnID="turn-after-orphan-failure",
+                runtimeSessionID="runtime-session-four",
+                correlationID="corr-four",
+                input={"prompt": "four", "contextRefs": [], "env": [{"name": "MODEL_TOKEN", "value": "four-token"}]},
+            )
+            fourth_frames = _frames(client.get(f"/v1/turns/{fourth_id}/events", headers=AUTH).text)
+            assert fourth_frames[-1]["type"] == "TurnFailed"
+            assert fourth_frames[-1]["failed"] == {
+                "reason": "RuntimeCloseFailed",
+                "message": "runtime cleanup failed; restart required before opening another runtime session",
+                "retryable": False,
+            }
+            assert len(factory.runtimes) == 2
+
+    assert len(factory.runtimes) == 2
+    assert factory.runtimes[0].close_calls == 1
+    assert factory.runtimes[0].close_failed == 1
+    assert factory.runtimes[1].close_calls == 1
+    assert factory.runtimes[1].close_completed == 1
 
 
 def test_orka_required_env_must_be_supplied_per_turn_or_process(monkeypatch):
@@ -954,6 +1679,7 @@ def test_orka_brokered_start_validates_safe_read_tool_schemas():
 class CapturingBrokeredRuntime:
     def __init__(self) -> None:
         self.tools: list[BrokeredToolDefinition] = []
+        self.results: list[BrokeredToolResult] = []
 
     async def __aenter__(self) -> RuntimeSession:
         return self
@@ -979,6 +1705,7 @@ class CapturingBrokeredRuntime:
                 brokered_class="read",
             )
         )
+        self.results.append(result)
         return RunResult(text=f"captured {result.output}")
 
 
@@ -991,6 +1718,524 @@ class CapturingBrokeredFactory:
 
     def build_runtime(self, spec: AgentSpec) -> RuntimeSession:
         return self.runtime
+
+
+class NonAmplifyingBrokeredRuntime:
+    async def __aenter__(self) -> RuntimeSession:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool | None:
+        return None
+
+    async def run(self, request: RunRequest) -> RunResult:
+        raise AssertionError("brokered mode must not call direct run()")
+
+    async def run_brokered(self, request: RunRequest, tools: list[BrokeredToolDefinition], broker: ToolBroker) -> RunResult:
+        await broker.request_tool(
+            BrokeredToolCall(
+                tool_call_id="tool-call-1",
+                name=tools[0].name,
+                arguments={"incident": "INC-1"},
+                brokered_class="read",
+            )
+        )
+        return RunResult(text="brokered output accepted")
+
+
+class NonAmplifyingBrokeredFactory:
+    def __init__(self) -> None:
+        self.runtime = NonAmplifyingBrokeredRuntime()
+
+    def supports_brokered_read(self) -> bool:
+        return True
+
+    def build_runtime(self, spec: AgentSpec) -> RuntimeSession:
+        return self.runtime
+
+
+class TwoStepBrokeredRuntime(NonAmplifyingBrokeredRuntime):
+    async def run_brokered(self, request: RunRequest, tools: list[BrokeredToolDefinition], broker: ToolBroker) -> RunResult:
+        for tool_call_id in ("tool-call-1", "tool-call-2"):
+            await broker.request_tool(
+                BrokeredToolCall(
+                    tool_call_id=tool_call_id,
+                    name=tools[0].name,
+                    arguments={"toolCallID": tool_call_id},
+                    brokered_class="read",
+                )
+            )
+        return RunResult(text="two-step brokered output accepted")
+
+
+class TwoStepBrokeredFactory(NonAmplifyingBrokeredFactory):
+    def __init__(self) -> None:
+        self.runtime = TwoStepBrokeredRuntime()
+
+
+class MutatingBrokeredRuntime(NonAmplifyingBrokeredRuntime):
+    async def run_brokered(self, request: RunRequest, tools: list[BrokeredToolDefinition], broker: ToolBroker) -> RunResult:
+        result = await broker.request_tool(
+            BrokeredToolCall(
+                tool_call_id="tool-call-1",
+                name=tools[0].name,
+                arguments={"probe": True},
+                brokered_class="read",
+            )
+        )
+        result.output["nested"]["items"].append("mutated")
+        return RunResult(text="mutated adapter-local result")
+
+
+class MutatingBrokeredFactory(NonAmplifyingBrokeredFactory):
+    def __init__(self) -> None:
+        self.runtime = MutatingBrokeredRuntime()
+
+
+def test_orka_brokered_retained_event_is_an_immutable_json_snapshot():
+    app = create_orka_app(
+        _spec(),
+        MutatingBrokeredFactory(),
+        AUTH["authorization"].removeprefix("Bearer "),
+        enable_brokered_read=True,
+    )
+    output = {"nested": {"items": ["original"]}}
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(client, toolExecutionMode="brokered", input=_brokered_input())
+        _wait_for_event_type(client, turn_id, "ToolCallRequested")
+        continuation = _continue_payload(turnID=turn_id)
+        continuation["toolResults"][0]["output"] = output
+        accepted = client.post(f"/v1/turns/{turn_id}/continue", json=continuation, headers=AUTH)
+        frames = _frames(client.get(f"/v1/turns/{turn_id}/events", headers=AUTH).text)
+
+    assert accepted.status_code == 202
+    assert frames[2]["type"] == "ToolResultReceived"
+    assert frames[2]["content"] == output
+
+
+def test_orka_brokered_accepted_result_replays_while_later_tool_call_is_pending():
+    app = create_orka_app(
+        _spec(),
+        TwoStepBrokeredFactory(),
+        AUTH["authorization"].removeprefix("Bearer "),
+        enable_brokered_read=True,
+    )
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(
+            client,
+            turnID="turn-brokered-inflight-replay",
+            toolExecutionMode="brokered",
+            input=_brokered_input(),
+        )
+        _wait_for_tool_call_id(client, turn_id, "tool-call-1")
+        first = _continue_payload(turnID=turn_id)
+        first["toolResults"][0]["turnID"] = turn_id
+        first["toolResults"][0]["idempotencyKey"] = f"runtime-session-1:{turn_id}:tool-call-1"
+        accepted = client.post(f"/v1/turns/{turn_id}/continue", json=first, headers=AUTH)
+        _wait_for_tool_call_id(client, turn_id, "tool-call-2")
+        replayed = client.post(f"/v1/turns/{turn_id}/continue", json=first, headers=AUTH)
+        second = _continue_payload(turnID=turn_id)
+        second_result = second["toolResults"][0]
+        second_result["turnID"] = turn_id
+        second_result["toolCallID"] = "tool-call-2"
+        second_result["idempotencyKey"] = f"runtime-session-1:{turn_id}:tool-call-2"
+        completed = client.post(f"/v1/turns/{turn_id}/continue", json=second, headers=AUTH)
+        frames = _frames(client.get(f"/v1/turns/{turn_id}/events", headers=AUTH).text)
+
+    assert accepted.status_code == 202
+    assert replayed.status_code == 202
+    assert completed.status_code == 202
+    assert frames[-1]["type"] == "TurnCompleted"
+
+
+def test_orka_brokered_batch_validates_conflicts_before_oversized_members():
+    app = create_orka_app(
+        _spec(),
+        TwoStepBrokeredFactory(),
+        AUTH["authorization"].removeprefix("Bearer "),
+        enable_brokered_read=True,
+    )
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(
+            client,
+            turnID="turn-brokered-batch-validation",
+            toolExecutionMode="brokered",
+            input=_brokered_input(),
+        )
+        _wait_for_tool_call_id(client, turn_id, "tool-call-1")
+        first = _continue_payload(turnID=turn_id)
+        first_result = first["toolResults"][0]
+        first_result["turnID"] = turn_id
+        first_result["idempotencyKey"] = f"runtime-session-1:{turn_id}:tool-call-1"
+        assert client.post(f"/v1/turns/{turn_id}/continue", json=first, headers=AUTH).status_code == 202
+        _wait_for_tool_call_id(client, turn_id, "tool-call-2")
+
+        oversized_second = dict(first_result)
+        oversized_second["toolCallID"] = "tool-call-2"
+        oversized_second["idempotencyKey"] = f"runtime-session-1:{turn_id}:tool-call-2"
+        oversized_second["output"] = _json_object_with_size(EXPECTED_MAX_OUTPUT_BYTES + 1)
+        conflicting_first = dict(first_result)
+        conflicting_first["output"] = {"different": True}
+        invalid_batch = _continue_payload(turnID=turn_id)
+        invalid_batch["toolResults"] = [oversized_second, conflicting_first]
+        invalid = client.post(f"/v1/turns/{turn_id}/continue", json=invalid_batch, headers=AUTH)
+
+        valid_second = _continue_payload(turnID=turn_id)
+        valid_second_result = valid_second["toolResults"][0]
+        valid_second_result["turnID"] = turn_id
+        valid_second_result["toolCallID"] = "tool-call-2"
+        valid_second_result["idempotencyKey"] = f"runtime-session-1:{turn_id}:tool-call-2"
+        completed = client.post(f"/v1/turns/{turn_id}/continue", json=valid_second, headers=AUTH)
+        frames = _frames(client.get(f"/v1/turns/{turn_id}/events", headers=AUTH).text)
+
+    assert invalid.status_code == 409
+    assert "conflicting tool result" in invalid.text
+    assert completed.status_code == 202
+    assert frames[-1]["type"] == "TurnCompleted"
+
+
+def test_orka_brokered_json_output_accepts_exact_utf8_limit_replays_and_retains_one_copy():
+    output = _json_object_with_size(EXPECTED_MAX_OUTPUT_BYTES)
+    app = create_orka_app(
+        _spec(),
+        NonAmplifyingBrokeredFactory(),
+        AUTH["authorization"].removeprefix("Bearer "),
+        enable_brokered_read=True,
+    )
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(
+            client,
+            turnID="turn-brokered-output-boundary",
+            toolExecutionMode="brokered",
+            input=_brokered_input(),
+        )
+        _wait_for_event_type(client, turn_id, "ToolCallRequested")
+        continuation = _continue_payload(turnID=turn_id)
+        continuation["toolResults"][0]["turnID"] = turn_id
+        continuation["toolResults"][0]["idempotencyKey"] = f"runtime-session-1:{turn_id}:tool-call-1"
+        continuation["toolResults"][0]["output"] = output
+        accepted = client.post(f"/v1/turns/{turn_id}/continue", json=continuation, headers=AUTH)
+        response = client.get(f"/v1/turns/{turn_id}/events", headers=AUTH)
+        replay = client.get(f"/v1/turns/{turn_id}/events?afterSeq=1", headers=AUTH)
+        duplicate = client.post(f"/v1/turns/{turn_id}/continue", json=continuation, headers=AUTH)
+        state = client.app.state.turns[turn_id]
+
+    frames = _frames(response.text)
+    assert accepted.status_code == 202, accepted.text
+    assert duplicate.status_code == 202, duplicate.text
+    assert [frame["type"] for frame in frames] == [
+        "TurnStarted",
+        "ToolCallRequested",
+        "ToolResultReceived",
+        "RuntimeOutput",
+        "TurnCompleted",
+    ]
+    assert frames[2]["content"] == output
+    assert [frame["type"] for frame in _frames(replay.text)] == [
+        "ToolCallRequested",
+        "ToolResultReceived",
+        "RuntimeOutput",
+        "TurnCompleted",
+    ]
+    assert state.pending_tools == {}
+    assert sum(event.content == output for event in state.events) == 1
+    _assert_sse_lines_fit_orka_client(response.content)
+    _assert_sse_lines_fit_orka_client(replay.content)
+
+
+def test_orka_brokered_result_preflight_reserves_maximum_sequence_width(monkeypatch):
+    app = create_orka_app(
+        _spec(),
+        NonAmplifyingBrokeredFactory(),
+        AUTH["authorization"].removeprefix("Bearer "),
+        enable_brokered_read=True,
+    )
+    original_ensure = orka_module._ensure_sse_frame_fits
+    tool_result_sequences: list[int] = []
+
+    def recording_ensure(event):
+        if event.type == "ToolResultReceived":
+            tool_result_sequences.append(event.seq)
+        return original_ensure(event)
+
+    monkeypatch.setattr(orka_module, "_ensure_sse_frame_fits", recording_ensure)
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(client, toolExecutionMode="brokered", input=_brokered_input())
+        _wait_for_event_type(client, turn_id, "ToolCallRequested")
+        accepted = client.post(f"/v1/turns/{turn_id}/continue", json=_continue_payload(turnID=turn_id), headers=AUTH)
+        client.get(f"/v1/turns/{turn_id}/events", headers=AUTH)
+
+    assert accepted.status_code == 202
+    assert tool_result_sequences[0] == 9_223_372_036_854_775_807
+    assert tool_result_sequences[-1] < tool_result_sequences[0]
+
+
+def test_orka_brokered_json_output_over_utf8_limit_returns_413_and_visible_terminal_failure():
+    output = _json_object_with_size(EXPECTED_MAX_OUTPUT_BYTES + 1)
+    app = create_orka_app(
+        _spec(),
+        NonAmplifyingBrokeredFactory(),
+        AUTH["authorization"].removeprefix("Bearer "),
+        enable_brokered_read=True,
+    )
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(
+            client,
+            turnID="turn-brokered-output-over-limit",
+            toolExecutionMode="brokered",
+            input=_brokered_input(),
+        )
+        _wait_for_event_type(client, turn_id, "ToolCallRequested")
+        continuation = _continue_payload(turnID=turn_id)
+        continuation["toolResults"][0]["turnID"] = turn_id
+        continuation["toolResults"][0]["idempotencyKey"] = f"runtime-session-1:{turn_id}:tool-call-1"
+        continuation["toolResults"][0]["output"] = output
+        rejected = client.post(f"/v1/turns/{turn_id}/continue", json=continuation, headers=AUTH)
+        replayed_rejection = client.post(f"/v1/turns/{turn_id}/continue", json=continuation, headers=AUTH)
+        conflicting_continuation = _continue_payload(turnID=turn_id)
+        conflicting_continuation["toolResults"][0]["turnID"] = turn_id
+        conflicting_continuation["toolResults"][0]["idempotencyKey"] = f"runtime-session-1:{turn_id}:tool-call-1"
+        conflicting_continuation["toolResults"][0]["output"] = {"different": True}
+        conflicting = client.post(
+            f"/v1/turns/{turn_id}/continue",
+            json=conflicting_continuation,
+            headers=AUTH,
+        )
+        response = client.get(f"/v1/turns/{turn_id}/events", headers=AUTH)
+        replay = client.get(f"/v1/turns/{turn_id}/events?afterSeq=1", headers=AUTH)
+        state = client.app.state.turns[turn_id]
+
+    message = (
+        f"brokered tool output is {EXPECTED_MAX_OUTPUT_BYTES + 1} UTF-8 bytes; "
+        f"maxOutputBytes is {EXPECTED_MAX_OUTPUT_BYTES}"
+    )
+    frames = _frames(response.text)
+    assert rejected.status_code == 413
+    assert rejected.json() == {"detail": message}
+    assert replayed_rejection.status_code == 413
+    assert replayed_rejection.json() == rejected.json()
+    assert conflicting.status_code == 409
+    assert [frame["type"] for frame in frames] == ["TurnStarted", "ToolCallRequested", "TurnFailed"]
+    assert frames[-1]["failed"] == {"reason": "MaxOutputBytesExceeded", "message": message, "retryable": False}
+    assert [frame["type"] for frame in _frames(replay.text)] == ["ToolCallRequested", "TurnFailed"]
+    assert state.pending_tools == {}
+    assert all(event.content != output for event in state.events)
+    _assert_sse_lines_fit_orka_client(response.content)
+    _assert_sse_lines_fit_orka_client(replay.content)
+
+
+def test_orka_brokered_under_limit_output_with_unstreamable_error_uses_frame_failure_code():
+    app = create_orka_app(
+        _spec(),
+        NonAmplifyingBrokeredFactory(),
+        AUTH["authorization"].removeprefix("Bearer "),
+        enable_brokered_read=True,
+    )
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(
+            client,
+            turnID="turn-brokered-error-frame-over-limit",
+            toolExecutionMode="brokered",
+            input=_brokered_input(),
+        )
+        _wait_for_event_type(client, turn_id, "ToolCallRequested")
+        continuation = _continue_payload(turnID=turn_id)
+        result = continuation["toolResults"][0]
+        result["turnID"] = turn_id
+        result["idempotencyKey"] = f"runtime-session-1:{turn_id}:tool-call-1"
+        result["output"] = {"small": True}
+        result["error"] = {"code": "HugeError", "message": "\x00" * 200_000, "retryable": False}
+        rejected = client.post(f"/v1/turns/{turn_id}/continue", json=continuation, headers=AUTH)
+        event_response = client.get(f"/v1/turns/{turn_id}/events", headers=AUTH)
+        frames = _frames(event_response.text)
+
+    assert rejected.status_code == 413
+    assert frames[-1]["type"] == "TurnFailed"
+    assert frames[-1]["failed"]["reason"] == "HarnessFrameTooLarge"
+    _assert_sse_lines_fit_orka_client(event_response.content)
+
+
+def test_orka_brokered_output_rejection_is_atomic_with_a_racing_valid_continue(monkeypatch):
+    app = create_orka_app(
+        _spec(),
+        NonAmplifyingBrokeredFactory(),
+        AUTH["authorization"].removeprefix("Bearer "),
+        enable_brokered_read=True,
+    )
+    rejection_locked = threading.Event()
+    release_rejection = threading.Event()
+    original_append_failure = orka_module._append_output_failure_locked
+
+    def blocking_append_failure(state, message, code):
+        rejection_locked.set()
+        assert release_rejection.wait(timeout=5)
+        return original_append_failure(state, message, code)
+
+    monkeypatch.setattr(orka_module, "_append_output_failure_locked", blocking_append_failure)
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(
+            client,
+            turnID="turn-brokered-output-race",
+            toolExecutionMode="brokered",
+            input=_brokered_input(),
+        )
+        _wait_for_event_type(client, turn_id, "ToolCallRequested")
+        oversized = _continue_payload(turnID=turn_id)
+        oversized_result = oversized["toolResults"][0]
+        oversized_result["turnID"] = turn_id
+        oversized_result["idempotencyKey"] = f"runtime-session-1:{turn_id}:tool-call-1"
+        oversized_result["output"] = _json_object_with_size(EXPECTED_MAX_OUTPUT_BYTES + 1)
+        valid = _continue_payload(turnID=turn_id)
+        valid_result = valid["toolResults"][0]
+        valid_result["turnID"] = turn_id
+        valid_result["idempotencyKey"] = f"runtime-session-1:{turn_id}:tool-call-1"
+
+        responses: dict[str, Any] = {}
+        oversized_thread = threading.Thread(
+            target=lambda: responses.setdefault(
+                "oversized",
+                client.post(f"/v1/turns/{turn_id}/continue", json=oversized, headers=AUTH),
+            )
+        )
+        valid_thread = threading.Thread(
+            target=lambda: responses.setdefault(
+                "valid",
+                client.post(f"/v1/turns/{turn_id}/continue", json=valid, headers=AUTH),
+            )
+        )
+        oversized_thread.start()
+        assert rejection_locked.wait(timeout=5)
+        valid_thread.start()
+        time.sleep(0.05)
+        assert valid_thread.is_alive()
+        release_rejection.set()
+        oversized_thread.join(timeout=5)
+        valid_thread.join(timeout=5)
+        assert not oversized_thread.is_alive()
+        assert not valid_thread.is_alive()
+        frames = _frames(client.get(f"/v1/turns/{turn_id}/events", headers=AUTH).text)
+
+    assert responses["oversized"].status_code == 413
+    assert responses["valid"].status_code == 409
+    assert frames[-1]["type"] == "TurnFailed"
+    assert all(frame["type"] != "ToolResultReceived" for frame in frames)
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        pytest.param({"answer": "ok"}, id="object"),
+        pytest.param([], id="array"),
+        pytest.param("", id="string"),
+        pytest.param(0, id="number"),
+        pytest.param(False, id="boolean"),
+        pytest.param(None, id="null"),
+    ],
+)
+def test_orka_brokered_tool_result_preserves_any_json_output_value(output: Any):
+    factory = CapturingBrokeredFactory()
+    app = create_orka_app(
+        _spec(), factory, AUTH["authorization"].removeprefix("Bearer "), enable_brokered_read=True
+    )
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(client, toolExecutionMode="brokered", input=_brokered_input())
+        _wait_for_event_type(client, turn_id, "ToolCallRequested")
+        continuation = _continue_payload(turnID=turn_id)
+        continuation["toolResults"][0]["output"] = output
+        response = client.post(f"/v1/turns/{turn_id}/continue", json=continuation, headers=AUTH)
+        if response.status_code == 202:
+            frames = _frames(client.get(f"/v1/turns/{turn_id}/events", headers=AUTH).text)
+        else:
+            frames = []
+
+    assert response.status_code == 202, response.text
+    assert len(factory.runtime.results) == 1
+    assert type(factory.runtime.results[0].output) is type(output)
+    assert factory.runtime.results[0].output == output
+    assert frames[2]["type"] == "ToolResultReceived"
+    assert type(frames[2]["content"]) is type(output)
+    assert frames[2]["content"] == output
+
+
+@pytest.mark.parametrize(
+    ("include_output", "expected_output_present"),
+    [
+        pytest.param(False, False, id="absent"),
+        pytest.param(True, True, id="explicit-null"),
+    ],
+)
+def test_orka_brokered_tool_result_distinguishes_absent_output_from_explicit_null(
+    include_output: bool, expected_output_present: bool
+):
+    factory = CapturingBrokeredFactory()
+    app = create_orka_app(
+        _spec(), factory, AUTH["authorization"].removeprefix("Bearer "), enable_brokered_read=True
+    )
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(client, toolExecutionMode="brokered", input=_brokered_input())
+        _wait_for_event_type(client, turn_id, "ToolCallRequested")
+        continuation = _continue_payload(turnID=turn_id)
+        if include_output:
+            continuation["toolResults"][0]["output"] = None
+        else:
+            continuation["toolResults"][0].pop("output")
+            continuation["toolResults"][0]["error"] = {
+                "code": "NoOutput",
+                "message": "tool completed without output",
+                "retryable": False,
+            }
+        response = client.post(f"/v1/turns/{turn_id}/continue", json=continuation, headers=AUTH)
+        if response.status_code == 202:
+            frames = _frames(client.get(f"/v1/turns/{turn_id}/events", headers=AUTH).text)
+        else:
+            frames = []
+
+    assert response.status_code == 202, response.text
+    assert len(factory.runtime.results) == 1
+    result = factory.runtime.results[0]
+    assert result.output is None
+    assert result.output_present is expected_output_present
+    assert frames[2]["type"] == "ToolResultReceived"
+    if include_output:
+        assert "content" in frames[2]
+        assert frames[2]["content"] is None
+    else:
+        assert "content" not in frames[2]
+        assert frames[2]["error"] == {
+            "code": "NoOutput",
+            "message": "tool completed without output",
+            "retryable": False,
+        }
+
+
+def test_orka_brokered_continue_rejects_absent_output_without_error():
+    app = create_orka_app(
+        _spec(), OfflineEchoRuntimeFactory(), AUTH["authorization"].removeprefix("Bearer "), enable_brokered_read=True
+    )
+
+    with TestClient(app) as client:
+        turn_id = _create_turn(client, toolExecutionMode="brokered", input=_brokered_input())
+        _wait_for_event_type(client, turn_id, "ToolCallRequested")
+        continuation = _continue_payload(turnID=turn_id)
+        continuation["toolResults"][0].pop("output")
+        response = client.post(f"/v1/turns/{turn_id}/continue", json=continuation, headers=AUTH)
+
+    assert response.status_code == 400
+    assert "output or error is required" in response.text
 
 
 def test_orka_brokered_runtime_receives_only_safe_tool_definition_fields():

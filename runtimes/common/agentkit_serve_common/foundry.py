@@ -16,14 +16,17 @@ Orka-governed tool locally. A later continuation must provide a matching
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import json
 import logging
 import math
 import os
 import re
+import threading
 import time
 import uuid
+from copy import deepcopy
 from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 from pathlib import Path
@@ -52,8 +55,10 @@ _DEFAULT_STATE_TTL_SECONDS = 15 * 60
 _DEFAULT_MAX_PENDING_RESPONSES = 128
 _DEFAULT_MAX_ARGUMENT_BYTES = 8192
 _DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024
+_DEFAULT_MAX_RESPONSE_STATE_BYTES = 4 * 1024 * 1024
 _DEFAULT_MAX_REQUEST_BODY_BYTES = 1024 * 1024
 _DEFAULT_MAX_MODEL_MESSAGES_BYTES = 1024 * 1024
+_REQUEST_BODY_OVERHEAD_BYTES = 16 * 1024
 _MAX_SYNTHETIC_ARRAY_ITEMS = 32
 _MAX_SYNTHETIC_STRING_LENGTH = 4096
 _MAX_SYNTHETIC_VALUES = 256
@@ -62,7 +67,9 @@ _STATE_TTL_ENV = "AGENTKIT_FOUNDRY_RESPONSE_STATE_TTL_SECONDS"
 _MAX_PENDING_ENV = "AGENTKIT_FOUNDRY_RESPONSE_STATE_MAX_PENDING"
 _MAX_ARGUMENT_BYTES_ENV = "AGENTKIT_FOUNDRY_BROKERED_MAX_ARGUMENT_BYTES"
 _MAX_OUTPUT_BYTES_ENV = "AGENTKIT_FOUNDRY_BROKERED_MAX_OUTPUT_BYTES"
+_MAX_RESPONSE_STATE_BYTES_ENV = "AGENTKIT_FOUNDRY_RESPONSE_STATE_MAX_BYTES"
 _MAX_REQUEST_BODY_BYTES_ENV = "AGENTKIT_FOUNDRY_MAX_REQUEST_BODY_BYTES"
+_LEGACY_MAX_REQUEST_BODY_BYTES_ENV = "AGENTKIT_FOUNDRY_REQUEST_BODY_MAX_BYTES"
 _MAX_MODEL_MESSAGES_BYTES_ENV = "AGENTKIT_FOUNDRY_BROKERED_MAX_MODEL_MESSAGES_BYTES"
 _CONTINUATION_PROOF_ENV = "AGENTKIT_FOUNDRY_BROKERED_CONTINUATION_PROOF"
 _CONTINUATION_PROOF_HEADER = "x-agentkit-brokered-continuation-proof"
@@ -70,6 +77,7 @@ _CONTINUATION_PROOF_BODY_FIELD = "brokered_continuation_proof"
 _MODEL_LOOP_ENV = "AGENTKIT_FOUNDRY_BROKERED_MODEL_LOOP"
 _STATE_FILE_ENV = "AGENTKIT_FOUNDRY_RESPONSE_STATE_FILE"
 _FOUNDRY_SESSION_ENV = "FOUNDRY_AGENT_SESSION_ID"
+_TERMINAL_STATE_FULL = "state_full"
 
 
 def _new_response_id(previous_response_id: str | None = None) -> str:
@@ -144,6 +152,67 @@ def _error(message: str, status: int = 400, code: str | None = None) -> JSONResp
     )
 
 
+def _state_storage_error() -> JSONResponse:
+    return _error(
+        "brokered response state storage unavailable",
+        status=503,
+        code="brokered_response_state_storage_error",
+    )
+
+
+def _state_too_large_error() -> JSONResponse:
+    return _error(
+        "brokered response state exceeds the configured byte limit",
+        status=413,
+        code="brokered_response_state_too_large",
+    )
+
+
+def _state_full_error() -> JSONResponse:
+    return _error(
+        "too many pending brokered responses",
+        status=429,
+        code="brokered_response_state_full",
+    )
+
+
+def _request_too_large_error() -> JSONResponse:
+    return _error(
+        "Foundry request body is too large",
+        status=413,
+        code="request_too_large",
+    )
+
+
+def _model_response_too_large_error() -> JSONResponse:
+    return _error(
+        "model response is too large to retain safely",
+        status=502,
+        code="ModelResponseTooLarge",
+    )
+
+
+def _non_brokered_agent_run_error(exc: AgentRunError) -> JSONResponse:
+    if exc.status < 500:
+        return _error(str(exc), status=exc.status, code=exc.code)
+    logger.warning("non-brokered Foundry runtime request failed: %s", exc, exc_info=True)
+    status = exc.status if 500 <= exc.status <= 599 else 502
+    return _error(
+        "agent runtime request failed",
+        status=status,
+        code="RuntimeFailure",
+    )
+
+
+def _non_brokered_unexpected_runtime_error() -> JSONResponse:
+    logger.exception("non-brokered Foundry runtime request failed unexpectedly")
+    return _error(
+        "agent runtime request failed",
+        status=502,
+        code="RuntimeFailure",
+    )
+
+
 def _message_to_prompt(message: Any) -> str:
     if isinstance(message, str):
         return message
@@ -151,9 +220,11 @@ def _message_to_prompt(message: Any) -> str:
 
 
 def _session_id_from_request(request: Request) -> str | None:
-    # Foundry hosted agents may pass the session as a query parameter to the
-    # container and expose it as x-agent-session-id externally. The AgentKit
-    # header keeps local standalone validation provider-neutral.
+    # The hosted sandbox identity is authoritative when present. Query and
+    # header carriers remain ordered compatibility fallbacks for local use.
+    value = os.environ.get(_FOUNDRY_SESSION_ENV)
+    if value and value.strip():
+        return value.strip()
     for name in ("agent_session_id", "session_id"):
         value = request.query_params.get(name)
         if value and value.strip():
@@ -162,25 +233,60 @@ def _session_id_from_request(request: Request) -> str | None:
         value = request.headers.get(name)
         if value and value.strip():
             return value.strip()
-    value = os.environ.get(_FOUNDRY_SESSION_ENV)
-    if value and value.strip():
+    return None
+
+
+class _SessionIdentityConflict(ValueError):
+    pass
+
+
+def _clean_session_id(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
         return value.strip()
     return None
 
 
-def _effective_responses_session_id(request: Request, data: Mapping[str, Any]) -> str | None:
+def _effective_responses_session_id(
+    request: Request,
+    data: Mapping[str, Any],
+    *,
+    enforce_trusted_precedence: bool = False,
+) -> str | None:
     # The hosted platform identity describes the sandbox that actually received
     # the request, so prefer it over caller-controlled routing fields. Body
     # fields remain useful for direct/local protocol fidelity when the hosted
     # runtime environment is unavailable.
-    hosted = os.environ.get(_FOUNDRY_SESSION_ENV)
-    if hosted and hosted.strip():
-        return hosted.strip()
-    for name in ("agent_session_id", "session_id"):
-        value = data.get(name)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return _session_id_from_request(request)
+    hosted = _clean_session_id(os.environ.get(_FOUNDRY_SESSION_ENV))
+    if not enforce_trusted_precedence:
+        if hosted:
+            return hosted
+        for name in ("agent_session_id", "session_id"):
+            value = _clean_session_id(data.get(name))
+            if value:
+                return value
+        return _session_id_from_request(request)
+
+    # Brokered continuations persist a session binding. The hosted ingress
+    # contract strips/replaces x-agent-session-id, so that gateway-owned header
+    # and the sandbox environment must not be silently replaced by local
+    # body/query compatibility fields. Matching duplicates remain valid.
+    gateway = _clean_session_id(request.headers.get("x-agent-session-id"))
+    compatibility = [
+        _clean_session_id(data.get("agent_session_id")),
+        _clean_session_id(data.get("session_id")),
+        _clean_session_id(request.query_params.get("agent_session_id")),
+        _clean_session_id(request.query_params.get("session_id")),
+        _clean_session_id(request.headers.get("x-agentkit-session-id")),
+    ]
+    trusted = hosted or gateway
+    if trusted is not None and any(
+        value is not None and value != trusted
+        for value in (hosted, gateway, *compatibility)
+    ):
+        raise _SessionIdentityConflict("conflicting Foundry session identities")
+    if trusted is not None:
+        return trusted
+    return next((value for value in compatibility if value), None)
 
 
 def _continuation_proof_matches(
@@ -305,10 +411,13 @@ class _HostedResponseState:
     pending_calls: dict[str, _PendingCall]
     expires_at: float
     status: str = "pending"
-    accepted_outputs: dict[str, str] = field(default_factory=dict)
+    accepted_output_digests: dict[str, str] = field(default_factory=dict)
+    accepted_output_sizes: dict[str, int] = field(default_factory=dict)
     final_payload: dict[str, Any] | None = None
+    terminal_error: str | None = None
     model_messages: list[dict[str, Any]] | None = None
     initial_usage: dict[str, int] = field(default_factory=dict)
+    final_persistence_pending: bool = False
 
 
 class _StateExpired(KeyError):
@@ -318,6 +427,26 @@ class _StateExpired(KeyError):
 
 
 class _StateStoreFull(Exception):
+    pass
+
+
+class _StatePersistenceError(Exception):
+    pass
+
+
+class _StateSizeLimitExceeded(Exception):
+    pass
+
+
+class _SerializedPayloadTooLarge(ValueError):
+    pass
+
+
+class _InvalidUnicodeValue(ValueError):
+    pass
+
+
+class _RequestBodyTooLarge(ValueError):
     pass
 
 
@@ -382,31 +511,55 @@ def _persistence_json_bytes(value: Any) -> bytes:
 
 
 def _state_to_payload(state: _HostedResponseState) -> dict[str, Any]:
-    return {
+    payload = {
         "responseID": state.response_id,
         "sessionID": state.session_id,
         "pendingCalls": {call_id: _pending_call_to_state_payload(call) for call_id, call in state.pending_calls.items()},
         "expiresAt": state.expires_at,
         "status": state.status,
-        "acceptedOutputs": dict(state.accepted_outputs),
+        "acceptedOutputDigests": dict(state.accepted_output_digests),
+        "acceptedOutputSizes": dict(state.accepted_output_sizes),
         "finalPayload": state.final_payload,
         "modelMessages": state.model_messages,
         "initialUsage": dict(state.initial_usage),
     }
+    if state.terminal_error is not None:
+        payload["terminalError"] = state.terminal_error
+    return payload
 
 
 def _state_from_payload(data: Mapping[str, Any]) -> _HostedResponseState:
     pending_calls_raw = data.get("pendingCalls", {})
     if not isinstance(pending_calls_raw, Mapping):
         raise ValueError("stored pendingCalls must be an object")
-    accepted_outputs = data.get("acceptedOutputs", {})
-    if not isinstance(accepted_outputs, Mapping):
-        raise ValueError("stored acceptedOutputs must be an object")
+    accepted_output_digests = data.get("acceptedOutputDigests")
+    accepted_output_sizes = data.get("acceptedOutputSizes")
+    if accepted_output_digests is None:
+        accepted_outputs = data.get("acceptedOutputs", {})
+        if not isinstance(accepted_outputs, Mapping):
+            raise ValueError("stored acceptedOutputs must be an object")
+        accepted_output_digests = {
+            str(key): _output_digest(str(value)) for key, value in accepted_outputs.items()
+        }
+        accepted_output_sizes = {
+            str(key): len(str(value).encode("utf-8")) for key, value in accepted_outputs.items()
+        }
+    elif not isinstance(accepted_output_digests, Mapping):
+        raise ValueError("stored acceptedOutputDigests must be an object")
+    if accepted_output_sizes is None:
+        accepted_output_sizes = {}
+    if not isinstance(accepted_output_sizes, Mapping):
+        raise ValueError("stored acceptedOutputSizes must be an object")
     final_payload = data.get("finalPayload")
+    terminal_error = data.get("terminalError")
     model_messages = data.get("modelMessages")
     initial_usage = data.get("initialUsage", {})
     if final_payload is not None and not isinstance(final_payload, dict):
         raise ValueError("stored finalPayload must be an object")
+    if terminal_error is not None and not isinstance(terminal_error, str):
+        raise ValueError("stored terminalError must be a string")
+    if terminal_error not in {None, _TERMINAL_STATE_FULL}:
+        raise ValueError("stored terminalError is invalid")
     if model_messages is not None and not isinstance(model_messages, list):
         raise ValueError("stored modelMessages must be an array")
     if not isinstance(initial_usage, Mapping):
@@ -415,25 +568,39 @@ def _state_from_payload(data: Mapping[str, Any]) -> _HostedResponseState:
     expires_at = float(data.get("expiresAt") or 0)
     if not math.isfinite(expires_at):
         raise ValueError("stored expiresAt must be finite")
-    accepted = {str(key): str(value) for key, value in accepted_outputs.items()}
-    if final_payload is None and accepted:
-        # A persisted accepted output without a final payload means the process
+    accepted = {str(key): str(value) for key, value in accepted_output_digests.items()}
+    accepted_sizes: dict[str, int] = {}
+    for key, value in accepted_output_sizes.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("stored acceptedOutputSizes values must be non-negative integers")
+        accepted_sizes[str(key)] = value
+    if any(key not in accepted for key in accepted_sizes):
+        raise ValueError("stored acceptedOutputSizes contains an unknown call id")
+    if final_payload is None and terminal_error is None and (accepted or status == "resuming"):
+        # Persisted in-progress state without a final payload means the process
         # stopped between accepting the continuation and completing the resume.
-        # Clear it on load so Orka can retry the same continuation instead of
-        # being stuck behind duplicate_continuation_in_progress until TTL expiry.
+        # Clear it on load so Orka can retry instead of being stuck behind
+        # duplicate_continuation_in_progress until TTL expiry.
         status = "pending"
         accepted = {}
+        accepted_sizes = {}
     return _HostedResponseState(
         response_id=str(data.get("responseID") or ""),
         session_id=str(data["sessionID"]) if data.get("sessionID") is not None else None,
         pending_calls={str(call_id): _pending_call_from_state_payload(call) for call_id, call in pending_calls_raw.items() if isinstance(call, Mapping)},
         expires_at=expires_at,
         status=status,
-        accepted_outputs=accepted,
+        accepted_output_digests=accepted,
+        accepted_output_sizes=accepted_sizes,
         final_payload=final_payload,
+        terminal_error=terminal_error,
         model_messages=model_messages,
         initial_usage={str(key): int(value or 0) for key, value in initial_usage.items()},
     )
+
+
+def _state_has_replay(state: _HostedResponseState) -> bool:
+    return state.final_payload is not None or state.terminal_error is not None
 
 
 class _FoundryResponseStateStore:
@@ -441,138 +608,505 @@ class _FoundryResponseStateStore:
 
     Without a file path this is in-memory only. With a file path, the store
     persists pending/final response state using atomic JSON writes so a restarted
-    single-replica/sticky deployment can resume known response IDs.
+    single-replica/sticky deployment can resume known response IDs. Initial model
+    work reserves capacity in memory; a reservation may provisionally claim a
+    completed replay entry, but eviction is committed only when pending state is
+    installed in its place.
     """
 
-    def __init__(self, ttl_seconds: float, max_entries: int, state_file: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        ttl_seconds: float,
+        max_entries: int,
+        max_bytes: int,
+        state_file: str | Path | None = None,
+    ) -> None:
         self.ttl_seconds = ttl_seconds
         self.max_entries = max_entries
+        self.max_bytes = max_bytes
         self.state_file = Path(state_file) if state_file else None
         self._states: dict[str, _HostedResponseState] = {}
-        self._reservations: set[str] = set()
+        self._entry_sizes: dict[str, int] = {}
+        self._active_resumes: dict[str, asyncio.Task[Any]] = {}
+        self._reservations: dict[str, str | None] = {}
+        self._lock = threading.RLock()
         self._load()
 
     @property
     def backend_name(self) -> str:
         return "file" if self.state_file else "memory"
 
-    def reserve(self, response_id: str) -> None:
-        self.purge_expired()
-        if response_id in self._states or response_id in self._reservations:
-            return
-        non_evictable = sum(
+    def max_accepted_output_bytes(self) -> int:
+        with self._lock:
+            now = time.time()
+            active_resume_ids = self._active_resume_ids()
+            return max(
+                (
+                    size
+                    for response_id, state in self._states.items()
+                    if state.expires_at > now
+                    or (state.status == "resuming" and response_id in active_resume_ids)
+                    for size in state.accepted_output_sizes.values()
+                ),
+                default=0,
+            )
+
+    def _active_resume_ids(self) -> set[str]:
+        finished = [response_id for response_id, task in self._active_resumes.items() if task.done()]
+        for response_id in finished:
+            self._active_resumes.pop(response_id, None)
+        return set(self._active_resumes)
+
+    def _claimed_response_ids(
+        self,
+        states: Mapping[str, _HostedResponseState],
+        *,
+        exclude_reservation_id: str | None = None,
+    ) -> set[str]:
+        return {
+            claimed_response_id
+            for reservation_id, claimed_response_id in self._reservations.items()
+            if reservation_id != exclude_reservation_id
+            and claimed_response_id is not None
+            and claimed_response_id in states
+        }
+
+    def _reservation_slots(
+        self,
+        states: Mapping[str, _HostedResponseState],
+        *,
+        exclude_reservation_id: str | None = None,
+    ) -> int:
+        return sum(
             1
-            for state in self._states.values()
-            if state.status != "completed" or state.final_payload is None
+            for reservation_id, claimed_response_id in self._reservations.items()
+            if reservation_id != exclude_reservation_id
+            and (claimed_response_id is None or claimed_response_id not in states)
         )
-        if non_evictable + len(self._reservations) >= self.max_entries:
-            raise _StateStoreFull("too many pending brokered responses")
-        self._reservations.add(response_id)
 
-    def release_reservation(self, response_id: str) -> None:
-        self._reservations.discard(response_id)
+    @staticmethod
+    def _purge_expired_from(
+        states: dict[str, _HostedResponseState],
+        *,
+        now: float,
+        active_resume_ids: set[str],
+    ) -> bool:
+        expired = [
+            response_id
+            for response_id, state in states.items()
+            if state.expires_at <= now and not (state.status == "resuming" and response_id in active_resume_ids)
+        ]
+        for response_id in expired:
+            states.pop(response_id, None)
+        return bool(expired)
 
-    def add(self, state: _HostedResponseState) -> None:
-        self.purge_expired()
-        if state.response_id in self._states:
-            self._reservations.discard(state.response_id)
-        else:
-            reserved = state.response_id in self._reservations
-            self._reservations.discard(state.response_id)
-            self.evict_completed_to_capacity(reserve_slots=len(self._reservations) + 1)
-            if len(self._states) + len(self._reservations) >= self.max_entries:
-                if reserved:
-                    self._reservations.add(state.response_id)
-                raise _StateStoreFull("too many pending brokered responses")
-        self._states[state.response_id] = state
-        self._persist()
-
-    def save(self, state: _HostedResponseState) -> None:
-        if state.response_id in self._states:
-            self._states[state.response_id] = state
-            self._persist()
-
-    def evict_completed_to_capacity(self, *, reserve_slots: int = 0) -> None:
-        target = max(self.max_entries - reserve_slots, 0)
-        if len(self._states) <= target:
-            return
+    @staticmethod
+    def _evict_completed_from(
+        states: dict[str, _HostedResponseState],
+        *,
+        target: int,
+        excluded_response_ids: set[str] | None = None,
+    ) -> bool:
+        if len(states) <= target:
+            return False
+        excluded = excluded_response_ids or set()
         completed = sorted(
-            (entry for entry in self._states.values() if entry.status == "completed" and entry.final_payload is not None),
+            (
+                entry
+                for entry in states.values()
+                if entry.status == "completed"
+                and _state_has_replay(entry)
+                and not entry.final_persistence_pending
+                and entry.response_id not in excluded
+            ),
             key=lambda entry: entry.expires_at,
         )
         changed = False
         for entry in completed:
-            self._states.pop(entry.response_id, None)
+            states.pop(entry.response_id, None)
             changed = True
-            if len(self._states) <= target:
+            if len(states) <= target:
                 break
-        if changed:
-            self._persist()
+        return changed
+
+    @staticmethod
+    def _completed_reservation_candidate(
+        states: Mapping[str, _HostedResponseState],
+        *,
+        excluded_response_ids: set[str],
+    ) -> str | None:
+        candidates = sorted(
+            (
+                entry
+                for entry in states.values()
+                if entry.status == "completed"
+                and _state_has_replay(entry)
+                and not entry.final_persistence_pending
+                and entry.response_id not in excluded_response_ids
+            ),
+            key=lambda entry: entry.expires_at,
+        )
+        return candidates[0].response_id if candidates else None
+
+    def _commit(
+        self,
+        states: dict[str, _HostedResponseState],
+        *,
+        data: bytes | None = None,
+        entry_sizes: Mapping[str, int] | None = None,
+    ) -> None:
+        if data is None:
+            data = self._serialize(states)
+        if entry_sizes is None:
+            entry_sizes = self._entry_sizes_for(states)
+        self._persist(data)
+        installed = states
+        pending_finals = [
+            response_id
+            for response_id, state in states.items()
+            if state.final_persistence_pending and state.status == "completed" and _state_has_replay(state)
+        ]
+        if pending_finals:
+            installed = dict(states)
+            for response_id in pending_finals:
+                durable = deepcopy(states[response_id])
+                durable.final_persistence_pending = False
+                installed[response_id] = durable
+        self._states = installed
+        self._entry_sizes = {response_id: entry_sizes[response_id] for response_id in installed}
+
+    def _serialized_state_entry_size(self, response_id: str, state: _HostedResponseState) -> int:
+        try:
+            key_data = _bounded_json_bytes(response_id, max_bytes=self.max_bytes)
+            state_data = _bounded_json_bytes(_state_to_payload(state), max_bytes=self.max_bytes)
+        except _SerializedPayloadTooLarge as exc:
+            raise _StateSizeLimitExceeded("Foundry response state exceeds configured byte limit") from exc
+        except (TypeError, ValueError) as exc:
+            raise _StatePersistenceError("Foundry response state serialization failed") from exc
+        return len(key_data) + 1 + len(state_data)
+
+    def _entry_sizes_for(
+        self,
+        states: Mapping[str, _HostedResponseState],
+        *,
+        recompute_response_id: str | None = None,
+    ) -> dict[str, int]:
+        return {
+            response_id: (
+                self._serialized_state_entry_size(response_id, state)
+                if response_id == recompute_response_id or response_id not in self._entry_sizes
+                else self._entry_sizes[response_id]
+            )
+            for response_id, state in states.items()
+        }
+
+    def _serialize_candidate(
+        self,
+        states: dict[str, _HostedResponseState],
+        *,
+        response_id: str,
+        excluded_response_ids: set[str],
+    ) -> tuple[bytes, dict[str, int]]:
+        entry_sizes = self._entry_sizes_for(states, recompute_response_id=response_id)
+
+        envelope_bytes = len(b'{"states":{}}')
+        candidate_bytes = envelope_bytes + entry_sizes[response_id]
+        if candidate_bytes > self.max_bytes:
+            raise _StateSizeLimitExceeded("Foundry response state exceeds configured byte limit")
+
+        state_count = len(states)
+        total_bytes = envelope_bytes + sum(entry_sizes.values()) + max(state_count - 1, 0)
+        excluded = {*excluded_response_ids, response_id}
+        evictable = sorted(
+            (
+                state
+                for state in states.values()
+                if state.status == "completed"
+                and _state_has_replay(state)
+                and not state.final_persistence_pending
+                and state.response_id not in excluded
+            ),
+            key=lambda state: state.expires_at,
+        )
+        for completed in evictable:
+            if total_bytes <= self.max_bytes:
+                break
+            states.pop(completed.response_id, None)
+            total_bytes -= entry_sizes[completed.response_id]
+            if state_count > 1:
+                total_bytes -= 1
+            state_count -= 1
+        if total_bytes > self.max_bytes:
+            raise _StateStoreFull("brokered response state byte capacity is full")
+        return self._serialize(states), {current_response_id: entry_sizes[current_response_id] for current_response_id in states}
+
+    def _add_locked(self, state: _HostedResponseState, *, reservation_id: str | None = None) -> None:
+        if reservation_id is not None:
+            if reservation_id != state.response_id or reservation_id not in self._reservations:
+                raise RuntimeError("Foundry response state reservation is missing")
+        states = dict(self._states)
+        self._purge_expired_from(states, now=time.time(), active_resume_ids=self._active_resume_ids())
+        is_new_state = state.response_id not in states
+        reservation_slots = self._reservation_slots(
+            states,
+            exclude_reservation_id=reservation_id,
+        )
+        if (
+            is_new_state
+            and len(states) + reservation_slots >= self.max_entries
+            and any(
+                entry.final_persistence_pending and entry.status == "completed" and _state_has_replay(entry)
+                for entry in states.values()
+            )
+        ):
+            self._commit(states)
+            states = dict(self._states)
+
+        claimed_response_id = self._reservations.get(reservation_id) if reservation_id is not None else None
+        if claimed_response_id is not None:
+            states.pop(claimed_response_id, None)
+        reservation_slots = self._reservation_slots(
+            states,
+            exclude_reservation_id=reservation_id,
+        )
+        protected_response_ids = self._claimed_response_ids(
+            states,
+            exclude_reservation_id=reservation_id,
+        )
+        if len(states) + reservation_slots >= self.max_entries and is_new_state:
+            self._evict_completed_from(
+                states,
+                target=max(self.max_entries - reservation_slots - 1, 0),
+                excluded_response_ids=protected_response_ids,
+            )
+        if len(states) + reservation_slots >= self.max_entries and is_new_state:
+            raise _StateStoreFull("too many pending brokered responses")
+        states[state.response_id] = state
+        data, entry_sizes = self._serialize_candidate(
+            states,
+            response_id=state.response_id,
+            excluded_response_ids=protected_response_ids,
+        )
+        states[state.response_id] = deepcopy(state)
+        self._commit(states, data=data, entry_sizes=entry_sizes)
+        if reservation_id is not None:
+            self._reservations.pop(reservation_id, None)
+
+    def reserve(self, response_id: str) -> None:
+        with self._lock:
+            if response_id in self._states or response_id in self._reservations:
+                raise RuntimeError("Foundry response state ID is already in use")
+            states = dict(self._states)
+            changed = self._purge_expired_from(
+                states,
+                now=time.time(),
+                active_resume_ids=self._active_resume_ids(),
+            )
+            reservation_slots = self._reservation_slots(states)
+            if (
+                len(states) + reservation_slots >= self.max_entries
+                and any(
+                    entry.final_persistence_pending and entry.status == "completed" and _state_has_replay(entry)
+                    for entry in states.values()
+                )
+            ):
+                self._commit(states)
+                states = dict(self._states)
+                changed = False
+                reservation_slots = self._reservation_slots(states)
+
+            if len(states) + reservation_slots < self.max_entries:
+                if changed:
+                    self._commit(states)
+                self._reservations[response_id] = None
+                return
+
+            claimed_response_id = self._completed_reservation_candidate(
+                states,
+                excluded_response_ids=self._claimed_response_ids(states),
+            )
+            if claimed_response_id is None:
+                raise _StateStoreFull("too many pending brokered responses")
+            if changed:
+                self._commit(states)
+            self._reservations[response_id] = claimed_response_id
+
+    def release_reservation(self, response_id: str) -> None:
+        with self._lock:
+            self._reservations.pop(response_id, None)
+
+    def add(self, state: _HostedResponseState) -> None:
+        with self._lock:
+            self._add_locked(state)
+
+    def add_reserved(self, state: _HostedResponseState) -> None:
+        with self._lock:
+            self._add_locked(state, reservation_id=state.response_id)
+
+    def save(self, state: _HostedResponseState) -> None:
+        with self._lock:
+            if state.response_id not in self._states:
+                return
+            states = dict(self._states)
+            states[state.response_id] = state
+            data, entry_sizes = self._serialize_candidate(
+                states,
+                response_id=state.response_id,
+                excluded_response_ids=self._claimed_response_ids(states),
+            )
+            states[state.response_id] = deepcopy(state)
+            self._commit(states, data=data, entry_sizes=entry_sizes)
+
+    def cache_in_memory(self, state: _HostedResponseState) -> bool:
+        """Cache one entry after a durable transition could not be written.
+
+        Persisted unfinalized continuations are normalized back to pending by
+        ``_state_from_payload`` on restart. In-process caching also preserves a
+        successfully computed final payload until an identical retry can persist it.
+        """
+
+        with self._lock:
+            if state.response_id not in self._states:
+                return False
+            states = dict(self._states)
+            states[state.response_id] = state
+            try:
+                _, entry_sizes = self._serialize_candidate(
+                    states,
+                    response_id=state.response_id,
+                    excluded_response_ids=self._claimed_response_ids(states),
+                )
+            except (_StateSizeLimitExceeded, _StateStoreFull, _StatePersistenceError):
+                return False
+            states[state.response_id] = deepcopy(state)
+            self._states = states
+            self._entry_sizes = entry_sizes
+            return True
+
+    def mark_resume_active(self, response_id: str) -> None:
+        with self._lock:
+            task = asyncio.current_task()
+            if task is not None:
+                self._active_resumes[response_id] = task
+
+    def mark_resume_inactive(self, response_id: str) -> None:
+        with self._lock:
+            self._active_resumes.pop(response_id, None)
+
+    def evict_completed_to_capacity(self, *, reserve_slots: int = 0) -> None:
+        with self._lock:
+            states = dict(self._states)
+            reservation_slots = self._reservation_slots(states)
+            target = max(self.max_entries - reservation_slots - reserve_slots, 0)
+            if self._evict_completed_from(
+                states,
+                target=target,
+                excluded_response_ids=self._claimed_response_ids(states),
+            ):
+                self._commit(states)
 
     def get(self, response_id: str) -> _HostedResponseState:
-        state = self._states.get(response_id)
-        if state is None:
-            raise KeyError(response_id)
-        if state.expires_at <= time.time():
-            self._states.pop(response_id, None)
-            self._persist()
-            raise _StateExpired(response_id, state)
-        self.purge_expired()
-        return state
+        with self._lock:
+            state = self._states.get(response_id)
+            if state is None:
+                raise KeyError(response_id)
+            states = dict(self._states)
+            now = time.time()
+            active_resume_ids = self._active_resume_ids()
+            target_expired = state.expires_at <= now and not (
+                state.status == "resuming" and response_id in active_resume_ids
+            )
+            changed = self._purge_expired_from(states, now=now, active_resume_ids=active_resume_ids)
+            if changed:
+                self._commit(states)
+            if target_expired:
+                raise _StateExpired(response_id, deepcopy(state))
+            current = self._states.get(response_id)
+            if current is None:
+                raise KeyError(response_id)
+            return deepcopy(current)
 
     def purge_expired(self) -> None:
-        now = time.time()
-        expired = [response_id for response_id, state in self._states.items() if state.expires_at <= now]
-        for response_id in expired:
-            self._states.pop(response_id, None)
-        if expired:
-            self._persist()
+        with self._lock:
+            states = dict(self._states)
+            if self._purge_expired_from(states, now=time.time(), active_resume_ids=self._active_resume_ids()):
+                self._commit(states)
 
     def _load(self) -> None:
         if self.state_file is None or not self.state_file.exists():
             return
         try:
-            data = json.loads(self.state_file.read_text(encoding="utf-8"))
+            if self.state_file.stat().st_size > self.max_bytes:
+                raise _StateSizeLimitExceeded("Foundry response state file exceeds configured byte limit")
+            with self.state_file.open("rb") as handle:
+                raw = handle.read(self.max_bytes + 1)
+            if len(raw) > self.max_bytes:
+                raise _StateSizeLimitExceeded("Foundry response state file exceeds configured byte limit")
+            data = json.loads(raw)
             if not isinstance(data, Mapping):
                 raise ValueError("Foundry response state file root must be an object")
             states = data.get("states", {})
             if not isinstance(states, Mapping):
                 raise ValueError("Foundry response state file states must be an object")
+            if len(states) > self.max_entries:
+                raise ValueError("Foundry response state file exceeds configured entry limit")
             if not all(isinstance(state, Mapping) for state in states.values()):
                 raise ValueError("Foundry response state entries must be objects")
-            self._states = {str(response_id): _state_from_payload(state) for response_id, state in states.items()}
+            loaded_states = {
+                str(response_id): _state_from_payload(state)
+                for response_id, state in states.items()
+            }
+            self._serialize(loaded_states)
+            self._states = loaded_states
+            self._entry_sizes = {}
             self.purge_expired()
-        except (OSError, json.JSONDecodeError, ValueError) as exc:
+        except (
+            OSError,
+            _StatePersistenceError,
+            TypeError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            RecursionError,
+            ValueError,
+            _StateSizeLimitExceeded,
+        ) as exc:
             raise RuntimeError(f"invalid Foundry response state file {self.state_file}: {exc}") from exc
 
-    def _persist(self) -> None:
+    def _serialize(self, states: Mapping[str, _HostedResponseState]) -> bytes:
+        payload = {"states": {response_id: _state_to_payload(state) for response_id, state in states.items()}}
+        try:
+            return _bounded_json_bytes(payload, max_bytes=self.max_bytes)
+        except _SerializedPayloadTooLarge as exc:
+            raise _StateSizeLimitExceeded("Foundry response state exceeds configured byte limit") from exc
+        except (TypeError, ValueError) as exc:
+            raise _StatePersistenceError("Foundry response state serialization failed") from exc
+
+    def _persist(self, data: bytes) -> None:
         if self.state_file is None:
             return
-        self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"states": {response_id: _state_to_payload(state) for response_id, state in self._states.items()}}
         tmp = self.state_file.with_name(f".{self.state_file.name}.tmp")
-        data = _persistence_json_bytes(payload)
         try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        fd = os.open(tmp, flags, 0o600)
-        try:
+            self.state_file.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(tmp, flags, 0o600)
             with os.fdopen(fd, "wb") as handle:
                 handle.write(data)
                 handle.flush()
                 os.fsync(handle.fileno())
-        except Exception:
+            os.chmod(tmp, 0o600)
+            tmp.replace(self.state_file)
+        except OSError as exc:
             try:
                 tmp.unlink(missing_ok=True)
-            finally:
-                raise
-        os.chmod(tmp, 0o600)
-        tmp.replace(self.state_file)
-        os.chmod(self.state_file, 0o600)
+            except OSError:
+                pass
+            raise _StatePersistenceError("Foundry response state persistence failed") from exc
 
 
 def _state_ttl_seconds(value: float | None = None) -> float:
@@ -614,10 +1148,24 @@ def _max_output_bytes(value: int | None = None) -> int:
     return _positive_int_setting(value, env_name=_MAX_OUTPUT_BYTES_ENV, default=_DEFAULT_MAX_OUTPUT_BYTES)
 
 
-def _max_request_body_bytes(value: int | None = None) -> int:
+def _max_response_state_bytes(value: int | None = None) -> int:
     return _positive_int_setting(
         value,
-        env_name=_MAX_REQUEST_BODY_BYTES_ENV,
+        env_name=_MAX_RESPONSE_STATE_BYTES_ENV,
+        default=_DEFAULT_MAX_RESPONSE_STATE_BYTES,
+    )
+
+
+def _max_request_body_bytes(value: int | None = None) -> int:
+    if value is not None or os.environ.get(_MAX_REQUEST_BODY_BYTES_ENV):
+        return _positive_int_setting(
+            value,
+            env_name=_MAX_REQUEST_BODY_BYTES_ENV,
+            default=_DEFAULT_MAX_REQUEST_BODY_BYTES,
+        )
+    return _positive_int_setting(
+        None,
+        env_name=_LEGACY_MAX_REQUEST_BODY_BYTES_ENV,
         default=_DEFAULT_MAX_REQUEST_BODY_BYTES,
     )
 
@@ -628,21 +1176,6 @@ def _max_model_messages_bytes(value: int | None = None) -> int:
         env_name=_MAX_MODEL_MESSAGES_BYTES_ENV,
         default=_DEFAULT_MAX_MODEL_MESSAGES_BYTES,
     )
-
-
-class _RequestBodyTooLarge(Exception):
-    pass
-
-
-async def _bounded_request_body(request: Request, *, max_bytes: int) -> bytes:
-    chunks: list[bytes] = []
-    total = 0
-    async for chunk in request.stream():
-        total += len(chunk)
-        if total > max_bytes:
-            raise _RequestBodyTooLarge
-        chunks.append(chunk)
-    return b"".join(chunks)
 
 
 def _brokered_model_loop_enabled(value: bool | None = None) -> bool:
@@ -673,20 +1206,33 @@ def _function_call_outputs_from_input(input_value: Any) -> list[dict[str, Any]]:
     return outputs
 
 
+def _mapping_value_paths(value: Mapping[Any, Any], parent_path: str):
+    for key, child in value.items():
+        yield child, f"{parent_path}.{key}"
+
+
+def _list_value_paths(value: list[Any], parent_path: str):
+    for idx, child in enumerate(value):
+        yield child, f"{parent_path}[{idx}]"
+
+
 def _reject_nonfinite_json_values(value: Any, *, path: str = "value") -> None:
-    pending: list[tuple[Any, str, int]] = [(value, path, 0)]
+    pending: list[tuple[Any, int]] = [(iter(((value, path),)), 0)]
     while pending:
-        current, current_path, depth = pending.pop()
+        iterator, depth = pending[-1]
+        try:
+            current, current_path = next(iterator)
+        except StopIteration:
+            pending.pop()
+            continue
         if depth > _MAX_OUTPUT_DEPTH:
             raise ValueError(f"{path} is nested too deeply")
         if isinstance(current, float) and not math.isfinite(current):
             raise ValueError(f"{current_path} must be finite")
         if isinstance(current, Mapping):
-            for key, child in current.items():
-                pending.append((child, f"{current_path}.{key}", depth + 1))
+            pending.append((_mapping_value_paths(current, current_path), depth + 1))
         elif isinstance(current, list):
-            for idx, child in enumerate(current):
-                pending.append((child, f"{current_path}[{idx}]", depth + 1))
+            pending.append((_list_value_paths(current, current_path), depth + 1))
 
 
 def _parse_output_float(raw: str) -> float:
@@ -743,12 +1289,111 @@ def _json_object_from_output(output: Any) -> dict[str, Any]:
         if "error" not in parsed or not isinstance(parsed["error"], dict):
             raise ValueError("denied function_call_output.output.error must be an object")
     _reject_nonfinite_json_values(parsed, path="function_call_output.output")
-    return json.loads(json.dumps(parsed, allow_nan=False, separators=(",", ":"), sort_keys=True))
+    return parsed
+
+
+def _utf8_exceeds_limit(value: str, max_bytes: int) -> bool:
+    if len(value) > max_bytes:
+        return True
+    try:
+        return len(value.encode("utf-8")) > max_bytes
+    except UnicodeEncodeError as exc:
+        raise _InvalidUnicodeValue("function_call_output.output must contain valid Unicode") from exc
+
+
+def _mapping_children(value: Mapping[Any, Any]):
+    for key, child in value.items():
+        yield key
+        yield child
+
+
+def _json_string_encoded_size(value: str, *, max_bytes: int) -> int:
+    size = 2
+    for char in value:
+        codepoint = ord(char)
+        if 0xD800 <= codepoint <= 0xDFFF:
+            raise _InvalidUnicodeValue("JSON strings must contain valid Unicode")
+        if char in {'"', "\\", "\b", "\f", "\n", "\r", "\t"}:
+            size += 2
+        elif codepoint < 0x20 or codepoint == 0x7F or 0x80 <= codepoint <= 0xFFFF:
+            size += 6
+        elif codepoint > 0xFFFF:
+            size += 12
+        else:
+            size += 1
+        if size > max_bytes:
+            raise _SerializedPayloadTooLarge
+    return size
+
+
+def _encode_json_bounded(value: Any, *, max_bytes: int, sort_keys: bool, collect: bool) -> bytes:
+    encoded = bytearray() if collect else None
+    total = 0
+    encoder = json.JSONEncoder(allow_nan=False, separators=(",", ":"), sort_keys=sort_keys)
+    try:
+        for chunk in encoder.iterencode(value):
+            remaining = max_bytes - total
+            if len(chunk) > remaining:
+                raise _SerializedPayloadTooLarge
+            chunk_bytes = chunk.encode("utf-8")
+            if len(chunk_bytes) > remaining:
+                raise _SerializedPayloadTooLarge
+            total += len(chunk_bytes)
+            if encoded is not None:
+                encoded.extend(chunk_bytes)
+    except RecursionError as exc:
+        raise _SerializedPayloadTooLarge from exc
+    return bytes(encoded or b"")
+
+
+async def _read_json_request_bounded(request: Request, *, max_bytes: int) -> tuple[Any, int]:
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_length = int(content_length)
+        except ValueError:
+            declared_length = -1
+        if declared_length > max_bytes:
+            raise _RequestBodyTooLarge
+
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > max_bytes:
+            raise _RequestBodyTooLarge
+        body.extend(chunk)
+    return json.loads(body), len(body)
+
+
+def _bounded_json_bytes(value: Any, *, max_bytes: int) -> bytes:
+    pending = [iter((value,))]
+    visited = 0
+    while pending:
+        try:
+            current = next(pending[-1])
+        except StopIteration:
+            pending.pop()
+            continue
+        visited += 1
+        if visited > max_bytes:
+            raise _SerializedPayloadTooLarge
+        if isinstance(current, str):
+            _json_string_encoded_size(current, max_bytes=max_bytes)
+        elif isinstance(current, Mapping):
+            pending.append(iter(_mapping_children(current)))
+        elif isinstance(current, (list, tuple)):
+            pending.append(iter(current))
+
+    _encode_json_bounded(value, max_bytes=max_bytes, sort_keys=False, collect=False)
+    return _encode_json_bounded(value, max_bytes=max_bytes, sort_keys=True, collect=True)
 
 
 def _canonical_output_json(output: dict[str, Any]) -> str:
     _reject_nonfinite_json_values(output)
     return json.dumps(output, allow_nan=False, separators=(",", ":"), sort_keys=True)
+
+
+def _output_digest(output_json: str) -> str:
+    return "sha256:" + hashlib.sha256(output_json.encode("utf-8")).hexdigest()
 
 
 def _first_typed_value(schema: Mapping[str, Any], key: str, expected_type: type) -> Any:
@@ -1514,6 +2159,62 @@ def _final_text_from_tool_output(call: _PendingCall, output: dict[str, Any]) -> 
     return f"Brokered tool {call.tool.name} completed with output: {_canonical_output_json(tool_output)}"
 
 
+def _reset_unfinalized_continuation(
+    store: _FoundryResponseStateStore,
+    state: _HostedResponseState,
+    *,
+    call_id: str,
+) -> bool:
+    state.accepted_output_digests.pop(call_id, None)
+    state.accepted_output_sizes.pop(call_id, None)
+    state.status = "pending"
+    state.final_payload = None
+    state.terminal_error = None
+    state.final_persistence_pending = False
+    state.expires_at = time.time() + store.ttl_seconds
+    try:
+        store.save(state)
+    except _StatePersistenceError as exc:
+        logger.warning("failed to persist Foundry continuation rollback: %s", exc)
+        store.cache_in_memory(state)
+        return False
+    return True
+
+
+def _complete_with_state_full(
+    store: _FoundryResponseStateStore,
+    state: _HostedResponseState,
+    *,
+    call_id: str,
+    resume_model_messages: list[dict[str, Any]] | None,
+    resume_initial_usage: Mapping[str, int],
+) -> JSONResponse:
+    state.status = "completed"
+    state.final_payload = None
+    state.terminal_error = _TERMINAL_STATE_FULL
+    state.model_messages = None
+    state.initial_usage = {}
+    state.final_persistence_pending = False
+    state.expires_at = time.time() + store.ttl_seconds
+    try:
+        store.save(state)
+    except (_StateSizeLimitExceeded, _StateStoreFull):
+        state.model_messages = resume_model_messages
+        state.initial_usage = dict(resume_initial_usage)
+        if not _reset_unfinalized_continuation(store, state, call_id=call_id):
+            return _state_storage_error()
+        return _state_full_error()
+    except _StatePersistenceError as exc:
+        logger.warning("failed to persist terminal Foundry brokered capacity state: %s", exc)
+        state.final_persistence_pending = True
+        try:
+            store.cache_in_memory(state)
+        except (_StateSizeLimitExceeded, _StateStoreFull):
+            return _state_storage_error()
+        return _state_storage_error()
+    return _state_full_error()
+
+
 async def _handle_brokered_continuation(
     *,
     spec: AgentSpec,
@@ -1571,6 +2272,9 @@ async def _handle_brokered_continuation(
         )
     try:
         state = store.get(str(previous_response_id))
+    except _StatePersistenceError as exc:
+        logger.warning("failed to access Foundry brokered response state: %s", exc)
+        return _state_storage_error()
     except _StateExpired:
         return _error("previous_response_id state has expired", status=410, code="response_state_expired")
     except KeyError:
@@ -1592,34 +2296,74 @@ async def _handle_brokered_continuation(
     if call is None:
         return _error("unknown function_call_output call_id", status=400, code="unknown_call_id")
     raw_output = item.get("output")
-    if isinstance(raw_output, str):
-        try:
-            if len(raw_output) > max_output_bytes or len(raw_output.encode("utf-8")) > max_output_bytes:
-                return _error(
+    if not isinstance(raw_output, str):
+        return _error(
+            "function_call_output.output must be a JSON object string",
+            status=400,
+            code="invalid_function_call_output",
+        )
+    output_exceeds_current_limit = False
+    existing_output_digest = state.accepted_output_digests.get(call_id)
+    persisted_output_size = state.accepted_output_sizes.get(call_id, 0)
+    replay_parse_limit = (
+        max_output_bytes
+        if existing_output_digest is None
+        else max(store.max_bytes, max_output_bytes, persisted_output_size)
+    )
+    raw_output_size = 0
+    try:
+        if _utf8_exceeds_limit(raw_output, replay_parse_limit):
+            return _error(
                     "brokered function_call_output is too large",
                     status=413,
                     code="brokered_output_too_large",
                 )
-        except UnicodeEncodeError as exc:
-            return _error(str(exc), status=400, code="invalid_function_call_output")
+        raw_output_size = len(raw_output.encode("utf-8"))
+        output_exceeds_current_limit = raw_output_size > max_output_bytes
+    except _InvalidUnicodeValue as exc:
+        return _error(str(exc), status=400, code="invalid_function_call_output")
     try:
         parsed_output = _json_object_from_output(raw_output)
     except ValueError as exc:
         return _error(str(exc), status=400, code="invalid_function_call_output")
-    output_json = _canonical_output_json(parsed_output)
-    output_size = len(output_json.encode("utf-8"))
-    if output_size > max_output_bytes:
+    try:
+        output_bytes = _bounded_json_bytes(parsed_output, max_bytes=replay_parse_limit)
+    except _SerializedPayloadTooLarge:
         return _error(
             "brokered function_call_output is too large",
             status=413,
             code="brokered_output_too_large",
         )
+    except _InvalidUnicodeValue as exc:
+        return _error(str(exc), status=400, code="invalid_function_call_output")
+    if len(output_bytes) > max_output_bytes:
+        output_exceeds_current_limit = True
+    accepted_output_size = max(raw_output_size, len(output_bytes))
+    output_json = output_bytes.decode("utf-8")
+    output_digest = _output_digest(output_json)
 
-    existing_output = state.accepted_outputs.get(call_id)
-    if existing_output is not None:
-        if existing_output == output_json and state.final_payload is not None:
+    if existing_output_digest is not None:
+        if existing_output_digest == output_digest and _state_has_replay(state):
+            if state.final_persistence_pending:
+                state.final_persistence_pending = False
+                try:
+                    store.save(state)
+                except _StateStoreFull:
+                    state.final_persistence_pending = True
+                    return _state_full_error()
+                except _StateSizeLimitExceeded:
+                    state.final_persistence_pending = True
+                    return _state_too_large_error()
+                except _StatePersistenceError as exc:
+                    logger.warning("failed to persist cached Foundry brokered completion: %s", exc)
+                    state.final_persistence_pending = True
+                    store.cache_in_memory(state)
+                    return _state_storage_error()
+            if state.terminal_error == _TERMINAL_STATE_FULL:
+                return _state_full_error()
+            assert state.final_payload is not None
             return JSONResponse(state.final_payload)
-        if existing_output == output_json:
+        if existing_output_digest == output_digest:
             return _error(
                 "matching function_call_output is already being processed",
                 status=409,
@@ -1630,6 +2374,12 @@ async def _handle_brokered_continuation(
             status=409,
             code="conflicting_duplicate_continuation",
         )
+    if output_exceeds_current_limit:
+        return _error(
+            "brokered function_call_output is too large",
+            status=413,
+            code="brokered_output_too_large",
+        )
     if state.model_messages is not None and model_loop is None:
         return _error(
             "brokered model-loop continuation is unavailable for this pending response",
@@ -1639,50 +2389,103 @@ async def _handle_brokered_continuation(
     if state.status != "pending":
         return _error("previous response is not pending a tool result", status=409, code="response_not_pending")
 
-    state.accepted_outputs[call_id] = output_json
-    state.expires_at = time.time() + store.ttl_seconds
-    store.save(state)
     if state.model_messages is not None and model_loop is not None:
-        state.status = "resuming"
-        store.save(state)
         try:
-            model_result = await model_loop.resume(state.model_messages, call_id=call_id, output=output_json)
+            model_loop.validate_static_credentials()
         except AgentRunError as exc:
-            state.accepted_outputs.pop(call_id, None)
-            state.status = "pending"
-            store.save(state)
-            if exc.status >= 500:
-                logger.warning("brokered model-loop resume failed: %s", exc)
-                return _error("model resume failed", status=exc.status, code="ModelResumeError")
             return _error(str(exc), status=exc.status, code=exc.code)
-        except asyncio.CancelledError:
-            state.accepted_outputs.pop(call_id, None)
-            state.status = "pending"
+        state.accepted_output_digests[call_id] = output_digest
+        state.accepted_output_sizes[call_id] = accepted_output_size
+        state.status = "resuming"
+        state.expires_at = time.time() + store.ttl_seconds
+        try:
             store.save(state)
-            raise
-        except Exception as exc:  # noqa: BLE001 - reset continuation state before surfacing unexpected model failures.
-            logger.exception("brokered model-loop resume failed unexpectedly")
-            state.accepted_outputs.pop(call_id, None)
-            state.status = "pending"
-            store.save(state)
-            return _error("model resume failed", status=502, code="ModelResumeError")
-        if not isinstance(model_result, ModelLoopFinal):
-            state.accepted_outputs.pop(call_id, None)
-            state.status = "pending"
-            store.save(state)
-            return _error(
-                "model requested another brokered tool after resume",
-                status=400,
-                code="tool_loop_limit_exceeded",
-            )
-        result = RunResult(text=model_result.text, usage=_combine_usage(state.initial_usage, model_result.usage))
+        except _StateStoreFull:
+            return _state_full_error()
+        except _StateSizeLimitExceeded:
+            return _state_too_large_error()
+        except _StatePersistenceError as exc:
+            logger.warning("failed to persist Foundry brokered continuation state: %s", exc)
+            return _state_storage_error()
+        store.mark_resume_active(state.response_id)
+        try:
+            try:
+                model_result = await model_loop.resume(state.model_messages, call_id=call_id, output=output_json)
+            except AgentRunError as exc:
+                if not _reset_unfinalized_continuation(store, state, call_id=call_id):
+                    return _state_storage_error()
+                if exc.code == "ModelResponseTooLarge":
+                    logger.warning("brokered model-loop response exceeded configured limits")
+                    return _model_response_too_large_error()
+                if exc.status >= 500:
+                    logger.warning("brokered model-loop resume failed: %s", exc)
+                    return _error("model resume failed", status=exc.status, code="ModelResumeError")
+                return _error(str(exc), status=exc.status, code=exc.code)
+            except asyncio.CancelledError:
+                _reset_unfinalized_continuation(store, state, call_id=call_id)
+                raise
+            except Exception as exc:  # noqa: BLE001 - reset continuation state before surfacing unexpected model failures.
+                logger.exception("brokered model-loop resume failed unexpectedly")
+                if not _reset_unfinalized_continuation(store, state, call_id=call_id):
+                    return _state_storage_error()
+                return _error("model resume failed", status=502, code="ModelResumeError")
+            if not isinstance(model_result, ModelLoopFinal):
+                if not _reset_unfinalized_continuation(store, state, call_id=call_id):
+                    return _state_storage_error()
+                return _error(
+                    "model requested another brokered tool after resume",
+                    status=400,
+                    code="tool_loop_limit_exceeded",
+                )
+            result = RunResult(text=model_result.text, usage=_combine_usage(state.initial_usage, model_result.usage))
+        finally:
+            store.mark_resume_inactive(state.response_id)
     else:
         result = RunResult(text=_final_text_from_tool_output(call, parsed_output))
+    resume_model_messages = state.model_messages
+    resume_initial_usage = dict(state.initial_usage)
+    has_resume_transcript = resume_model_messages is not None
+    used_model_resume = has_resume_transcript and model_loop is not None
     final_payload = _responses_payload(spec, result, previous_response_id=state.response_id)
+    state.accepted_output_digests[call_id] = output_digest
+    state.accepted_output_sizes[call_id] = accepted_output_size
     state.status = "completed"
     state.final_payload = final_payload
-    store.save(state)
-    store.evict_completed_to_capacity()
+    state.terminal_error = None
+    if has_resume_transcript:
+        state.model_messages = None
+        state.initial_usage = {}
+    state.final_persistence_pending = False
+    state.expires_at = time.time() + store.ttl_seconds
+    try:
+        store.save(state)
+    except _StateStoreFull:
+        return _complete_with_state_full(
+            store,
+            state,
+            call_id=call_id,
+            resume_model_messages=resume_model_messages,
+            resume_initial_usage=resume_initial_usage,
+        )
+    except _StateSizeLimitExceeded:
+        if has_resume_transcript:
+            state.model_messages = resume_model_messages
+            state.initial_usage = resume_initial_usage
+            if not _reset_unfinalized_continuation(store, state, call_id=call_id):
+                return _state_storage_error()
+        if used_model_resume:
+            return _model_response_too_large_error()
+        return _state_too_large_error()
+    except _StatePersistenceError as exc:
+        logger.warning("failed to persist completed Foundry brokered response state: %s", exc)
+        state.final_persistence_pending = True
+        store.cache_in_memory(state)
+        return _state_storage_error()
+    try:
+        store.evict_completed_to_capacity()
+    except _StatePersistenceError as exc:
+        logger.warning("failed to evict completed Foundry brokered response state: %s", exc)
+        return _state_storage_error()
     return JSONResponse(final_payload)
 
 
@@ -1696,6 +2499,7 @@ def create_foundry_app(
     max_pending_responses: int | None = None,
     max_brokered_argument_bytes: int | None = None,
     max_brokered_output_bytes: int | None = None,
+    max_response_state_bytes: int | None = None,
     max_request_body_bytes: int | None = None,
     max_model_messages_bytes: int | None = None,
     brokered_model_loop_enabled: bool | None = None,
@@ -1713,8 +2517,18 @@ def create_foundry_app(
     response_states = _FoundryResponseStateStore(
         ttl_seconds=_state_ttl_seconds(state_ttl_seconds),
         max_entries=_max_pending_responses(max_pending_responses),
+        max_bytes=_max_response_state_bytes(max_response_state_bytes),
         state_file=_response_state_file(response_state_file) if brokered_tools else None,
     )
+
+    def max_brokered_request_body_bytes() -> int:
+        replay_ceiling = max(
+            response_states.max_bytes,
+            max_output_bytes,
+            response_states.max_accepted_output_bytes(),
+        )
+        return max(6 * replay_ceiling, max_argument_bytes) + _REQUEST_BODY_OVERHEAD_BYTES
+
     model_loop = (
         BrokeredChatModelLoop(
             spec,
@@ -1722,6 +2536,7 @@ def create_foundry_app(
             http_client=brokered_model_http_client,
             max_argument_bytes=max_argument_bytes,
             max_output_bytes=max_output_bytes,
+            max_response_bytes=response_states.max_bytes,
         )
         if brokered_tools and _brokered_model_loop_enabled(brokered_model_loop_enabled)
         else None
@@ -1755,6 +2570,13 @@ def create_foundry_app(
             }
             if not continuation_proof:
                 body["ready"] = False
+            if model_loop is not None:
+                try:
+                    await model_loop.validate_credentials()
+                except AgentRunError:
+                    body["ready"] = False
+                    body["foundryResponses"]["modelAuth"] = "missing"
+            if not body["ready"]:
                 return JSONResponse(body, status_code=503)
         return body
 
@@ -1767,12 +2589,10 @@ def create_foundry_app(
                 code="invocations_disabled_in_brokered_mode",
             )
         try:
-            raw_body = await _bounded_request_body(request, max_bytes=request_body_limit)
+            data, _ = await _read_json_request_bounded(request, max_bytes=request_body_limit)
         except _RequestBodyTooLarge:
-            return Response("Request body is too large", status_code=413)
-        try:
-            data = json.loads(raw_body)
-        except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
+            return _request_too_large_error()
+        except (UnicodeDecodeError, RecursionError, ValueError):
             return Response("Request body must be JSON", status_code=400)
 
         if not isinstance(data, dict):
@@ -1786,21 +2606,28 @@ def create_foundry_app(
                 RunRequest(prompt=prompt, session_id=_session_id_from_request(request))
             )
         except AgentRunError as exc:
-            return _error(str(exc), status=exc.status, code=exc.code)
-        except Exception as exc:  # noqa: BLE001 - deterministic protocol envelope.
-            return _error(str(exc), status=502, code=exc.__class__.__name__)
+            return _non_brokered_agent_run_error(exc)
+        except Exception:  # noqa: BLE001 - deterministic protocol envelope.
+            return _non_brokered_unexpected_runtime_error()
 
         return JSONResponse({"response": result.text, "usage": _usage(result)})
 
     @app.post("/responses", dependencies=[auth])
     async def responses(request: Request):
         try:
-            raw_body = await _bounded_request_body(request, max_bytes=request_body_limit)
+            data, request_body_size = await _read_json_request_bounded(
+                request,
+                max_bytes=max_brokered_request_body_bytes() if brokered_tools else request_body_limit,
+            )
         except _RequestBodyTooLarge:
-            return _error("Request body is too large", status=413, code="request_body_too_large")
-        try:
-            data = json.loads(raw_body)
-        except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
+            if not brokered_tools:
+                return _request_too_large_error()
+            return _error(
+                "brokered Responses request body is too large",
+                status=413,
+                code="brokered_request_too_large",
+            )
+        except (UnicodeDecodeError, RecursionError, ValueError):
             return _error("Request body must be JSON", status=400, code="invalid_json")
 
         if not isinstance(data, dict):
@@ -1824,9 +2651,26 @@ def create_foundry_app(
         if "input" not in data:
             return _error("Missing 'input' in request", status=400, code="missing_input")
 
-        session_id = _effective_responses_session_id(request, data)
+        try:
+            session_id = _effective_responses_session_id(
+                request,
+                data,
+                enforce_trusted_precedence=bool(brokered_tools),
+            )
+        except _SessionIdentityConflict:
+            return _error(
+                "request contains conflicting Foundry session identities",
+                status=409,
+                code="response_session_mismatch",
+            )
         previous_response_id = data.get("previous_response_id")
         function_outputs = _function_call_outputs_from_input(data["input"])
+        if brokered_tools and not function_outputs and request_body_size > request_body_limit:
+            return _error(
+                "Request body is too large",
+                status=413,
+                code="request_body_too_large",
+            )
         if brokered_tools and function_outputs:
             return await _handle_brokered_continuation(
                 spec=spec,
@@ -1843,6 +2687,9 @@ def create_foundry_app(
         if brokered_tools and isinstance(previous_response_id, str) and previous_response_id:
             try:
                 previous_state = response_states.get(previous_response_id)
+            except _StatePersistenceError as exc:
+                logger.warning("failed to access Foundry brokered response state: %s", exc)
+                return _state_storage_error()
             except _StateExpired as exc:
                 if exc.state.status in {"pending", "resuming"}:
                     return _error("previous_response_id state has expired", status=410, code="response_state_expired")
@@ -1873,6 +2720,10 @@ def create_foundry_app(
                 )
             previous_response_id_for_output = previous_response_id if isinstance(previous_response_id, str) and previous_response_id else None
             if model_loop is not None:
+                try:
+                    model_loop.validate_static_credentials()
+                except AgentRunError as exc:
+                    return _error(str(exc), status=exc.status, code=exc.code)
                 response_id = _new_response_id(previous_response_id_for_output)
                 call_id = f"call_{response_id}_1"
                 try:
@@ -1883,13 +2734,24 @@ def create_foundry_app(
                         status=429,
                         code="brokered_response_state_full",
                     )
+                except _StatePersistenceError as exc:
+                    logger.warning("failed to persist Foundry brokered response state: %s", exc)
+                    return _state_storage_error()
                 try:
                     try:
                         model_result = await model_loop.start(run_request, call_id=call_id)
                     except AgentRunError as exc:
+                        if exc.code == "ModelResponseTooLarge":
+                            return _model_response_too_large_error()
                         return _error(str(exc), status=exc.status, code=exc.code)
                     if isinstance(model_result, ModelLoopFinal):
-                        return JSONResponse(_responses_payload(spec, RunResult(text=model_result.text, usage=model_result.usage), previous_response_id=previous_response_id_for_output))
+                        return JSONResponse(
+                            _responses_payload(
+                                spec,
+                                RunResult(text=model_result.text, usage=model_result.usage),
+                                previous_response_id=previous_response_id_for_output,
+                            )
+                        )
                     tool = {tool.name: tool for tool in brokered_tools}.get(model_result.name)
                     if tool is None:
                         return _error("model requested unknown brokered tool", status=400, code="unknown_brokered_tool")
@@ -1905,20 +2767,18 @@ def create_foundry_app(
                             code="brokered_arguments_too_large",
                         )
                     try:
-                        model_messages_bytes = len(
-                            _persistence_json_bytes(model_result.messages)
-                        )
-                    except (TypeError, ValueError, RecursionError, UnicodeEncodeError) as exc:
-                        return _error(
-                            f"model loop messages are invalid: {exc}",
-                            status=502,
-                            code="InvalidModelResponse",
-                        )
-                    if model_messages_bytes > model_messages_limit:
+                        _bounded_json_bytes(model_result.messages, max_bytes=model_messages_limit)
+                    except _SerializedPayloadTooLarge:
                         return _error(
                             "model loop messages are too large for pending state",
                             status=413,
                             code="brokered_model_messages_too_large",
+                        )
+                    except (_InvalidUnicodeValue, TypeError, ValueError) as exc:
+                        return _error(
+                            f"model loop messages are invalid: {exc}",
+                            status=502,
+                            code="InvalidModelResponse",
                         )
                     call = _PendingCall(
                         call_id=call_id,
@@ -1934,7 +2794,19 @@ def create_foundry_app(
                         model_messages=model_result.messages,
                         initial_usage=dict(model_result.usage),
                     )
-                    response_states.add(state)
+                    try:
+                        response_states.add_reserved(state)
+                    except _StateStoreFull:
+                        return _error(
+                            "too many pending brokered responses",
+                            status=429,
+                            code="brokered_response_state_full",
+                        )
+                    except _StateSizeLimitExceeded:
+                        return _state_too_large_error()
+                    except _StatePersistenceError as exc:
+                        logger.warning("failed to persist Foundry brokered response state: %s", exc)
+                        return _state_storage_error()
                     return JSONResponse(
                         _function_call_response_payload(
                             spec,
@@ -1987,6 +2859,11 @@ def create_foundry_app(
                     status=429,
                     code="brokered_response_state_full",
                 )
+            except _StateSizeLimitExceeded:
+                return _state_too_large_error()
+            except _StatePersistenceError as exc:
+                logger.warning("failed to persist Foundry brokered response state: %s", exc)
+                return _state_storage_error()
             return JSONResponse(
                 _function_call_response_payload(
                     spec,
@@ -1999,9 +2876,9 @@ def create_foundry_app(
         try:
             result = await request.app.state.runtime.run(run_request)
         except AgentRunError as exc:
-            return _error(str(exc), status=exc.status, code=exc.code)
-        except Exception as exc:  # noqa: BLE001 - deterministic protocol envelope.
-            return _error(str(exc), status=502, code=exc.__class__.__name__)
+            return _non_brokered_agent_run_error(exc)
+        except Exception:  # noqa: BLE001 - deterministic protocol envelope.
+            return _non_brokered_unexpected_runtime_error()
 
         return JSONResponse(_responses_payload(spec, result))
 

@@ -45,6 +45,13 @@ func TestLookupRouteUnknownRuntime(t *testing.T) {
 	}
 }
 
+func TestLookupRouteRejectsConflictingRuntimeTarget(t *testing.T) {
+	matched, _, rc, ok := lookupRoute(wantLangGraphRoute, runtimePydca)
+	if ok {
+		t.Fatalf("conflicting target resolved: matched=%q rc=%+v, want no route", matched, rc)
+	}
+}
+
 // TestLookupRouteLangGraph proves the LangGraph runtime resolves through the
 // same data-derived router as pydantic-ai and MAF.
 func TestLookupRouteLangGraph(t *testing.T) {
@@ -120,19 +127,44 @@ func TestLookupRouteAliasAsTarget(t *testing.T) {
 	}
 }
 
-// TestLookupRouteAliasTargetEmptyRuntime documents the contract seam: when the
-// target names a runtime by alias but the runtime arg is empty (→ defaults to
-// pydantic-ai), the ROUTE still canonicalizes to maf/image, but the returned
-// RuntimeConfig follows the runtime arg (pydantic-ai). build.go always passes the
-// authoritative cfg.Runtime, so this mixed case does not arise in practice; the
-// test pins the behavior so a future refactor notices if it changes.
-func TestLookupRouteAliasTargetEmptyRuntime(t *testing.T) {
-	matched, _, rc, ok := lookupRoute(runtimeMAFAls+"/image", "")
-	if !ok || matched != wantMAFRoute {
-		t.Fatalf("matched=%q ok=%v, want %s", matched, ok, wantMAFRoute)
+func TestLookupRouteRejectsConflictingAliasAndPrefixedTargets(t *testing.T) {
+	cases := []struct {
+		target  string
+		runtime string
+	}{
+		{runtimeMAFAls, ""},
+		{runtimeMAFAls + "/image", runtimePydca},
+		{runtimeMAFAls + "/image/debug", runtimePydca},
+		{runtimeMAFName + "/image/debug", runtimeLangGraph},
 	}
-	if rc == nil || rc.Name != runtimePydca {
-		t.Fatalf("rc=%+v, want pydantic-ai (rc follows the runtime arg, not the target)", rc)
+	for _, tc := range cases {
+		matched, _, rc, ok := lookupRoute(tc.target, tc.runtime)
+		if ok {
+			t.Errorf("lookupRoute(%q, %q) resolved: matched=%q rc=%+v, want no route", tc.target, tc.runtime, matched, rc)
+		}
+	}
+}
+
+func TestLookupRouteMatchingRuntimePreservesOutputSuffix(t *testing.T) {
+	cases := []struct {
+		target      string
+		runtime     string
+		wantRoute   string
+		wantRuntime string
+	}{
+		{wantImageRoute + "/debug", runtimePydca, wantImageRoute, runtimePydca},
+		{runtimeMAFAls + "/image/debug", runtimeMAFName, wantMAFRoute, runtimeMAFName},
+		{wantMAFRoute + "/debug/more", runtimeMAFAls, wantMAFRoute, runtimeMAFName},
+		{wantLangGraphRoute + "/debug", runtimeLangGraph, wantLangGraphRoute, runtimeLangGraph},
+	}
+	for _, tc := range cases {
+		matched, _, rc, ok := lookupRoute(tc.target, tc.runtime)
+		if !ok || matched != tc.wantRoute {
+			t.Errorf("lookupRoute(%q, %q): matched=%q ok=%v, want %q", tc.target, tc.runtime, matched, ok, tc.wantRoute)
+		}
+		if rc == nil || rc.Name != tc.wantRuntime {
+			t.Errorf("lookupRoute(%q, %q): rc=%+v, want runtime %q", tc.target, tc.runtime, rc, tc.wantRuntime)
+		}
 	}
 }
 
