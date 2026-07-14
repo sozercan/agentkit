@@ -79,7 +79,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"agentkit-foundry-brokered: refusing to bind {args.host!r} without AGENTKIT_AUTH_TOKEN; "
             "set a bearer token or bind 127.0.0.1 for local-only use"
         )
-    app = create_foundry_app(spec, _NoDirectFactory(), auth_token=auth_token)
     if args.dry_run:
         print(
             json.dumps(
@@ -95,6 +94,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         )
         return 0
+    app = create_foundry_app(spec, _NoDirectFactory(), auth_token=auth_token)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info", access_log=True)
     return 0
 

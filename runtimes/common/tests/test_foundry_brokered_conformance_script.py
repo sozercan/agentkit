@@ -38,6 +38,7 @@ def _mock_gateway(
                     "output": [
                         {
                             "type": "function_call",
+                            "response_id": initial_response_id,
                             "call_id": "call_conformance_1",
                             "name": "conformance_read",
                             "arguments": '{"probe":true}',
@@ -48,7 +49,7 @@ def _mock_gateway(
                 if agent_session_id is not None:
                     response["agent_session_id"] = agent_session_id
             else:
-                final_text = "success"
+                final_text = 'conformance complete: {"approved": true, "output": {"success": true}}'
                 if serialize_continuation_body:
                     final_text = "request failed: " + json.dumps(body, separators=(",", ":"))
                 elif echo_continuation_proof:
@@ -60,6 +61,9 @@ def _mock_gateway(
                     "output": [
                         {
                             "type": "message",
+                            "response_id": "caresp_mock_final",
+                            "role": "assistant",
+                            "status": "completed",
                             "content": [{"type": "output_text", "text": final_text}],
                         }
                     ],

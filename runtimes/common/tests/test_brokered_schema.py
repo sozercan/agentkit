@@ -266,6 +266,56 @@ def test_render_brokered_tools_yaml_outputs_agent_yaml_fragment():
     assert "Authorization" not in rendered
 
 
+def test_load_orka_tool_crd_files_preserves_high_precision_integral_float(tmp_path):
+    src = tmp_path / "precise.yaml"
+    src.write_text(
+        """apiVersion: core.orka.ai/v1alpha1
+kind: Tool
+metadata:
+  name: precise-number
+spec:
+  description: Preserve a precise number.
+  brokeredToolClass: read
+  parameters:
+    type: object
+    properties:
+      identifier:
+        type: integer
+        default: 9007199254740993.0
+""",
+        encoding="utf-8",
+    )
+
+    [entry] = load_orka_tool_crd_files([src], include_digest=False)
+
+    default = entry["parameters"]["properties"]["identifier"]["default"]
+    assert default == 9007199254740993
+    assert isinstance(default, int)
+
+
+def test_load_orka_tool_crd_files_rejects_lossy_fractional_float(tmp_path):
+    src = tmp_path / "lossy.yaml"
+    src.write_text(
+        """apiVersion: core.orka.ai/v1alpha1
+kind: Tool
+metadata:
+  name: lossy-number
+spec:
+  description: Reject a lossy number.
+  brokeredToolClass: write
+  parameters:
+    type: object
+    properties:
+      ratio:
+        default: 0.100000000000000005
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="cannot be represented exactly"):
+        load_orka_tool_crd_files([src], include_digest=False)
+
+
 def test_load_orka_tool_crd_files_rejects_duplicate_exported_names(tmp_path):
     first = tmp_path / "first.yaml"
     second = tmp_path / "second.yaml"

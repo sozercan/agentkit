@@ -9,7 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	pathpkg "path"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -47,6 +49,7 @@ const (
 	jsonSchemaTypeArray            = "array"
 	jsonSchemaTypeBoolean          = "boolean"
 	jsonSchemaTypeNull             = "null"
+	jsonSchemaEnumKey              = "enum"
 	jsonSchemaDefaultKey           = "default"
 	jsonSchemaRequiredKey          = "required"
 	jsonSchemaDependentRequiredKey = "dependentRequired"
@@ -62,6 +65,7 @@ const (
 	brokeredUnsafeCookieKey        = "cookie"
 	authorizationKey               = "authorization"
 	credentialHeaderAPIKey         = "api-key"
+	maxExactJSONFloatInteger       = float64(1<<53 - 1)
 )
 
 var brokeredBasicValuePattern = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9_])basic[^A-Za-z0-9_]+?([A-Za-z0-9+/]+={0,2})`)
@@ -271,25 +275,93 @@ func validateBrokeredToolParameters(add func(string, ...any), path string, param
 		add("%s must be a JSON Schema object", path)
 		return
 	}
-	encoded, err := json.Marshal(parameters)
+	if _, err := json.Marshal(parameters); err != nil {
+		add("%s must be JSON serializable: %v", path, err)
+		return
+	}
+	normalized, ok := normalizeJSONContainers(parameters).(map[string]any)
+	if !ok {
+		add("%s must be a JSON Schema object", path)
+		return
+	}
+	canonical, err := canonicalJSON(normalized)
 	if err != nil {
 		add("%s must be JSON serializable: %v", path, err)
 		return
 	}
-	if len(encoded) > 64*1024 {
+	if len(canonical) > 64*1024 {
 		add("%s schema is too large", path)
 	}
-	var schema map[string]any
-	if err := json.Unmarshal(encoded, &schema); err != nil {
-		add("%s must be a JSON Schema object", path)
-		return
-	}
+	schema := normalized
 	validateJSONSchemaSubset(add, path, schema)
 	if typ, _ := schema[jsonSchemaTypeKey].(string); typ != jsonSchemaTypeObject {
 		add("%s must set type: object", path)
 	}
 	rejectUnsafeBrokeredSchemaKeys(add, path, schema)
 	validateBrokeredSchemaValueConstraints(add, path, schema)
+}
+
+func normalizeJSONContainers(value any) any {
+	if value == nil {
+		return nil
+	}
+	rv := reflect.ValueOf(value)
+	for rv.Kind() == reflect.Interface || rv.Kind() == reflect.Pointer {
+		if rv.IsNil() {
+			return nil
+		}
+		rv = rv.Elem()
+	}
+	if number, ok := rv.Interface().(json.Number); ok {
+		return number
+	}
+	switch rv.Kind() {
+	case reflect.Map:
+		if rv.IsNil() {
+			return nil
+		}
+		if rv.Type().Key().Kind() != reflect.String {
+			return value
+		}
+		out := make(map[string]any, rv.Len())
+		iter := rv.MapRange()
+		for iter.Next() {
+			out[iter.Key().String()] = normalizeJSONContainers(iter.Value().Interface())
+		}
+		return out
+	case reflect.Slice:
+		if rv.IsNil() {
+			return nil
+		}
+		if rv.Type().Elem().Kind() == reflect.Uint8 {
+			return value
+		}
+		out := make([]any, rv.Len())
+		for i := 0; i < rv.Len(); i++ {
+			out[i] = normalizeJSONContainers(rv.Index(i).Interface())
+		}
+		return out
+	case reflect.Array:
+		out := make([]any, rv.Len())
+		for i := 0; i < rv.Len(); i++ {
+			out[i] = normalizeJSONContainers(rv.Index(i).Interface())
+		}
+		return out
+	case reflect.Bool:
+		return rv.Bool()
+	case reflect.String:
+		return rv.String()
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return rv.Int()
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return rv.Uint()
+	case reflect.Float32:
+		return float32(rv.Float())
+	case reflect.Float64:
+		return rv.Float()
+	default:
+		return rv.Interface()
+	}
 }
 
 func hasAnySchemaKey(schema map[string]any, keys ...string) bool {
@@ -350,9 +422,12 @@ func validateJSONSchemaSubset(add func(string, ...any), path string, schema map[
 			}
 		}
 	}
-	if enumValue, ok := schema["enum"]; ok {
-		if _, ok := enumValue.([]any); !ok {
+	if enumValue, ok := schema[jsonSchemaEnumKey]; ok {
+		items, ok := enumValue.([]any)
+		if !ok {
 			add("%s.enum must be an array", path)
+		} else if len(items) == 0 {
+			add("%s.enum must contain at least one value", path)
 		}
 	}
 	if _, ok := schema["pattern"]; ok {
@@ -367,7 +442,7 @@ func validateJSONSchemaSubset(add func(string, ...any), path string, schema map[
 			add("%s.additionalProperties must be a boolean or object", path)
 		}
 	}
-	if hasAnySchemaKey(schema, "enum", "const", "default") && hasAnySchemaKey(schema, jsonSchemaMinimumKey, "maximum", "exclusiveMinimum", "exclusiveMaximum", "minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties", "pattern") {
+	if hasAnySchemaKey(schema, jsonSchemaEnumKey, "const", "default") && hasAnySchemaKey(schema, jsonSchemaMinimumKey, "maximum", "exclusiveMinimum", "exclusiveMaximum", "minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties", "pattern") {
 		add("%s combines enum/const/default with constraints unsupported by deterministic brokered synthesis", path)
 	}
 	if _, ok := schema["multipleOf"]; ok {
@@ -375,19 +450,86 @@ func validateJSONSchemaSubset(add func(string, ...any), path string, schema map[
 	}
 	for _, key := range []string{jsonSchemaMinimumKey, jsonSchemaMaximumKey, "exclusiveMinimum", "exclusiveMaximum"} {
 		if value, ok := schema[key]; ok {
-			if _, ok := value.(float64); !ok {
+			if !isFiniteJSONNumber(value) {
 				add("%s.%s must be a number", path, key)
 			}
 		}
 	}
 	for _, key := range []string{"minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties"} {
 		if value, ok := schema[key]; ok {
-			number, ok := value.(float64)
-			if !ok || number < 0 || number != float64(int64(number)) {
+			if !isNonNegativeJSONInteger(value) {
 				add("%s.%s must be a non-negative integer", path, key)
 			}
 		}
 	}
+}
+
+func isFiniteJSONNumber(value any) bool {
+	switch typed := value.(type) {
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return true
+	case float32:
+		return !math.IsNaN(float64(typed)) && !math.IsInf(float64(typed), 0)
+	case float64:
+		return !math.IsNaN(typed) && !math.IsInf(typed, 0)
+	case json.Number:
+		number, ok := parseJSONNumber(typed)
+		return ok && jsonNumberIsRepresentable(typed, number)
+	default:
+		return false
+	}
+}
+
+func isNonNegativeJSONInteger(value any) bool {
+	switch typed := value.(type) {
+	case int:
+		return typed >= 0
+	case int8:
+		return typed >= 0
+	case int16:
+		return typed >= 0
+	case int32:
+		return typed >= 0
+	case int64:
+		return typed >= 0
+	case uint, uint8, uint16, uint32, uint64:
+		return true
+	case float32:
+		number := float64(typed)
+		return !math.IsNaN(number) && !math.IsInf(number, 0) && number >= 0 && math.Trunc(number) == number
+	case float64:
+		return !math.IsNaN(typed) && !math.IsInf(typed, 0) && typed >= 0 && math.Trunc(typed) == typed
+	case json.Number:
+		number, ok := parseJSONNumber(typed)
+		return ok && number.Sign() >= 0 && jsonNumberIsExactInteger(typed, number)
+	default:
+		return false
+	}
+}
+
+func parseJSONNumber(value json.Number) (*big.Rat, bool) {
+	raw := value.String()
+	if !json.Valid([]byte(raw)) {
+		return nil, false
+	}
+	return new(big.Rat).SetString(raw)
+}
+
+func jsonNumberIsExactInteger(value json.Number, number *big.Rat) bool {
+	return number.IsInt() && jsonNumberIsRepresentable(value, number)
+}
+
+func jsonNumberIsRepresentable(value json.Number, number *big.Rat) bool {
+	raw := value.String()
+	if !strings.ContainsAny(raw, ".eE") {
+		return true
+	}
+	parsed, err := strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+		return false
+	}
+	roundTrip, ok := new(big.Rat).SetString(strconv.FormatFloat(parsed, 'g', -1, 64))
+	return ok && roundTrip.Cmp(number) == 0
 }
 
 func validateJSONSchemaType(add func(string, ...any), path string, value any) {
@@ -438,7 +580,7 @@ func validateBrokeredSchemaValueConstraints(add func(string, ...any), path strin
 				add("%s.%s must match the declared JSON Schema type", path, keyword)
 			}
 		}
-		if enum, exists := schema["enum"]; exists {
+		if enum, exists := schema[jsonSchemaEnumKey]; exists {
 			items, ok := enum.([]any)
 			if !ok {
 				add("%s.enum must be an array", path)
@@ -531,17 +673,24 @@ func matchesSchemaType(value any, schemaType string) bool {
 		case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
 			return true
 		case float64:
-			return typed == math.Trunc(typed)
+			return !math.IsNaN(typed) && !math.IsInf(typed, 0) && typed == math.Trunc(typed) && math.Abs(typed) <= maxExactJSONFloatInteger
 		case json.Number:
-			_, err := typed.Int64()
-			return err == nil
+			number, ok := parseJSONNumber(typed)
+			return ok && jsonNumberIsExactInteger(typed, number)
 		default:
 			return false
 		}
 	case jsonSchemaTypeNumber:
-		switch value.(type) {
-		case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64, json.Number:
+		switch typed := value.(type) {
+		case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
 			return true
+		case float32:
+			return !math.IsNaN(float64(typed)) && !math.IsInf(float64(typed), 0)
+		case float64:
+			return !math.IsNaN(typed) && !math.IsInf(typed, 0)
+		case json.Number:
+			number, ok := parseJSONNumber(typed)
+			return ok && jsonNumberIsRepresentable(typed, number)
 		default:
 			return false
 		}
@@ -941,12 +1090,53 @@ func canonicalJSONString(value string) ([]byte, error) {
 	if err := encoder.Encode(value); err != nil {
 		return nil, err
 	}
-	return bytes.TrimSuffix(encoded.Bytes(), []byte("\n")), nil
+	return unescapeJSONLineSeparators(bytes.TrimSuffix(encoded.Bytes(), []byte("\n"))), nil
+}
+
+func unescapeJSONLineSeparators(encoded []byte) []byte {
+	out := make([]byte, 0, len(encoded))
+	for i := 0; i < len(encoded); {
+		if encoded[i] != '\\' {
+			out = append(out, encoded[i])
+			i++
+			continue
+		}
+		start := i
+		for i < len(encoded) && encoded[i] == '\\' {
+			i++
+		}
+		runLength := i - start
+		if runLength%2 == 1 && i+5 <= len(encoded) && encoded[i] == 'u' {
+			escape := string(encoded[i : i+5])
+			if escape == "u2028" || escape == "u2029" {
+				out = append(out, encoded[start:i-1]...)
+				if escape == "u2028" {
+					out = append(out, []byte("\u2028")...)
+				} else {
+					out = append(out, []byte("\u2029")...)
+				}
+				i += 5
+				continue
+			}
+		}
+		out = append(out, encoded[start:i]...)
+	}
+	return out
 }
 
 func canonicalJSONNumberString(value string) (string, error) {
-	if !strings.ContainsAny(value, ".eE") {
-		return value, nil
+	if !json.Valid([]byte(value)) {
+		return "", fmt.Errorf("invalid JSON number %q", value)
+	}
+	number, ok := new(big.Rat).SetString(value)
+	if !ok {
+		return "", fmt.Errorf("invalid JSON number %q", value)
+	}
+	if number.IsInt() {
+		if number.Sign() == 0 && strings.HasPrefix(value, "-") {
+			return "-0", nil
+		}
+		return number.Num().String(), nil
 	}
 	parsed, err := strconv.ParseFloat(value, 64)
 	if err != nil {
@@ -954,6 +1144,10 @@ func canonicalJSONNumberString(value string) (string, error) {
 	}
 	if math.IsNaN(parsed) || math.IsInf(parsed, 0) {
 		return "", fmt.Errorf("JSON numbers must be finite")
+	}
+	roundTrip, ok := new(big.Rat).SetString(strconv.FormatFloat(parsed, 'g', -1, 64))
+	if !ok || roundTrip.Cmp(number) != 0 {
+		return "", fmt.Errorf("JSON number %q cannot be represented exactly", value)
 	}
 	return strconv.FormatFloat(parsed, 'f', -1, 64), nil
 }

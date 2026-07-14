@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+import pytest
 
 from agentkit_serve_common.foundry_conformance import create_foundry_conformance_app
 
@@ -17,6 +18,15 @@ def _load_verifier():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+_EXPECTED_SDK_FINAL_TEXT = 'conformance complete: {"approved": true, "output": {"success": true}}'
+_EXPECTED_AGENTKIT_FINAL_TEXT = 'Brokered tool conformance_read completed with output: {"success":true}'
+
+
+def _verify(verifier, transcript, **kwargs):  # noqa: ANN001
+    kwargs.setdefault("expected_final_text", _EXPECTED_SDK_FINAL_TEXT)
+    return verifier.verify_transcript(transcript, **kwargs)
 
 
 def _write_transcript(tmp_path: Path) -> Path:
@@ -54,12 +64,31 @@ def test_verify_brokered_transcript_accepts_conformance_loop(tmp_path):
     verifier = _load_verifier()
     transcript = _write_transcript(tmp_path)
 
-    summary = verifier.verify_transcript(transcript)
+    summary = _verify(verifier, transcript)
 
     assert summary["initial_response_id"].startswith("caresp_")
     assert summary["continuation_response_id"].startswith("caresp_")
     assert summary["call_id"] == "call_conformance_1"
     assert "success" in summary["final_text"]
+
+
+def test_foundry_brokered_conformance_script_uses_private_file_umask():
+    script = Path(__file__).parents[3] / "deploy" / "foundry" / "scripts" / "foundry_brokered_conformance.sh"
+    lines = script.read_text(encoding="utf-8").splitlines()
+
+    assert "umask 077" in lines[:5]
+
+
+def test_foundry_brokered_conformance_script_keeps_sensitive_headers_out_of_curl_argv():
+    script = Path(__file__).parents[3] / "deploy" / "foundry" / "scripts" / "foundry_brokered_conformance.sh"
+    text = script.read_text(encoding="utf-8")
+
+    assert text.count("--config -") == 2
+    assert '-H "Authorization: Bearer ${token}"' not in text
+    assert '-H "x-agentkit-brokered-continuation-proof:' not in text
+    assert '--expected-output-file "$expected_output_file"' in text
+    assert '--expected-output-json "$conformance_output"' not in text
+    assert '--expected-final-text-file "$expected_final_text_file"' in text
 
 
 def test_verify_brokered_transcript_rejects_old_response_ids(tmp_path):
@@ -70,18 +99,201 @@ def test_verify_brokered_transcript_rejects_old_response_ids(tmp_path):
     (transcript / "02-initial-response.json").write_text(json.dumps(initial), encoding="utf-8")
 
     try:
-        verifier.verify_transcript(transcript)
+        _verify(verifier, transcript)
     except ValueError as exc:
         assert "caresp_" in str(exc)
     else:  # pragma: no cover - assertion path.
         raise AssertionError("expected old response id to fail")
 
 
+def test_verify_brokered_transcript_rejects_duplicate_keys_in_top_level_files(tmp_path):
+    verifier = _load_verifier()
+    transcript = _write_transcript(tmp_path)
+    initial_path = transcript / "02-initial-response.json"
+    initial = json.loads(initial_path.read_text(encoding="utf-8"))
+    encoded = json.dumps(initial, separators=(",", ":"))
+    initial_path.write_text(encoded[:-1] + ',"status":"failed"}', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="duplicate JSON object key"):
+        _verify(verifier, transcript)
+
+
+def test_verify_brokered_transcript_rejects_mismatched_function_call_response_id(tmp_path):
+    verifier = _load_verifier()
+    transcript = _write_transcript(tmp_path)
+    initial_path = transcript / "02-initial-response.json"
+    initial = json.loads(initial_path.read_text(encoding="utf-8"))
+    initial["output"][0]["response_id"] = "caresp_other"
+    initial_path.write_text(json.dumps(initial), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="function_call response_id must match"):
+        _verify(verifier, transcript)
+
+
+def test_verify_brokered_transcript_rejects_mismatched_final_message_response_id(tmp_path):
+    verifier = _load_verifier()
+    transcript = _write_transcript(tmp_path)
+    continuation_path = transcript / "04-continuation-response.json"
+    continuation = json.loads(continuation_path.read_text(encoding="utf-8"))
+    continuation["output"][0]["response_id"] = "caresp_other"
+    continuation_path.write_text(json.dumps(continuation), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="final message response_id must match"):
+        _verify(verifier, transcript)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("role", "user", "final message role must be assistant"),
+        ("status", "in_progress", "final message status must be completed"),
+    ],
+)
+def test_verify_brokered_transcript_rejects_noncompleted_assistant_message(
+    tmp_path, field: str, value: str, message: str
+):
+    verifier = _load_verifier()
+    transcript = _write_transcript(tmp_path)
+    continuation_path = transcript / "04-continuation-response.json"
+    continuation = json.loads(continuation_path.read_text(encoding="utf-8"))
+    continuation["output"][0][field] = value
+    continuation_path.write_text(json.dumps(continuation), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        _verify(verifier, transcript)
+
+
+def test_verify_brokered_transcript_requires_expected_final_text(tmp_path):
+    verifier = _load_verifier()
+    transcript = _write_transcript(tmp_path)
+
+    with pytest.raises(ValueError, match="expected final text is required"):
+        verifier.verify_transcript(transcript)
+
+
+def test_verify_brokered_transcript_rejects_incomplete_function_call_item(tmp_path):
+    verifier = _load_verifier()
+    transcript = _write_transcript(tmp_path)
+    initial_path = transcript / "02-initial-response.json"
+    initial = json.loads(initial_path.read_text(encoding="utf-8"))
+    initial["output"][0]["status"] = "in_progress"
+    initial_path.write_text(json.dumps(initial), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="function_call status must be completed"):
+        _verify(verifier, transcript)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        [{"type": "output_text", "text": "ok"}, {"type": "output_text", "text": "extra"}],
+        [{"type": "input_text", "text": "wrong type"}],
+    ],
+)
+def test_verify_brokered_transcript_rejects_noncanonical_final_content(tmp_path, content: list[dict]):
+    verifier = _load_verifier()
+    transcript = _write_transcript(tmp_path)
+    continuation_path = transcript / "04-continuation-response.json"
+    continuation = json.loads(continuation_path.read_text(encoding="utf-8"))
+    continuation["output"][0]["content"] = content
+    continuation_path.write_text(json.dumps(continuation), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="exactly one item|must be output_text"):
+        _verify(verifier, transcript)
+
+
+def test_verify_brokered_transcript_rejects_reused_continuation_response_id(tmp_path):
+    verifier = _load_verifier()
+    transcript = _write_transcript(tmp_path)
+    initial = json.loads((transcript / "02-initial-response.json").read_text(encoding="utf-8"))
+    continuation = json.loads((transcript / "04-continuation-response.json").read_text(encoding="utf-8"))
+    continuation["id"] = initial["id"]
+    (transcript / "04-continuation-response.json").write_text(json.dumps(continuation), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must differ from initial response id"):
+        _verify(verifier, transcript)
+
+
+def test_verify_brokered_transcript_rejects_extra_final_output_items(tmp_path):
+    verifier = _load_verifier()
+    transcript = _write_transcript(tmp_path)
+    continuation = json.loads((transcript / "04-continuation-response.json").read_text(encoding="utf-8"))
+    continuation["output"].append(
+        {
+            "type": "function_call",
+            "id": "fc_unexpected",
+            "call_id": "call_unexpected",
+            "name": "unexpected",
+            "arguments": "{}",
+            "status": "completed",
+        }
+    )
+    (transcript / "04-continuation-response.json").write_text(json.dumps(continuation), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must contain exactly one item"):
+        _verify(verifier, transcript)
+
+
+def test_verify_brokered_transcript_rejects_unexpected_final_text(tmp_path):
+    verifier = _load_verifier()
+    transcript = _write_transcript(tmp_path)
+
+    with pytest.raises(ValueError, match="final message text did not match"):
+        _verify(verifier, transcript, expected_final_text="unrelated response")
+
+
+def test_verify_brokered_transcript_rejects_unexpected_continuation_output(tmp_path):
+    verifier = _load_verifier()
+    transcript = _write_transcript(tmp_path)
+    continuation = json.loads((transcript / "03-continuation-request.json").read_text(encoding="utf-8"))
+    continuation["input"][0]["output"] = '{"approved":false,"error":{"code":"denied"}}'
+    (transcript / "03-continuation-request.json").write_text(json.dumps(continuation), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="continuation output did not match expected JSON"):
+        _verify(verifier, transcript)
+
+
+def test_verify_brokered_transcript_compares_output_json_types_strictly(tmp_path):
+    verifier = _load_verifier()
+    transcript = _write_transcript(tmp_path)
+    continuation = json.loads((transcript / "03-continuation-request.json").read_text(encoding="utf-8"))
+    continuation["input"][0]["output"] = '{"approved":1,"output":{"success":1}}'
+    (transcript / "03-continuation-request.json").write_text(json.dumps(continuation), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="continuation output did not match expected JSON"):
+        _verify(verifier, transcript)
+
+
+def test_verify_brokered_transcript_json_comparison_distinguishes_booleans_but_normalizes_numbers():
+    verifier = _load_verifier()
+
+    assert verifier._strict_json_equal({"limit": 1}, {"limit": 1.0})
+    assert not verifier._strict_json_equal({"approved": True}, {"approved": 1})
+    assert not verifier._strict_json_equal(
+        verifier._parse_json_lossless('{"value":9007199254740992.0}'),
+        verifier._parse_json_lossless('{"value":9007199254740993.0}'),
+    )
+    compatible = verifier._json_compatible(verifier._parse_json_lossless('{"count":9007199254740993,"ratio":0.5}'))
+    assert compatible == {"count": 9007199254740993, "ratio": 0.5}
+    json.dumps(compatible)
+
+
+def test_verify_brokered_transcript_rejects_duplicate_json_keys_and_huge_summary_integers():
+    verifier = _load_verifier()
+
+    with pytest.raises(ValueError, match="duplicate JSON object key"):
+        verifier._parse_json_lossless('{"probe":false,"probe":true}')
+    with pytest.raises(ValueError, match="too large to include safely"):
+        verifier._json_compatible(verifier._parse_json_lossless("1e1000000"))
+
+
 def test_verify_brokered_transcript_cli_writes_summary(tmp_path, capsys):
     verifier = _load_verifier()
     transcript = _write_transcript(tmp_path)
 
-    assert verifier.main([str(transcript), "--write-summary"]) == 0
+    assert verifier.main(
+        [str(transcript), "--write-summary", "--expected-final-text", _EXPECTED_SDK_FINAL_TEXT]
+    ) == 0
 
     output = json.loads(capsys.readouterr().out)
     written = json.loads((transcript / "summary.json").read_text(encoding="utf-8"))
@@ -145,6 +357,7 @@ def test_verify_brokered_transcript_accepts_agentkit_generated_call_id(tmp_path)
 
     summary = _load_verifier().verify_transcript(
         tmp_path,
+        expected_final_text=_EXPECTED_AGENTKIT_FINAL_TEXT,
         expected_call_id="auto",
         expected_call_id_prefix="call_",
     )

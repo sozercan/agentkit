@@ -20,7 +20,6 @@ dependencies = [
     "pydantic>=2.7",
     "pyyaml>=6.0",
     "httpx>=0.28",
-    "azure-ai-agentserver-responses>=1.0.0b8",
 ]
 
 [project.scripts]
@@ -29,8 +28,11 @@ agentkit-foundry-brokered = "agentkit_serve_common.foundry_brokered_cli:main"
 agentkit-foundry-conformance = "agentkit_serve_common.foundry_conformance:main"
 
 [project.optional-dependencies]
+foundry-conformance = ["azure-ai-agentserver-responses>=1.0.0b8"]
 # Starlette/FastAPI TestClient currently imports the httpx2 compatibility package.
-dev = ["pytest>=8.0", "httpx2>=0.1"]
+# Keep the Foundry SDK here as well because the common test suite exercises the
+# optional conformance app. Runtime adapter images install the base package only.
+dev = ["pytest>=8.0", "httpx2>=0.1", "azure-ai-agentserver-responses>=1.0.0b8"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["agentkit_serve_common"]

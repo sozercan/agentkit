@@ -18,6 +18,15 @@ import yaml
 
 from .config import AgentSpec, BrokeredToolSpec, brokered_tool_schema_digest
 from .runtime import BrokeredToolDefinition
+from .yaml_support import safe_load_all_lossless
+
+_ORKA_TOOL_API_VERSION = "core.orka.ai/v1alpha1"
+_ORKA_TOOL_KIND = "Tool"
+_ORKA_BROKERED_TOOL_CLASSES = ("read", "write", "coordination")
+
+
+def _load_orka_tool_crd_documents(raw: str) -> list[Any]:
+    return [doc for doc in safe_load_all_lossless(raw) if doc is not None]
 
 _ORKA_TOOL_API_VERSION = "core.orka.ai/v1alpha1"
 _ORKA_TOOL_KIND = "Tool"
@@ -148,7 +157,7 @@ def load_orka_tool_crd_file(path: str | Path, *, include_digest: bool = True) ->
     """Load Tool CRD YAML/JSON documents and return safe brokeredTools entries."""
 
     raw = Path(path).read_text(encoding="utf-8")
-    docs = [doc for doc in yaml.safe_load_all(raw) if doc is not None]
+    docs = _load_orka_tool_crd_documents(raw)
     return generate_brokered_tools_from_orka_tool_crds(docs, include_digest=include_digest)
 
 
@@ -158,7 +167,7 @@ def load_orka_tool_crd_files(paths: Sequence[str | Path], *, include_digest: boo
     documents: list[Any] = []
     for path in paths:
         raw = Path(path).read_text(encoding="utf-8")
-        documents.extend(doc for doc in yaml.safe_load_all(raw) if doc is not None)
+        documents.extend(_load_orka_tool_crd_documents(raw))
     entries = generate_brokered_tools_from_orka_tool_crds(documents, include_digest=include_digest)
     seen: set[str] = set()
     duplicates: set[str] = set()

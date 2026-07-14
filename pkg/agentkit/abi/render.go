@@ -5,6 +5,9 @@ package abi
 import (
 	"bytes"
 	"encoding/json"
+	"math"
+	"math/big"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -18,6 +21,8 @@ const Version = "v0"
 
 // Path is where the rendered agent.yaml is baked into the agent image.
 const Path = "/agent/agent.yaml"
+
+const yamlNegativeZero = "-0.0"
 
 // The following types are the WRITER half of the frozen agent.yaml ABI
 // (docs/agent-abi.md). agentkit-serve reads this file with pydantic
@@ -48,6 +53,14 @@ func yamlStrings(values []string) []yamlString {
 		out[i] = yamlString(value)
 	}
 	return out
+}
+
+func yamlFloat(value float64, bitSize int) yamlNumber {
+	rendered := strconv.FormatFloat(value, 'f', -1, bitSize)
+	if value == 0 && math.Signbit(value) {
+		rendered = yamlNegativeZero
+	}
+	return yamlNumber(rendered)
 }
 
 type abiMetadata struct {
@@ -145,6 +158,14 @@ type abiAgent struct {
 
 func expandJSONNumber(value string) string {
 	lower := strings.ToLower(value)
+	if json.Valid([]byte(lower)) {
+		if number, ok := new(big.Rat).SetString(lower); ok && number.IsInt() {
+			if number.Sign() == 0 && strings.HasPrefix(lower, "-") {
+				return yamlNegativeZero
+			}
+			return number.Num().String()
+		}
+	}
 	parts := strings.Split(lower, "e")
 	if len(parts) != 2 {
 		return value
@@ -168,6 +189,9 @@ func expandJSONNumber(value string) string {
 	}
 	mantissa = strings.TrimLeft(mantissa, "0")
 	if mantissa == "" {
+		if sign == "-" {
+			return yamlNegativeZero
+		}
 		return "0"
 	}
 	decimalPos := len(mantissa) - fracLen + exponent
@@ -251,8 +275,14 @@ func copyAny(v any) any {
 	case string:
 		return yamlString(typed)
 	case map[string]any:
+		if typed == nil {
+			return nil
+		}
 		return copyMap(typed)
 	case []any:
+		if typed == nil {
+			return nil
+		}
 		out := make([]any, len(typed))
 		for i, item := range typed {
 			out[i] = copyAny(item)
@@ -261,7 +291,62 @@ func copyAny(v any) any {
 	case json.Number:
 		return yamlJSONNumber(typed)
 	default:
-		return typed
+		return copyReflectedJSON(typed)
+	}
+}
+
+func copyReflectedJSON(value any) any {
+	if value == nil {
+		return nil
+	}
+	rv := reflect.ValueOf(value)
+	for rv.Kind() == reflect.Interface || rv.Kind() == reflect.Pointer {
+		if rv.IsNil() {
+			return nil
+		}
+		rv = rv.Elem()
+	}
+	if number, ok := rv.Interface().(json.Number); ok {
+		return yamlNumber(expandJSONNumber(number.String()))
+	}
+	switch rv.Kind() {
+	case reflect.Map:
+		if rv.IsNil() {
+			return nil
+		}
+		if rv.Type().Key().Kind() != reflect.String {
+			return value
+		}
+		out := make(map[any]any, rv.Len())
+		iter := rv.MapRange()
+		for iter.Next() {
+			out[yamlString(iter.Key().String())] = copyAny(iter.Value().Interface())
+		}
+		return out
+	case reflect.Slice:
+		if rv.IsNil() {
+			return nil
+		}
+		if rv.Type().Elem().Kind() == reflect.Uint8 {
+			return value
+		}
+		out := make([]any, rv.Len())
+		for i := 0; i < rv.Len(); i++ {
+			out[i] = copyAny(rv.Index(i).Interface())
+		}
+		return out
+	case reflect.Array:
+		out := make([]any, rv.Len())
+		for i := 0; i < rv.Len(); i++ {
+			out[i] = copyAny(rv.Index(i).Interface())
+		}
+		return out
+	case reflect.Float32:
+		return yamlFloat(rv.Float(), 32)
+	case reflect.Float64:
+		return yamlFloat(rv.Float(), 64)
+	default:
+		return rv.Interface()
 	}
 }
 

@@ -66,7 +66,6 @@ class RunResult:
     usage: dict[str, int] = field(default_factory=dict)
 
 
-
 @dataclass(frozen=True)
 class BrokeredToolDefinition:
     """Safe tool schema a brokered runtime may request through Orka.

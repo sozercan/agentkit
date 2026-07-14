@@ -108,5 +108,5 @@ instead of invoking `az account get-access-token`. If `AZURE_SUBSCRIPTION_ID` is
 omitted, the helper uses the current `az` account. The script stores request and
 response JSON files plus `summary.json`; do not include bearer tokens in the
 transcript. Re-run
-`python3 deploy/foundry/scripts/verify_brokered_transcript.py <transcript-dir>`
+`python3 deploy/foundry/scripts/verify_brokered_transcript.py <transcript-dir> --expected-final-text '<known expected assistant result>'`
 to verify archived transcript evidence later.

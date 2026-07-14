@@ -28,6 +28,7 @@ import time
 import uuid
 from copy import deepcopy
 from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 from pathlib import Path
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -47,7 +48,7 @@ logger = logging.getLogger(__name__)
 
 try:  # Prefer the official hosted Responses SDK ID format/state-compatible prefix.
     from azure.ai.agentserver.responses._id_generator import IdGenerator as _AzureResponsesIdGenerator
-except Exception:  # pragma: no cover - dependency is declared; fallback is for source-tree imports only.
+except Exception:  # pragma: no cover - the SDK is optional outside conformance installs.
     _AzureResponsesIdGenerator = None
 
 _DEFAULT_STATE_TTL_SECONDS = 15 * 60
@@ -55,16 +56,21 @@ _DEFAULT_MAX_PENDING_RESPONSES = 128
 _DEFAULT_MAX_ARGUMENT_BYTES = 8192
 _DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024
 _DEFAULT_MAX_RESPONSE_STATE_BYTES = 4 * 1024 * 1024
-_DEFAULT_MAX_REQUEST_BODY_BYTES = 4 * 1024 * 1024
+_DEFAULT_MAX_REQUEST_BODY_BYTES = 1024 * 1024
+_DEFAULT_MAX_MODEL_MESSAGES_BYTES = 1024 * 1024
 _REQUEST_BODY_OVERHEAD_BYTES = 16 * 1024
 _MAX_SYNTHETIC_ARRAY_ITEMS = 32
 _MAX_SYNTHETIC_STRING_LENGTH = 4096
+_MAX_SYNTHETIC_VALUES = 256
+_MAX_OUTPUT_DEPTH = 128
 _STATE_TTL_ENV = "AGENTKIT_FOUNDRY_RESPONSE_STATE_TTL_SECONDS"
 _MAX_PENDING_ENV = "AGENTKIT_FOUNDRY_RESPONSE_STATE_MAX_PENDING"
 _MAX_ARGUMENT_BYTES_ENV = "AGENTKIT_FOUNDRY_BROKERED_MAX_ARGUMENT_BYTES"
 _MAX_OUTPUT_BYTES_ENV = "AGENTKIT_FOUNDRY_BROKERED_MAX_OUTPUT_BYTES"
 _MAX_RESPONSE_STATE_BYTES_ENV = "AGENTKIT_FOUNDRY_RESPONSE_STATE_MAX_BYTES"
-_MAX_REQUEST_BODY_BYTES_ENV = "AGENTKIT_FOUNDRY_REQUEST_BODY_MAX_BYTES"
+_MAX_REQUEST_BODY_BYTES_ENV = "AGENTKIT_FOUNDRY_MAX_REQUEST_BODY_BYTES"
+_LEGACY_MAX_REQUEST_BODY_BYTES_ENV = "AGENTKIT_FOUNDRY_REQUEST_BODY_MAX_BYTES"
+_MAX_MODEL_MESSAGES_BYTES_ENV = "AGENTKIT_FOUNDRY_BROKERED_MAX_MODEL_MESSAGES_BYTES"
 _CONTINUATION_PROOF_ENV = "AGENTKIT_FOUNDRY_BROKERED_CONTINUATION_PROOF"
 _CONTINUATION_PROOF_HEADER = "x-agentkit-brokered-continuation-proof"
 _CONTINUATION_PROOF_BODY_FIELD = "brokered_continuation_proof"
@@ -123,15 +129,19 @@ def _responses_usage(result: RunResult | None = None, usage: Mapping[str, int] |
 def _combine_usage(*usages: Mapping[str, int] | None) -> dict[str, int]:
     prompt_tokens = 0
     completion_tokens = 0
+    total_tokens = 0
     for usage in usages:
         if not usage:
             continue
-        prompt_tokens += int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
-        completion_tokens += int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
+        prompt_count = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
+        completion_count = int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
+        prompt_tokens += prompt_count
+        completion_tokens += completion_count
+        total_tokens += int(usage.get("total_tokens", prompt_count + completion_count) or 0)
     return {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
-        "total_tokens": prompt_tokens + completion_tokens,
+        "total_tokens": total_tokens,
     }
 
 
@@ -411,7 +421,9 @@ class _HostedResponseState:
 
 
 class _StateExpired(KeyError):
-    pass
+    def __init__(self, response_id: str, state: _HostedResponseState) -> None:
+        super().__init__(response_id)
+        self.state = state
 
 
 class _StateStoreFull(Exception):
@@ -489,6 +501,15 @@ def _pending_call_from_state_payload(data: Mapping[str, Any]) -> _PendingCall:
     )
 
 
+def _persistence_json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
 def _state_to_payload(state: _HostedResponseState) -> dict[str, Any]:
     payload = {
         "responseID": state.response_id,
@@ -544,6 +565,9 @@ def _state_from_payload(data: Mapping[str, Any]) -> _HostedResponseState:
     if not isinstance(initial_usage, Mapping):
         raise ValueError("stored initialUsage must be an object")
     status = str(data.get("status") or "pending")
+    expires_at = float(data.get("expiresAt") or 0)
+    if not math.isfinite(expires_at):
+        raise ValueError("stored expiresAt must be finite")
     accepted = {str(key): str(value) for key, value in accepted_output_digests.items()}
     accepted_sizes: dict[str, int] = {}
     for key, value in accepted_output_sizes.items():
@@ -564,7 +588,7 @@ def _state_from_payload(data: Mapping[str, Any]) -> _HostedResponseState:
         response_id=str(data.get("responseID") or ""),
         session_id=str(data["sessionID"]) if data.get("sessionID") is not None else None,
         pending_calls={str(call_id): _pending_call_from_state_payload(call) for call_id, call in pending_calls_raw.items() if isinstance(call, Mapping)},
-        expires_at=float(data.get("expiresAt") or 0),
+        expires_at=expires_at,
         status=status,
         accepted_output_digests=accepted,
         accepted_output_sizes=accepted_sizes,
@@ -989,12 +1013,14 @@ class _FoundryResponseStateStore:
             states = dict(self._states)
             now = time.time()
             active_resume_ids = self._active_resume_ids()
-            target_expired = state.expires_at <= now and not (state.status == "resuming" and response_id in active_resume_ids)
+            target_expired = state.expires_at <= now and not (
+                state.status == "resuming" and response_id in active_resume_ids
+            )
             changed = self._purge_expired_from(states, now=now, active_resume_ids=active_resume_ids)
             if changed:
                 self._commit(states)
             if target_expired:
-                raise _StateExpired(response_id)
+                raise _StateExpired(response_id, deepcopy(state))
             current = self._states.get(response_id)
             if current is None:
                 raise KeyError(response_id)
@@ -1017,19 +1043,23 @@ class _FoundryResponseStateStore:
             if len(raw) > self.max_bytes:
                 raise _StateSizeLimitExceeded("Foundry response state file exceeds configured byte limit")
             data = json.loads(raw)
-            states = data.get("states", {}) if isinstance(data, Mapping) else {}
+            if not isinstance(data, Mapping):
+                raise ValueError("Foundry response state file root must be an object")
+            states = data.get("states", {})
             if not isinstance(states, Mapping):
                 raise ValueError("Foundry response state file states must be an object")
             if len(states) > self.max_entries:
                 raise ValueError("Foundry response state file exceeds configured entry limit")
+            if not all(isinstance(state, Mapping) for state in states.values()):
+                raise ValueError("Foundry response state entries must be objects")
             loaded_states = {
                 str(response_id): _state_from_payload(state)
                 for response_id, state in states.items()
-                if isinstance(state, Mapping)
             }
             self._serialize(loaded_states)
             self._states = loaded_states
             self._entry_sizes = {}
+            self.purge_expired()
         except (
             OSError,
             _StatePersistenceError,
@@ -1040,13 +1070,7 @@ class _FoundryResponseStateStore:
             ValueError,
             _StateSizeLimitExceeded,
         ) as exc:
-            logger.warning("ignoring invalid Foundry response state file %s: %s", self.state_file, exc)
-            self._states = {}
-            return
-        try:
-            self.purge_expired()
-        except _StatePersistenceError as exc:
-            logger.warning("could not persist expired Foundry response state cleanup for %s: %s", self.state_file, exc)
+            raise RuntimeError(f"invalid Foundry response state file {self.state_file}: {exc}") from exc
 
     def _serialize(self, states: Mapping[str, _HostedResponseState]) -> bytes:
         payload = {"states": {response_id: _state_to_payload(state) for response_id, state in states.items()}}
@@ -1087,7 +1111,8 @@ class _FoundryResponseStateStore:
 
 def _state_ttl_seconds(value: float | None = None) -> float:
     if value is not None:
-        return max(float(value), 0.0)
+        parsed = float(value)
+        return max(parsed, 0.0) if math.isfinite(parsed) else float(_DEFAULT_STATE_TTL_SECONDS)
     raw = os.environ.get(_STATE_TTL_ENV)
     if not raw:
         return float(_DEFAULT_STATE_TTL_SECONDS)
@@ -1095,7 +1120,7 @@ def _state_ttl_seconds(value: float | None = None) -> float:
         parsed = float(raw)
     except ValueError:
         return float(_DEFAULT_STATE_TTL_SECONDS)
-    return max(parsed, 0.0)
+    return max(parsed, 0.0) if math.isfinite(parsed) else float(_DEFAULT_STATE_TTL_SECONDS)
 
 
 def _positive_int_setting(value: int | None, *, env_name: str, default: int) -> int:
@@ -1132,10 +1157,24 @@ def _max_response_state_bytes(value: int | None = None) -> int:
 
 
 def _max_request_body_bytes(value: int | None = None) -> int:
+    if value is not None or os.environ.get(_MAX_REQUEST_BODY_BYTES_ENV):
+        return _positive_int_setting(
+            value,
+            env_name=_MAX_REQUEST_BODY_BYTES_ENV,
+            default=_DEFAULT_MAX_REQUEST_BODY_BYTES,
+        )
+    return _positive_int_setting(
+        None,
+        env_name=_LEGACY_MAX_REQUEST_BODY_BYTES_ENV,
+        default=_DEFAULT_MAX_REQUEST_BODY_BYTES,
+    )
+
+
+def _max_model_messages_bytes(value: int | None = None) -> int:
     return _positive_int_setting(
         value,
-        env_name=_MAX_REQUEST_BODY_BYTES_ENV,
-        default=_DEFAULT_MAX_REQUEST_BODY_BYTES,
+        env_name=_MAX_MODEL_MESSAGES_BYTES_ENV,
+        default=_DEFAULT_MAX_MODEL_MESSAGES_BYTES,
     )
 
 
@@ -1178,41 +1217,76 @@ def _list_value_paths(value: list[Any], parent_path: str):
 
 
 def _reject_nonfinite_json_values(value: Any, *, path: str = "value") -> None:
-    pending = [iter(((value, path),))]
+    pending: list[tuple[Any, int]] = [(iter(((value, path),)), 0)]
     while pending:
+        iterator, depth = pending[-1]
         try:
-            current, current_path = next(pending[-1])
+            current, current_path = next(iterator)
         except StopIteration:
             pending.pop()
             continue
+        if depth > _MAX_OUTPUT_DEPTH:
+            raise ValueError(f"{path} is nested too deeply")
         if isinstance(current, float) and not math.isfinite(current):
             raise ValueError(f"{current_path} must be finite")
         if isinstance(current, Mapping):
-            pending.append(_mapping_value_paths(current, current_path))
+            pending.append((_mapping_value_paths(current, current_path), depth + 1))
         elif isinstance(current, list):
-            pending.append(_list_value_paths(current, current_path))
+            pending.append((_list_value_paths(current, current_path), depth + 1))
+
+
+def _parse_output_float(raw: str) -> float:
+    try:
+        decimal = Decimal(raw)
+    except InvalidOperation as exc:
+        raise ValueError("function_call_output.output must contain valid JSON numbers") from exc
+    parsed = float(decimal)
+    if not math.isfinite(parsed) or Decimal(str(parsed)) != decimal:
+        raise ValueError("function_call_output.output contains a number that cannot be represented exactly")
+    return parsed
+
+
+def _reject_output_constant(raw: str) -> None:
+    raise ValueError(f"function_call_output.output contains non-finite number {raw}")
+
+
+def _reject_duplicate_output_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f"function_call_output.output contains duplicate key {key!r}")
+        out[key] = value
+    return out
 
 
 def _json_object_from_output(output: Any) -> dict[str, Any]:
-    if isinstance(output, str):
-        try:
-            parsed = json.loads(output)
-        except (json.JSONDecodeError, RecursionError) as exc:
-            raise ValueError("function_call_output.output must be a JSON object string") from exc
-    else:
-        parsed = output
+    if not isinstance(output, str):
+        raise ValueError("function_call_output.output must be a JSON object string")
+    try:
+        parsed = json.loads(
+            output,
+            parse_float=_parse_output_float,
+            parse_constant=_reject_output_constant,
+            object_pairs_hook=_reject_duplicate_output_keys,
+        )
+    except (json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError("function_call_output.output must be a JSON object string with bounded nesting") from exc
     if not isinstance(parsed, dict):
         raise ValueError("function_call_output.output must be a JSON object")
     approved = parsed.get("approved")
     if not isinstance(approved, bool):
         raise ValueError("function_call_output.output.approved must be a boolean")
     if approved:
-        tool_output = parsed.get("output", {})
-        if tool_output is not None and not isinstance(tool_output, dict):
+        unexpected = set(parsed) - {"approved", "output"}
+        if unexpected:
+            raise ValueError("approved function_call_output.output contains unsupported fields")
+        if "output" not in parsed or not isinstance(parsed["output"], dict):
             raise ValueError("approved function_call_output.output.output must be an object")
     else:
-        error = parsed.get("error", {})
-        if error is not None and not isinstance(error, dict):
+        unexpected = set(parsed) - {"approved", "error"}
+        if unexpected:
+            raise ValueError("denied function_call_output.output contains unsupported fields")
+        if "error" not in parsed or not isinstance(parsed["error"], dict):
             raise ValueError("denied function_call_output.output.error must be an object")
     _reject_nonfinite_json_values(parsed, path="function_call_output.output")
     return parsed
@@ -1272,7 +1346,7 @@ def _encode_json_bounded(value: Any, *, max_bytes: int, sort_keys: bool, collect
     return bytes(encoded or b"")
 
 
-async def _read_json_request_bounded(request: Request, *, max_bytes: int) -> Any:
+async def _read_json_request_bounded(request: Request, *, max_bytes: int) -> tuple[Any, int]:
     content_length = request.headers.get("content-length")
     if content_length is not None:
         try:
@@ -1287,7 +1361,7 @@ async def _read_json_request_bounded(request: Request, *, max_bytes: int) -> Any
         if len(body) + len(chunk) > max_bytes:
             raise _RequestBodyTooLarge
         body.extend(chunk)
-    return json.loads(body)
+    return json.loads(body), len(body)
 
 
 def _bounded_json_bytes(value: Any, *, max_bytes: int) -> bytes:
@@ -1337,6 +1411,130 @@ def _enum_value(schema: Mapping[str, Any], expected_type: type) -> Any:
     return None
 
 
+def _integer_schema_bound(value: Any, *, lower: bool, exclusive: bool) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool):
+        if exclusive:
+            return value + 1 if lower else value - 1
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        if lower:
+            return math.floor(value) + 1 if exclusive else math.ceil(value)
+        return math.ceil(value) - 1 if exclusive else math.floor(value)
+    return None
+
+
+def _effective_numeric_bounds(schema: Mapping[str, Any]) -> tuple[Fraction | None, bool, Fraction | None, bool]:
+    lower_value: Fraction | None = None
+    lower_open = False
+    for key, exclusive in (("minimum", False), ("exclusiveMinimum", True)):
+        raw = schema.get(key)
+        if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+            continue
+        if isinstance(raw, float) and not math.isfinite(raw):
+            raise AgentRunError("brokered tool schema has a non-finite numeric bound", status=400, code="UnsupportedBrokeredSchema")
+        try:
+            candidate = Fraction(str(raw))
+        except (ValueError, ZeroDivisionError) as exc:
+            raise AgentRunError("brokered tool schema has an invalid numeric bound", status=400, code="UnsupportedBrokeredSchema") from exc
+        if lower_value is None or candidate > lower_value:
+            lower_value = candidate
+            lower_open = exclusive
+        elif candidate == lower_value and exclusive:
+            lower_open = True
+
+    upper_value: Fraction | None = None
+    upper_open = False
+    for key, exclusive in (("maximum", False), ("exclusiveMaximum", True)):
+        raw = schema.get(key)
+        if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+            continue
+        if isinstance(raw, float) and not math.isfinite(raw):
+            raise AgentRunError("brokered tool schema has a non-finite numeric bound", status=400, code="UnsupportedBrokeredSchema")
+        try:
+            candidate = Fraction(str(raw))
+        except (ValueError, ZeroDivisionError) as exc:
+            raise AgentRunError("brokered tool schema has an invalid numeric bound", status=400, code="UnsupportedBrokeredSchema") from exc
+        if upper_value is None or candidate < upper_value:
+            upper_value = candidate
+            upper_open = exclusive
+        elif candidate == upper_value and exclusive:
+            upper_open = True
+    return lower_value, lower_open, upper_value, upper_open
+
+
+def _fraction_floor(value: Fraction) -> int:
+    return value.numerator // value.denominator
+
+
+def _fraction_ceil(value: Fraction) -> int:
+    return -((-value.numerator) // value.denominator)
+
+
+def _fraction_json_candidate(value: Fraction, *, name: str, require_exact: bool) -> int | float:
+    if value.denominator == 1:
+        integer_text = str(value.numerator)
+        try:
+            compact_float = float(value.numerator)
+        except OverflowError:
+            compact_float = math.inf
+        if math.isfinite(compact_float) and Fraction(str(compact_float)) == value and len(str(compact_float)) < len(integer_text):
+            return compact_float
+        return value.numerator
+    try:
+        candidate = float(value)
+    except OverflowError as exc:
+        raise AgentRunError(
+            f"brokered tool schema for {name!r} has no representable numeric value in bounds",
+            status=400,
+            code="UnsupportedBrokeredSchema",
+        ) from exc
+    if not math.isfinite(candidate) or (require_exact and Fraction(str(candidate)) != value):
+        raise AgentRunError(
+            f"brokered tool schema for {name!r} has no representable numeric value in bounds",
+            status=400,
+            code="UnsupportedBrokeredSchema",
+        )
+    return candidate
+
+
+def _fraction_in_numeric_bounds(
+    candidate: Fraction,
+    *,
+    lower_value: Fraction | None,
+    lower_open: bool,
+    upper_value: Fraction | None,
+    upper_open: bool,
+) -> bool:
+    if lower_value is not None and (candidate < lower_value or (candidate == lower_value and lower_open)):
+        return False
+    if upper_value is not None and (candidate > upper_value or (candidate == upper_value and upper_open)):
+        return False
+    return True
+
+
+def _integer_candidate_from_bounds(
+    *,
+    lower_value: Fraction | None,
+    lower_open: bool,
+    upper_value: Fraction | None,
+    upper_open: bool,
+    step: int = 1,
+) -> int:
+    if lower_value is not None:
+        quotient = lower_value / step
+        multiplier = _fraction_ceil(quotient)
+        if lower_open and quotient.denominator == 1:
+            multiplier += 1
+        return multiplier * step
+    if upper_value is not None:
+        quotient = upper_value / step
+        multiplier = _fraction_floor(quotient)
+        if upper_open and quotient.denominator == 1:
+            multiplier -= 1
+        return multiplier * step
+    return 0
+
+
 def _required_property_names(schema: Mapping[str, Any]) -> list[str]:
     names: list[str] = []
     required = schema.get("required")
@@ -1378,16 +1576,61 @@ def _required_property_names(schema: Mapping[str, Any]) -> list[str]:
     return names
 
 
-def _sample_argument_value(name: str, schema: Any, run_request: RunRequest) -> Any:
+def _bounded_synthetic_literal(name: str, value: Any, *, depth: int) -> Any:
+    pending: list[tuple[Any, int]] = [(value, depth)]
+    while pending:
+        current, current_depth = pending.pop()
+        if current_depth > _MAX_OUTPUT_DEPTH:
+            raise AgentRunError(
+                f"brokered tool schema for {name!r} exceeds deterministic synthesis depth limit",
+                status=413,
+                code="brokered_arguments_too_large",
+            )
+        if isinstance(current, Mapping):
+            pending.extend((child, current_depth + 1) for child in current.values())
+        elif isinstance(current, list):
+            pending.extend((child, current_depth + 1) for child in current)
+    return value
+
+
+def _sample_argument_value(
+    name: str,
+    schema: Any,
+    run_request: RunRequest,
+    *,
+    budget: list[int] | None = None,
+    depth: int = 1,
+) -> Any:
+    if depth > _MAX_OUTPUT_DEPTH:
+        raise AgentRunError(
+            f"brokered tool schema for {name!r} exceeds deterministic synthesis depth limit",
+            status=413,
+            code="brokered_arguments_too_large",
+        )
+    if budget is None:
+        budget = [_MAX_SYNTHETIC_VALUES]
+    if budget[0] <= 0:
+        raise AgentRunError(
+            f"brokered tool schema for {name!r} exceeds deterministic synthesis value budget",
+            status=413,
+            code="brokered_arguments_too_large",
+        )
+    budget[0] -= 1
     if not isinstance(schema, Mapping):
         return run_request.prompt
+    if "multipleOf" in schema:
+        raise AgentRunError(
+            f"brokered tool schema for {name!r} has unsupported numeric multipleOf",
+            status=400,
+            code="UnsupportedBrokeredSchema",
+        )
     if "const" in schema:
-        return schema["const"]
+        return _bounded_synthetic_literal(name, schema["const"], depth=depth)
     if "default" in schema:
-        return schema["default"]
+        return _bounded_synthetic_literal(name, schema["default"], depth=depth)
     enum_values = schema.get("enum")
     if isinstance(enum_values, list) and enum_values:
-        return enum_values[0]
+        return _bounded_synthetic_literal(name, enum_values[0], depth=depth)
 
     schema_type = schema.get("type")
     if isinstance(schema_type, list):
@@ -1412,26 +1655,26 @@ def _sample_argument_value(name: str, schema: Any, run_request: RunRequest) -> A
         value = _enum_value(schema, int)
         if value is not None and not isinstance(value, bool):
             return value
-        lower_value = schema.get("minimum")
-        if isinstance(lower_value, (int, float)) and not isinstance(lower_value, bool) and math.isfinite(float(lower_value)):
-            lower = math.ceil(float(lower_value))
-        else:
-            exclusive_lower = schema.get("exclusiveMinimum")
-            if isinstance(exclusive_lower, (int, float)) and not isinstance(exclusive_lower, bool) and math.isfinite(float(exclusive_lower)):
-                lower = math.floor(float(exclusive_lower)) + 1
-            else:
-                lower = 0
-        upper_value = schema.get("maximum")
-        if isinstance(upper_value, (int, float)) and not isinstance(upper_value, bool) and math.isfinite(float(upper_value)):
-            upper = math.floor(float(upper_value))
-        else:
-            exclusive_upper = schema.get("exclusiveMaximum")
-            if isinstance(exclusive_upper, (int, float)) and not isinstance(exclusive_upper, bool) and math.isfinite(float(exclusive_upper)):
-                upper = math.ceil(float(exclusive_upper)) - 1
-            else:
-                upper = None
+        lower_candidates = [
+            candidate
+            for candidate in (
+                _integer_schema_bound(schema.get("minimum"), lower=True, exclusive=False),
+                _integer_schema_bound(schema.get("exclusiveMinimum"), lower=True, exclusive=True),
+            )
+            if candidate is not None
+        ]
+        upper_candidates = [
+            candidate
+            for candidate in (
+                _integer_schema_bound(schema.get("maximum"), lower=False, exclusive=False),
+                _integer_schema_bound(schema.get("exclusiveMaximum"), lower=False, exclusive=True),
+            )
+            if candidate is not None
+        ]
+        lower = max(lower_candidates, default=0)
+        upper = min(upper_candidates) if upper_candidates else None
         if upper is not None and lower > upper:
-            if "minimum" in schema or "exclusiveMinimum" in schema:
+            if lower_candidates:
                 raise AgentRunError(
                     f"brokered tool schema for {name!r} has incompatible integer bounds",
                     status=400,
@@ -1439,16 +1682,6 @@ def _sample_argument_value(name: str, schema: Any, run_request: RunRequest) -> A
                 )
             lower = upper
         multiple_of = schema.get("multipleOf")
-        if isinstance(multiple_of, int) and not isinstance(multiple_of, bool) and multiple_of > 0:
-            remainder = lower % multiple_of
-            candidate = lower if remainder == 0 else lower + (multiple_of - remainder)
-            if upper is not None and candidate > upper:
-                raise AgentRunError(
-                    f"brokered tool schema for {name!r} has no integer multipleOf value in bounds",
-                    status=400,
-                    code="UnsupportedBrokeredSchema",
-                )
-            return candidate
         if multiple_of is not None:
             raise AgentRunError(
                 f"brokered tool schema for {name!r} has unsupported integer multipleOf",
@@ -1465,50 +1698,94 @@ def _sample_argument_value(name: str, schema: Any, run_request: RunRequest) -> A
         value = _enum_value(schema, (int, float))
         if value is not None and not isinstance(value, bool):
             return value
-        lower_value = schema.get("minimum")
-        lower_open = False
-        if not isinstance(lower_value, (int, float)) or isinstance(lower_value, bool):
-            lower_value = schema.get("exclusiveMinimum")
-            lower_open = isinstance(lower_value, (int, float)) and not isinstance(lower_value, bool)
-        upper_value = schema.get("maximum")
-        upper_open = False
-        if not isinstance(upper_value, (int, float)) or isinstance(upper_value, bool):
-            upper_value = schema.get("exclusiveMaximum")
-            upper_open = isinstance(upper_value, (int, float)) and not isinstance(upper_value, bool)
-        has_lower = isinstance(lower_value, (int, float)) and not isinstance(lower_value, bool)
-        has_upper = isinstance(upper_value, (int, float)) and not isinstance(upper_value, bool)
-        if has_lower and has_upper:
-            if lower_value > upper_value or (lower_value == upper_value and (lower_open or upper_open)):
+        lower_fraction, lower_open, upper_fraction, upper_open = _effective_numeric_bounds(schema)
+        has_lower = lower_fraction is not None
+        has_upper = upper_fraction is not None
+        if lower_fraction is not None and upper_fraction is not None:
+            if lower_fraction > upper_fraction or (lower_fraction == upper_fraction and (lower_open or upper_open)):
                 raise AgentRunError(
                     f"brokered tool schema for {name!r} has incompatible numeric bounds",
                     status=400,
                     code="UnsupportedBrokeredSchema",
                 )
-            if lower_value == upper_value:
-                return lower_value
-            return (lower_value + upper_value) / 2
-        if has_lower:
-            candidate = lower_value + (1 if lower_open else 0)
-        elif has_upper:
-            candidate = upper_value - (1 if upper_open else 0)
-        else:
-            candidate = 0
+            if lower_fraction == upper_fraction:
+                return _fraction_json_candidate(lower_fraction, name=name, require_exact=True)
+
         multiple_of = schema.get("multipleOf")
-        if isinstance(multiple_of, (int, float)) and not isinstance(multiple_of, bool) and multiple_of > 0:
-            candidate = math.ceil(candidate / multiple_of) * multiple_of
-            if has_upper and (candidate > upper_value or (candidate == upper_value and upper_open)):
-                raise AgentRunError(
-                    f"brokered tool schema for {name!r} has no numeric multipleOf value in bounds",
-                    status=400,
-                    code="UnsupportedBrokeredSchema",
-                )
-        elif multiple_of is not None:
+        if multiple_of is not None:
             raise AgentRunError(
                 f"brokered tool schema for {name!r} has unsupported numeric multipleOf",
                 status=400,
                 code="UnsupportedBrokeredSchema",
             )
-        return candidate
+
+        candidates: list[int | float] = []
+
+        def add_candidate(candidate: int | float) -> None:
+            if isinstance(candidate, float) and not math.isfinite(candidate):
+                return
+            if _fraction_in_numeric_bounds(
+                Fraction(str(candidate)),
+                lower_value=lower_fraction,
+                lower_open=lower_open,
+                upper_value=upper_fraction,
+                upper_open=upper_open,
+            ):
+                candidates.append(candidate)
+
+        add_candidate(0)
+
+        for boundary, is_open in (
+            (lower_fraction, lower_open),
+            (upper_fraction, upper_open),
+        ):
+            if boundary is None or is_open:
+                continue
+            try:
+                add_candidate(_fraction_json_candidate(boundary, name=name, require_exact=True))
+            except AgentRunError:
+                pass
+
+        for boundary, is_open, direction in (
+            (lower_fraction, lower_open, math.inf),
+            (upper_fraction, upper_open, -math.inf),
+        ):
+            if boundary is None or not is_open:
+                continue
+            try:
+                boundary_float = float(boundary)
+            except OverflowError:
+                continue
+            if math.isfinite(boundary_float):
+                add_candidate(math.nextafter(boundary_float, direction))
+
+        integer_candidate = _integer_candidate_from_bounds(
+            lower_value=lower_fraction,
+            lower_open=lower_open,
+            upper_value=upper_fraction,
+            upper_open=upper_open,
+            step=1,
+        )
+        add_candidate(integer_candidate)
+
+        if lower_fraction is not None and upper_fraction is not None:
+            midpoint = (lower_fraction + upper_fraction) / 2
+            try:
+                add_candidate(_fraction_json_candidate(midpoint, name=name, require_exact=False))
+            except AgentRunError:
+                pass
+
+        if candidates:
+            return min(
+                candidates,
+                key=lambda candidate: len(json.dumps(candidate, allow_nan=False, separators=(",", ":"))),
+            )
+
+        raise AgentRunError(
+            f"brokered tool schema for {name!r} has no representable numeric value in bounds",
+            status=400,
+            code="UnsupportedBrokeredSchema",
+        )
 
     if schema_type == "array":
         for key in ("const", "default"):
@@ -1520,14 +1797,17 @@ def _sample_argument_value(name: str, schema: Any, run_request: RunRequest) -> A
             return value
         min_items = schema.get("minItems", 0)
         if isinstance(min_items, int) and min_items > 0:
-            if min_items > _MAX_SYNTHETIC_ARRAY_ITEMS:
+            if min_items > _MAX_SYNTHETIC_ARRAY_ITEMS or min_items > budget[0]:
                 raise AgentRunError(
                     f"brokered tool schema for {name!r} has minItems too large for deterministic synthesis",
                     status=413,
                     code="brokered_arguments_too_large",
                 )
             item_schema = schema.get("items", {})
-            return [_sample_argument_value(name, item_schema, run_request) for _ in range(min_items)]
+            return [
+                _sample_argument_value(name, item_schema, run_request, budget=budget, depth=depth + 1)
+                for _ in range(min_items)
+            ]
         return []
 
     if schema_type == "object":
@@ -1538,7 +1818,13 @@ def _sample_argument_value(name: str, schema: Any, run_request: RunRequest) -> A
         nested: dict[str, Any] = {}
         properties = schema.get("properties") if isinstance(schema.get("properties"), Mapping) else {}
         for child_name in _required_property_names(schema):
-            nested[child_name] = _sample_argument_value(child_name, properties.get(child_name, {}), run_request)
+            nested[child_name] = _sample_argument_value(
+                child_name,
+                properties.get(child_name, {}),
+                run_request,
+                budget=budget,
+                depth=depth + 1,
+            )
         return nested
 
     for key in ("const", "default"):
@@ -1585,12 +1871,18 @@ def _deterministic_tool_arguments(tool: BrokeredToolDefinition, run_request: Run
     for key in ("const", "default"):
         literal = parameters.get(key)
         if isinstance(literal, Mapping):
-            return dict(literal)
+            return dict(_bounded_synthetic_literal(tool.name, literal, depth=0))
     enum = parameters.get("enum")
     if isinstance(enum, list):
+        if tool.brokered_class != "read" and len(enum) > 1:
+            raise AgentRunError(
+                f"brokered {tool.brokered_class} tool {tool.name!r} has multiple root enum payloads; deterministic mode refuses to choose side-effecting arguments",
+                status=400,
+                code="UnsupportedBrokeredSchema",
+            )
         for item in enum:
             if isinstance(item, Mapping):
-                return dict(item)
+                return dict(_bounded_synthetic_literal(tool.name, item, depth=0))
     properties = parameters.get("properties") if isinstance(parameters.get("properties"), Mapping) else {}
     required_names = _required_property_names(parameters)
     if tool.brokered_class != "read":
@@ -1602,12 +1894,19 @@ def _deterministic_tool_arguments(tool: BrokeredToolDefinition, run_request: Run
                     code="UnsupportedBrokeredSchema",
                 )
     arguments: dict[str, Any] = {}
+    synthesis_budget = [_MAX_SYNTHETIC_VALUES]
     for name in required_names:
-        arguments[name] = _sample_argument_value(name, properties.get(name, {}), run_request)
+        arguments[name] = _sample_argument_value(name, properties.get(name, {}), run_request, budget=synthesis_budget)
     if tool.name == "conformance_read" and "probe" in properties and "probe" not in arguments:
         arguments["probe"] = True
     if not arguments and "prompt" in properties:
-        arguments["prompt"] = _sample_argument_value("prompt", properties["prompt"], run_request)
+        if tool.brokered_class != "read" and not _schema_has_literal_value(properties["prompt"]):
+            raise AgentRunError(
+                f"brokered {tool.brokered_class} tool {tool.name!r} has a non-literal optional prompt; deterministic mode refuses to synthesize side-effecting arguments",
+                status=400,
+                code="UnsupportedBrokeredSchema",
+            )
+        arguments["prompt"] = _sample_argument_value("prompt", properties["prompt"], run_request, budget=synthesis_budget)
     return arguments
 
 
@@ -1958,9 +2257,16 @@ async def _handle_brokered_continuation(
             status=400,
             code="missing_previous_response_id",
         )
+    input_items = input_value if isinstance(input_value, list) else [input_value] if isinstance(input_value, dict) else []
     if len(outputs) != 1:
         return _error(
             "multiple function_call_output items are not supported by this deterministic brokered adapter",
+            status=400,
+            code="multiple_tool_outputs_unsupported",
+        )
+    if len(input_items) != 1:
+        return _error(
+            "continuation input must contain exactly one function_call_output item",
             status=400,
             code="multiple_tool_outputs_unsupported",
         )
@@ -1990,38 +2296,32 @@ async def _handle_brokered_continuation(
     if call is None:
         return _error("unknown function_call_output call_id", status=400, code="unknown_call_id")
     raw_output = item.get("output")
+    if not isinstance(raw_output, str):
+        return _error(
+            "function_call_output.output must be a JSON object string",
+            status=400,
+            code="invalid_function_call_output",
+        )
     output_exceeds_current_limit = False
+    existing_output_digest = state.accepted_output_digests.get(call_id)
     persisted_output_size = state.accepted_output_sizes.get(call_id, 0)
-    replay_parse_limit = max(store.max_bytes, max_output_bytes, persisted_output_size)
+    replay_parse_limit = (
+        max_output_bytes
+        if existing_output_digest is None
+        else max(store.max_bytes, max_output_bytes, persisted_output_size)
+    )
     raw_output_size = 0
-    if isinstance(raw_output, str):
-        try:
-            if _utf8_exceeds_limit(raw_output, replay_parse_limit):
-                return _error(
+    try:
+        if _utf8_exceeds_limit(raw_output, replay_parse_limit):
+            return _error(
                     "brokered function_call_output is too large",
                     status=413,
                     code="brokered_output_too_large",
                 )
-            raw_output_size = len(raw_output.encode("utf-8"))
-            output_exceeds_current_limit = raw_output_size > max_output_bytes
-        except _InvalidUnicodeValue as exc:
-            return _error(str(exc), status=400, code="invalid_function_call_output")
-    else:
-        try:
-            raw_output_bytes = _bounded_json_bytes(raw_output, max_bytes=replay_parse_limit)
-            raw_output_size = len(raw_output_bytes)
-        except _SerializedPayloadTooLarge:
-            return _error(
-                "brokered function_call_output is too large",
-                status=413,
-                code="brokered_output_too_large",
-            )
-        except _InvalidUnicodeValue as exc:
-            return _error(str(exc), status=400, code="invalid_function_call_output")
-        except (TypeError, ValueError):
-            pass
-        if raw_output_size > max_output_bytes:
-            output_exceeds_current_limit = True
+        raw_output_size = len(raw_output.encode("utf-8"))
+        output_exceeds_current_limit = raw_output_size > max_output_bytes
+    except _InvalidUnicodeValue as exc:
+        return _error(str(exc), status=400, code="invalid_function_call_output")
     try:
         parsed_output = _json_object_from_output(raw_output)
     except ValueError as exc:
@@ -2042,7 +2342,6 @@ async def _handle_brokered_continuation(
     output_json = output_bytes.decode("utf-8")
     output_digest = _output_digest(output_json)
 
-    existing_output_digest = state.accepted_output_digests.get(call_id)
     if existing_output_digest is not None:
         if existing_output_digest == output_digest and _state_has_replay(state):
             if state.final_persistence_pending:
@@ -2080,6 +2379,12 @@ async def _handle_brokered_continuation(
             "brokered function_call_output is too large",
             status=413,
             code="brokered_output_too_large",
+        )
+    if state.model_messages is not None and model_loop is None:
+        return _error(
+            "brokered model-loop continuation is unavailable for this pending response",
+            status=503,
+            code="brokered_model_loop_unavailable",
         )
     if state.status != "pending":
         return _error("previous response is not pending a tool result", status=409, code="response_not_pending")
@@ -2196,6 +2501,7 @@ def create_foundry_app(
     max_brokered_output_bytes: int | None = None,
     max_response_state_bytes: int | None = None,
     max_request_body_bytes: int | None = None,
+    max_model_messages_bytes: int | None = None,
     brokered_model_loop_enabled: bool | None = None,
     brokered_model_http_client: Any | None = None,
     response_state_file: str | Path | None = None,
@@ -2206,7 +2512,8 @@ def create_foundry_app(
     continuation_proof = brokered_continuation_proof or os.environ.get(_CONTINUATION_PROOF_ENV) or None
     max_argument_bytes = _max_argument_bytes(max_brokered_argument_bytes)
     max_output_bytes = _max_output_bytes(max_brokered_output_bytes)
-    request_body_bytes = _max_request_body_bytes(max_request_body_bytes)
+    request_body_limit = _max_request_body_bytes(max_request_body_bytes)
+    model_messages_limit = _max_model_messages_bytes(max_model_messages_bytes)
     response_states = _FoundryResponseStateStore(
         ttl_seconds=_state_ttl_seconds(state_ttl_seconds),
         max_entries=_max_pending_responses(max_pending_responses),
@@ -2227,6 +2534,7 @@ def create_foundry_app(
             spec,
             brokered_tools,
             http_client=brokered_model_http_client,
+            max_argument_bytes=max_argument_bytes,
             max_output_bytes=max_output_bytes,
             max_response_bytes=response_states.max_bytes,
         )
@@ -2281,7 +2589,7 @@ def create_foundry_app(
                 code="invocations_disabled_in_brokered_mode",
             )
         try:
-            data = await _read_json_request_bounded(request, max_bytes=request_body_bytes)
+            data, _ = await _read_json_request_bounded(request, max_bytes=request_body_limit)
         except _RequestBodyTooLarge:
             return _request_too_large_error()
         except (UnicodeDecodeError, RecursionError, ValueError):
@@ -2307,9 +2615,9 @@ def create_foundry_app(
     @app.post("/responses", dependencies=[auth])
     async def responses(request: Request):
         try:
-            data = await _read_json_request_bounded(
+            data, request_body_size = await _read_json_request_bounded(
                 request,
-                max_bytes=max_brokered_request_body_bytes() if brokered_tools else request_body_bytes,
+                max_bytes=max_brokered_request_body_bytes() if brokered_tools else request_body_limit,
             )
         except _RequestBodyTooLarge:
             if not brokered_tools:
@@ -2357,6 +2665,12 @@ def create_foundry_app(
             )
         previous_response_id = data.get("previous_response_id")
         function_outputs = _function_call_outputs_from_input(data["input"])
+        if brokered_tools and not function_outputs and request_body_size > request_body_limit:
+            return _error(
+                "Request body is too large",
+                status=413,
+                code="request_body_too_large",
+            )
         if brokered_tools and function_outputs:
             return await _handle_brokered_continuation(
                 spec=spec,
@@ -2376,7 +2690,11 @@ def create_foundry_app(
             except _StatePersistenceError as exc:
                 logger.warning("failed to access Foundry brokered response state: %s", exc)
                 return _state_storage_error()
-            except (KeyError, _StateExpired):
+            except _StateExpired as exc:
+                if exc.state.status in {"pending", "resuming"}:
+                    return _error("previous_response_id state has expired", status=410, code="response_state_expired")
+                previous_state = None
+            except KeyError:
                 previous_state = None
             if previous_state is not None and previous_state.status in {"pending", "resuming"}:
                 return _error(
@@ -2447,6 +2765,20 @@ def create_foundry_app(
                             "brokered function_call arguments are too large for pending state",
                             status=413,
                             code="brokered_arguments_too_large",
+                        )
+                    try:
+                        _bounded_json_bytes(model_result.messages, max_bytes=model_messages_limit)
+                    except _SerializedPayloadTooLarge:
+                        return _error(
+                            "model loop messages are too large for pending state",
+                            status=413,
+                            code="brokered_model_messages_too_large",
+                        )
+                    except (_InvalidUnicodeValue, TypeError, ValueError) as exc:
+                        return _error(
+                            f"model loop messages are invalid: {exc}",
+                            status=502,
+                            code="InvalidModelResponse",
                         )
                     call = _PendingCall(
                         call_id=call_id,

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
@@ -22,6 +23,8 @@ from .adapter_support import AgentBuildError, NO_AUTH_API_KEY, resolve_api_key, 
 from .config import AgentSpec
 from .conversation import FORWARDED_ROLES, RunRequest
 from .runtime import AgentRunError, BrokeredToolDefinition
+
+_MAX_ARGUMENT_DEPTH = 128
 
 
 @dataclass(frozen=True)
@@ -47,12 +50,14 @@ class BrokeredChatModelLoop:
         tools: Sequence[BrokeredToolDefinition],
         *,
         http_client: httpx.AsyncClient | None = None,
+        max_argument_bytes: int = 8192,
         max_output_bytes: int = 64 * 1024,
         max_response_bytes: int = 4 * 1024 * 1024,
     ) -> None:
         self.spec = spec
         self.tools = list(tools)
         self.http_client = http_client
+        self.max_argument_bytes = max_argument_bytes
         self.max_output_bytes = max_output_bytes
         self.max_response_bytes = max_response_bytes
         self.tools_by_name = {tool.name: tool for tool in self.tools}
@@ -81,8 +86,18 @@ class BrokeredChatModelLoop:
         if not isinstance(name, str) or name not in self.tools_by_name:
             raise AgentRunError(f"model requested unknown brokered tool {name!r}", status=400, code="unknown_brokered_tool")
         raw_arguments = function.get("arguments", "{}")
+        if isinstance(raw_arguments, str):
+            try:
+                if len(raw_arguments) > self.max_argument_bytes or len(raw_arguments.encode("utf-8")) > self.max_argument_bytes:
+                    raise AgentRunError(
+                        "model brokered tool arguments are too large",
+                        status=413,
+                        code="brokered_arguments_too_large",
+                    )
+            except UnicodeEncodeError as exc:
+                raise AgentRunError("model tool arguments must contain valid Unicode", status=400, code="InvalidToolArguments") from exc
         arguments = _parse_arguments(raw_arguments)
-        _validate_json_unicode(arguments)
+        _validate_argument_unicode(arguments)
         argument_text = json.dumps(arguments, separators=(",", ":"), sort_keys=True)
         assistant_message = {
             "role": "assistant",
@@ -201,7 +216,7 @@ class BrokeredChatModelLoop:
             ) from exc
         if not isinstance(data, dict):
             raise AgentRunError("model response must be a JSON object", status=502, code="InvalidModelResponse")
-        _validate_json_unicode(data)
+        _validate_model_response_unicode(data)
         return data
 
     async def _auth_headers(self) -> dict[str, str]:
@@ -275,7 +290,7 @@ def _normalized_model_http_error(status_code: int) -> AgentRunError:
     )
 
 
-def _validate_json_unicode(value: Any) -> None:
+def _validate_model_response_unicode(value: Any) -> None:
     pending = [iter((value,))]
     while pending:
         try:
@@ -318,15 +333,25 @@ def _choice_message(data: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def _message_text(message: Mapping[str, Any], *, max_bytes: int) -> str:
-    content = message.get("content", "")
-    text = content if isinstance(content, str) else str(content or "")
+    content = message.get("content")
+    if isinstance(content, str):
+        text = content
+    else:
+        refusal = message.get("refusal")
+        if content is not None or not isinstance(refusal, str):
+            raise AgentRunError(
+                "model response final assistant content must be a string",
+                status=502,
+                code="InvalidModelResponse",
+            )
+        text = refusal
     if len(text) > max_bytes:
         raise _model_response_too_large_error()
     try:
         text_bytes = text.encode("utf-8")
     except UnicodeEncodeError as exc:
         raise AgentRunError(
-            "model service returned an invalid JSON response",
+            "model response final assistant content must contain valid Unicode",
             status=502,
             code="InvalidModelResponse",
         ) from exc
@@ -336,18 +361,51 @@ def _message_text(message: Mapping[str, Any], *, max_bytes: int) -> str:
 
 
 def _parse_arguments(raw: Any) -> dict[str, Any]:
-    if isinstance(raw, str):
-        try:
-            parsed = json.loads(raw or "{}", parse_float=_parse_json_float, parse_constant=_reject_json_constant)
-        except AgentRunError:
-            raise
-        except json.JSONDecodeError as exc:
-            raise AgentRunError("model tool arguments must be valid JSON", status=400, code="InvalidToolArguments") from exc
-    else:
-        parsed = raw
+    if not isinstance(raw, str):
+        raise AgentRunError("model tool arguments must be a JSON object string", status=400, code="InvalidToolArguments")
+    try:
+        parsed = json.loads(
+            raw or "{}",
+            parse_float=_parse_json_float,
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=_reject_duplicate_argument_keys,
+        )
+    except AgentRunError:
+        raise
+    except (json.JSONDecodeError, ValueError, RecursionError) as exc:
+        raise AgentRunError("model tool arguments must be valid JSON", status=400, code="InvalidToolArguments") from exc
     if not isinstance(parsed, dict):
         raise AgentRunError("model tool arguments must be a JSON object", status=400, code="InvalidToolArguments")
     return parsed
+
+
+def _reject_duplicate_argument_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise AgentRunError(f"model tool arguments contain duplicate key {key!r}", status=400, code="InvalidToolArguments")
+        out[key] = value
+    return out
+
+
+def _validate_argument_unicode(value: Any, *, path: str = "arguments") -> None:
+    pending: list[tuple[Any, str, int]] = [(value, path, 0)]
+    while pending:
+        current, current_path, depth = pending.pop()
+        if depth > _MAX_ARGUMENT_DEPTH:
+            raise AgentRunError("model tool arguments are nested too deeply", status=400, code="InvalidToolArguments")
+        if isinstance(current, str):
+            try:
+                current.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise AgentRunError(f"model tool arguments contain invalid Unicode at {current_path}", status=400, code="InvalidToolArguments") from exc
+        elif isinstance(current, Mapping):
+            for key, child in current.items():
+                pending.append((child, f"{current_path}[{key!r}]", depth + 1))
+                pending.append((key, f"{current_path}.<key>", depth + 1))
+        elif isinstance(current, list):
+            for index, child in enumerate(current):
+                pending.append((child, f"{current_path}[{index}]", depth + 1))
 
 
 def _parse_json_float(raw: str) -> float:
@@ -369,12 +427,37 @@ def _reject_json_constant(raw: str) -> None:
     raise AgentRunError(f"model tool arguments contain non-finite number {raw}", status=400, code="InvalidToolArguments")
 
 
+def _usage_token_count(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise AgentRunError(
+            "model response usage must contain non-negative integer token counts",
+            status=502,
+            code="InvalidModelResponse",
+        )
+    if isinstance(value, float) and (not math.isfinite(value) or not value.is_integer()):
+        raise AgentRunError(
+            "model response usage must contain non-negative integer token counts",
+            status=502,
+            code="InvalidModelResponse",
+        )
+    count = int(value)
+    if count < 0:
+        raise AgentRunError(
+            "model response usage must contain non-negative integer token counts",
+            status=502,
+            code="InvalidModelResponse",
+        )
+    return count
+
+
 def _usage(data: Mapping[str, Any]) -> dict[str, int]:
     usage = data.get("usage") if isinstance(data.get("usage"), Mapping) else {}
-    prompt_tokens = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
-    completion_tokens = int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
-    total_tokens = int(usage.get("total_tokens", prompt_tokens + completion_tokens) or 0)
-    return {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": total_tokens}
+    prompt_count = _usage_token_count(usage.get("prompt_tokens", usage.get("input_tokens", 0)))
+    completion_count = _usage_token_count(usage.get("completion_tokens", usage.get("output_tokens", 0)))
+    total_count = _usage_token_count(usage.get("total_tokens", prompt_count + completion_count))
+    return {"prompt_tokens": prompt_count, "completion_tokens": completion_count, "total_tokens": total_count}
 
 
 __all__ = ["BrokeredChatModelLoop", "ModelLoopFinal", "ModelLoopToolRequest"]

@@ -7,7 +7,7 @@ import pytest
 import yaml
 
 from _brokered_description_cases import HARMLESS_BROKERED_DESCRIPTIONS, UNSAFE_BROKERED_DESCRIPTIONS
-from agentkit_serve_common.config import ConfigError, load, load_or_exit, validate_required_env
+from agentkit_serve_common.config import ConfigError, brokered_tool_schema_digest, load, load_or_exit, validate_required_env
 
 
 _BASE_SPEC = {
@@ -1034,3 +1034,216 @@ def test_brokered_tool_schema_digest_canonicalizes_exponent_number_spellings():
         brokered_class="read",
         parameters=parameters,
     ) == "sha256:bb4fac58c3f65a33ed3c4ebfa10e5da9c3dc5a9250a1316f64d25e40e0e645e0"
+
+
+# Regression coverage retained from the merged brokered-continuation stack.
+
+@pytest.mark.parametrize(
+    "bad_parameters",
+    [
+        {"type": "object", "enum": []},
+        {"type": "object", "properties": {"site": {"type": "string", "enum": []}}},
+    ],
+)
+def test_load_rejects_empty_brokered_json_schema_enums(tmp_path, bad_parameters: dict):
+    msg = _invalid_message(
+        tmp_path,
+        lambda spec: spec.update(
+            tools=[],
+            brokeredTools=[
+                {
+                    "name": "safe_lookup",
+                    "description": "safe schema",
+                    "brokeredClass": "read",
+                    "parameters": bad_parameters,
+                }
+            ],
+        ),
+    )
+    assert "enum must contain at least one value" in msg
+
+def test_load_preserves_high_precision_integral_brokered_yaml_number(tmp_path):
+    path = tmp_path / "agent.yaml"
+    path.write_text(
+        """abiVersion: v0
+metadata:
+  name: precise-agent
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: Be precise.
+tools: []
+brokeredTools:
+  - name: precise_lookup
+    description: Preserve precise identifiers.
+    brokeredClass: read
+    parameters:
+      type: object
+      properties:
+        identifier:
+          type: integer
+          default: 9007199254740993.0
+expose:
+  openai: true
+  port: 8080
+""",
+        encoding="utf-8",
+    )
+
+    spec = load(path)
+
+    default = spec.brokered_tools[0].parameters["properties"]["identifier"]["default"]
+    assert default == 9007199254740993
+    assert isinstance(default, int)
+
+def test_load_rejects_lossy_fractional_brokered_yaml_number(tmp_path):
+    path = tmp_path / "agent.yaml"
+    path.write_text(
+        """abiVersion: v0
+metadata:
+  name: lossy-agent
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: Be precise.
+tools: []
+brokeredTools:
+  - name: lossy_lookup
+    description: Reject lossy ratios.
+    brokeredClass: read
+    parameters:
+      type: object
+      properties:
+        ratio:
+          type: number
+          default: 0.100000000000000005
+expose:
+  openai: true
+  port: 8080
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="cannot be represented exactly"):
+        load(path)
+
+def test_load_normalizes_cyclic_brokered_schema_to_config_error(tmp_path):
+    path = tmp_path / "agent.yaml"
+    path.write_text(
+        """abiVersion: v0
+metadata:
+  name: cyclic-agent
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: Be safe.
+tools: []
+brokeredTools:
+  - name: cyclic_lookup
+    description: Reject cyclic schemas.
+    brokeredClass: read
+    parameters: &schema
+      type: object
+      properties:
+        nested: *schema
+expose:
+  openai: true
+  port: 8080
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="acyclic JSON-serializable"):
+        load(path)
+
+def test_load_normalizes_surrogate_brokered_schema_to_config_error(tmp_path):
+    path = tmp_path / "agent.yaml"
+    path.write_text(
+        """abiVersion: v0
+metadata:
+  name: surrogate-agent
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+instructions: Be safe.
+tools: []
+brokeredTools:
+  - name: surrogate_lookup
+    description: Reject invalid Unicode.
+    brokeredClass: read
+    parameters:
+      type: object
+      properties:
+        text:
+          type: string
+          default: "\\ud800"
+expose:
+  openai: true
+  port: 8080
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="JSON serializable UTF-8"):
+        load(path)
+
+def test_load_accepts_integral_float_values_for_integer_brokered_schema(tmp_path):
+    spec_dict = deepcopy(_BASE_SPEC)
+    spec_dict.update(
+        tools=[],
+        brokeredTools=[
+            {
+                "name": "integer_values",
+                "description": "integer schema values",
+                "brokeredClass": "read",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "withDefault": {"type": "integer", "default": 1.0},
+                        "withConst": {"type": "integer", "const": 2.0},
+                        "withEnum": {"type": "integer", "enum": [3.0]},
+                    },
+                },
+            }
+        ],
+    )
+
+    spec = load(_write_spec(tmp_path, spec_dict))
+
+    properties = spec.brokered_tools[0].parameters["properties"]
+    assert properties["withDefault"]["default"] == 1.0
+    assert properties["withConst"]["const"] == 2.0
+    assert properties["withEnum"]["enum"] == [3.0]
+
+def test_load_accepts_integral_float_integer_schema_constraints(tmp_path):
+    spec_dict = deepcopy(_BASE_SPEC)
+    spec_dict.update(
+        tools=[],
+        brokeredTools=[
+            {
+                "name": "integer_constraints",
+                "description": "integer schema constraints",
+                "brokeredClass": "read",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "values": {
+                            "type": "array",
+                            "minItems": 1.0,
+                            "maxItems": 2.0,
+                        }
+                    },
+                },
+            }
+        ],
+    )
+
+    spec = load(_write_spec(tmp_path, spec_dict))
+
+    values = spec.brokered_tools[0].parameters["properties"]["values"]
+    assert values["minItems"] == 1
+    assert values["maxItems"] == 2

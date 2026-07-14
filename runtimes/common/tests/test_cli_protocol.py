@@ -27,6 +27,19 @@ def _spec(port: int = 8080) -> AgentSpec:
     )
 
 
+def _brokered_spec() -> AgentSpec:
+    data = _spec().model_dump(by_alias=True)
+    data["brokeredTools"] = [
+        {
+            "name": "check-network-telemetry",
+            "description": "Read telemetry.",
+            "brokeredClass": "read",
+            "parameters": {"type": "object"},
+        }
+    ]
+    return AgentSpec.model_validate(data)
+
+
 class Runtime:
     async def __aenter__(self) -> RuntimeSession:
         return self
@@ -61,6 +74,19 @@ def test_cli_protocol_flag_selects_foundry_and_default_foundry_port(monkeypatch)
     assert captured["port"] == 8088
     assert captured["host"] == "127.0.0.1"
     assert any(getattr(route, "path", None) == "/readiness" for route in captured["app"].routes)
+
+
+def test_cli_rejects_brokered_tools_on_default_openai_protocol(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "load_or_exit", lambda path: _brokered_spec())
+    monkeypatch.setattr(cli.uvicorn, "run", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("server must not start")))
+    monkeypatch.delenv("AGENTKIT_PROTOCOL", raising=False)
+    monkeypatch.delenv("AGENTKIT_AUTH_TOKEN", raising=False)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.run(Factory(), ["--config", "agent.yaml"])
+
+    assert exc.value.code == 2
+    assert "brokeredTools require AGENTKIT_PROTOCOL=foundry" in capsys.readouterr().err
 
 
 def test_cli_protocol_env_selects_orka_and_requires_auth_token(monkeypatch):

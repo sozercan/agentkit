@@ -39,7 +39,7 @@ brokeredTools:
     "required":
     - "line:\u2028break"
     "type": "object"
-  schemaDigest: "sha256:50d18ec3547b6ebc50aebf140716b6eac1e54f7eb4e5d84e69abef731ad7af64"
+  schemaDigest: "sha256:ce77aaf228491b5007ed2ee703e57180acec8def6214c84d4324719b7f4f1fb6"
 expose:
   openai: true
   port: 8080

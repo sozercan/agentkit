@@ -59,7 +59,7 @@ def test_go_rendered_edge_case_agent_yaml_loads_exactly_in_python_reader():
     assert isinstance(minimum, float)
     assert minimum == 0.0
     assert math.copysign(1.0, minimum) == -1.0
-    assert tool.schema_digest == "sha256:50d18ec3547b6ebc50aebf140716b6eac1e54f7eb4e5d84e69abef731ad7af64"
+    assert tool.schema_digest == "sha256:ce77aaf228491b5007ed2ee703e57180acec8def6214c84d4324719b7f4f1fb6"
 
 
 def test_current_go_validation_and_renderer_match_python_brokered_description_contract(tmp_path):

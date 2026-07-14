@@ -26,6 +26,7 @@ const (
 	jsonSchemaTypeKey        = "type"
 	jsonSchemaDescriptionKey = "description"
 	jsonSchemaDefaultKey     = "default"
+	jsonSchemaEnumKey        = "enum"
 	jsonSchemaObject         = "object"
 	jsonSchemaString         = "string"
 	jsonSchemaNumber         = "number"
@@ -318,11 +319,12 @@ func TestRenderAgentYAMLFormatsJSONNumberBrokeredSchemaValuesAsNumbers(t *testin
 	}
 }
 
-func TestRenderAgentYAMLNormalizesYAMLBinarySchemaValuesAsBase64Strings(t *testing.T) {
+func TestRenderAgentYAMLRejectsYAMLBinarySchemaValues(t *testing.T) {
 	const binaryAgentkitfile = `apiVersion: v1alpha1
 kind: Agent
 metadata:
   name: binary-schema
+runtime: pydantic-ai
 model:
   provider: openai-compatible
   baseURL: https://api.openai.com/v1
@@ -347,50 +349,8 @@ expose:
 	if err != nil {
 		t.Fatalf("load binary agentkitfile: %v", err)
 	}
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("binary schema should validate through its JSON/base64 representation: %v", err)
-	}
-	binaryDigest, err := config.BrokeredToolSchemaDigest(cfg.BrokeredTools[0])
-	if err != nil {
-		t.Fatalf("digest binary schema: %v", err)
-	}
-	equivalent := cfg.BrokeredTools[0]
-	equivalent.Parameters = map[string]any{
-		jsonSchemaTypeKey: jsonSchemaObject,
-		jsonSchemaPropertiesKey: map[string]any{
-			"payload": map[string]any{jsonSchemaTypeKey: jsonSchemaString, jsonSchemaDefaultKey: testHelloBase64},
-		},
-	}
-	stringDigest, err := config.BrokeredToolSchemaDigest(equivalent)
-	if err != nil {
-		t.Fatalf("digest equivalent string schema: %v", err)
-	}
-	if binaryDigest != stringDigest {
-		t.Fatalf("binary digest = %q, equivalent base64 string digest = %q", binaryDigest, stringDigest)
-	}
-	cfg.BrokeredTools[0].SchemaDigest = binaryDigest
-
-	out, err := Render(effective.FromConfig(cfg, cfg.Instructions.Inline))
-	if err != nil {
-		t.Fatalf("render binary schema: %v", err)
-	}
-	var got struct {
-		BrokeredTools []struct {
-			Parameters struct {
-				Properties map[string]struct {
-					Default any `yaml:"default"`
-				} `yaml:"properties"`
-			} `yaml:"parameters"`
-		} `yaml:"brokeredTools"`
-	}
-	if err := yaml.Unmarshal(out, &got); err != nil {
-		t.Fatalf("parse rendered binary schema: %v\n---\n%s", err, out)
-	}
-	if len(got.BrokeredTools) != 1 {
-		t.Fatalf("brokeredTools = %#v", got.BrokeredTools)
-	}
-	if value := got.BrokeredTools[0].Parameters.Properties["payload"].Default; value != testHelloBase64 {
-		t.Fatalf("rendered binary default = %#v (%T), want base64 string\n---\n%s", value, value, out)
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "unsupported JSON value []uint8") {
+		t.Fatalf("binary schema must be rejected rather than silently coerced, got: %v", err)
 	}
 }
 
@@ -414,7 +374,7 @@ func TestRenderAgentYAMLNormalizesNamedBrokeredSchemaTypes(t *testing.T) {
 				propertyName: map[string]any{
 					jsonSchemaTypeKey:    schemaString(jsonSchemaString),
 					jsonSchemaDefaultKey: schemaBytes("Hello"),
-					"enum":               schemaStrings{enumValue},
+					jsonSchemaEnumKey:    schemaStrings{enumValue},
 				},
 			},
 		},
@@ -430,7 +390,7 @@ func TestRenderAgentYAMLNormalizesNamedBrokeredSchemaTypes(t *testing.T) {
 			string(propertyName): map[string]any{
 				jsonSchemaTypeKey:    jsonSchemaString,
 				jsonSchemaDefaultKey: testHelloBase64,
-				"enum":               []string{string(enumValue)},
+				jsonSchemaEnumKey:    []string{string(enumValue)},
 			},
 		},
 	}
@@ -758,7 +718,7 @@ func TestRenderAgentYAMLEdgeCasesMatchCrossLanguageGolden(t *testing.T) {
 				},
 				"binary": map[string]any{
 					jsonSchemaTypeKey:    jsonSchemaString,
-					jsonSchemaDefaultKey: []byte("Hello"),
+					jsonSchemaDefaultKey: testHelloBase64,
 				},
 				propertyName: map[string]any{
 					jsonSchemaTypeKey:        "number",
@@ -797,7 +757,7 @@ func TestRenderAgentYAMLEdgeCasesMatchCrossLanguageGolden(t *testing.T) {
 	}
 }
 
-func TestRenderAgentYAMLDoesNotTreatUnderflowingJSONNumberAsNegativeZero(t *testing.T) {
+func TestRenderAgentYAMLRejectsUnderflowingJSONNumbers(t *testing.T) {
 	cfg := sampleConfig()
 	cfg.Tools = nil
 	cfg.Instructions = config.Source{Inline: testInstructions}
@@ -809,29 +769,54 @@ func TestRenderAgentYAMLDoesNotTreatUnderflowingJSONNumberAsNegativeZero(t *test
 			jsonSchemaTypeKey: jsonSchemaObject,
 			jsonSchemaPropertiesKey: map[string]any{
 				"tiny": map[string]any{jsonSchemaTypeKey: jsonSchemaNumber, jsonSchemaMinimumKey: json.Number("-1e-350")},
-				"zero": map[string]any{jsonSchemaTypeKey: jsonSchemaNumber, jsonSchemaMinimumKey: json.Number("-0e-350")},
 			},
 		},
 	}}
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("tiny nonzero json.Number should pass Go validation: %v", err)
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "cannot be represented exactly") {
+		t.Fatalf("underflowing json.Number must fail exact representation validation, got: %v", err)
 	}
+}
+
+func TestRenderAgentYAMLPreservesNegativeZeroBrokeredSchemaFloats(t *testing.T) {
+	cfg := sampleConfig()
+	cfg.Tools = nil
+	tool := config.BrokeredTool{
+		Name:          "negative-zero-tool",
+		Description:   "Preserve negative zero.",
+		BrokeredClass: config.BrokeredClassRead,
+		Parameters: map[string]any{
+			jsonSchemaTypeKey: jsonSchemaObject,
+			jsonSchemaPropertiesKey: map[string]any{
+				"offset":        map[string]any{jsonSchemaTypeKey: jsonSchemaNumber, jsonSchemaDefaultKey: math.Copysign(0, -1)},
+				"jsonOffset":    map[string]any{jsonSchemaTypeKey: jsonSchemaNumber, jsonSchemaDefaultKey: json.Number("-0e0")},
+				"largeInteger":  map[string]any{jsonSchemaTypeKey: "integer", jsonSchemaDefaultKey: json.Number("9007199254740995.0")},
+				"typedNested":   map[string][]float64{"enum": {math.Copysign(0, -1)}},
+				"typedNil":      map[string]any{jsonSchemaDefaultKey: map[string]string(nil)},
+				"typedNilSlice": map[string]any{jsonSchemaDefaultKey: []string(nil)},
+			},
+		},
+	}
+	digest, err := config.BrokeredToolSchemaDigest(tool)
+	if err != nil {
+		t.Fatalf("digest error: %v", err)
+	}
+	tool.SchemaDigest = digest
+	cfg.BrokeredTools = []config.BrokeredTool{tool}
 
 	out, err := Render(effective.FromConfig(cfg, testInstructions))
 	if err != nil {
 		t.Fatalf("render error: %v", err)
 	}
-	want := "\"minimum\": -0." + strings.Repeat("0", 349) + "1"
-	if !strings.Contains(string(out), want) {
-		t.Fatalf("rendered agent.yaml collapsed a nonzero json.Number to negative zero\n---\n%s", out)
+	if strings.Count(string(out), `"default": -0.0`) != 2 {
+		t.Fatalf("rendered agent.yaml did not preserve negative zero as a float\n---\n%s", out)
 	}
-	negativeZeroLines := 0
-	for _, line := range strings.Split(string(out), "\n") {
-		if strings.TrimSpace(line) == "\"minimum\": -0.0" {
-			negativeZeroLines++
-		}
+	if !strings.Contains(string(out), `"default": 9007199254740995`) || strings.Contains(string(out), "9007199254740995.0") {
+		t.Fatalf("rendered agent.yaml did not preserve a large integral decimal as an integer\n---\n%s", out)
 	}
-	if negativeZeroLines != 1 {
-		t.Fatalf("rendered agent.yaml must preserve only the lexical negative zero, got %d exact lines\n---\n%s", negativeZeroLines, out)
+	if strings.Count(string(out), yamlNegativeZero) != 3 {
+		t.Fatalf("rendered agent.yaml did not normalize negative zero in typed nested containers\n---\n%s", out)
+	}
+	if strings.Count(string(out), `"default": null`) != 2 {
+		t.Fatalf("rendered agent.yaml did not preserve typed nil containers as null\n---\n%s", out)
 	}
 }

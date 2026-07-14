@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 usage() {
   cat >&2 <<'EOF'
@@ -26,6 +27,7 @@ Optional:
   AGENTKIT_EXPECTED_ARGUMENTS   Defaults to {"probe":true}.
   AGENTKIT_EXPECTED_CALL_ID     Defaults to call_conformance_1; set to auto for generated IDs.
   AGENTKIT_EXPECTED_CALL_ID_PREFIX  Optional required call_id prefix, e.g. call_.
+  AGENTKIT_EXPECTED_FINAL_TEXT  Optional exact final assistant text; defaults are derived for SDK/AgentKit fixtures.
   AGENTKIT_CONTINUATION_PROOF   Optional x-agentkit-brokered-continuation-proof header.
   AGENTKIT_CONTINUATION_PROOF_BODY  Optional proof sent only in the live continuation body.
                                     It is omitted from the archived request transcript.
@@ -36,6 +38,17 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   usage
   exit 0
 fi
+
+write_curl_header() {
+  local header="$1"
+  if [[ "$header" == *$'\r'* || "$header" == *$'\n'* ]]; then
+    echo "refusing curl header containing a newline" >&2
+    return 1
+  fi
+  header="${header//\\/\\\\}"
+  header="${header//\"/\\\"}"
+  printf 'header = "%s"\n' "$header"
+}
 
 : "${AGENT_RESPONSES_ENDPOINT:?set AGENT_RESPONSES_ENDPOINT to the deployed /responses URL}"
 
@@ -59,18 +72,47 @@ expected_tool_name="${AGENTKIT_EXPECTED_TOOL_NAME:-conformance_read}"
 expected_arguments="${AGENTKIT_EXPECTED_ARGUMENTS:-{\"probe\":true}}"
 expected_call_id="${AGENTKIT_EXPECTED_CALL_ID:-call_conformance_1}"
 expected_call_id_prefix="${AGENTKIT_EXPECTED_CALL_ID_PREFIX:-}"
+expected_final_text="${AGENTKIT_EXPECTED_FINAL_TEXT:-}"
+if [[ -z "$expected_final_text" ]]; then
+  expected_final_text="$(
+    EXPECTED_CALL_ID="$expected_call_id" EXPECTED_TOOL_NAME="$expected_tool_name" CONFORMANCE_OUTPUT="$conformance_output" python3 - <<'PY'
+import json
+import os
+
+call_id = os.environ["EXPECTED_CALL_ID"]
+tool_name = os.environ["EXPECTED_TOOL_NAME"]
+payload = json.loads(os.environ["CONFORMANCE_OUTPUT"])
+if call_id == "call_conformance_1":
+    print(f"conformance complete: {json.dumps(payload, sort_keys=True)}")
+elif payload.get("approved") is True:
+    output = payload.get("output") if isinstance(payload.get("output"), dict) else {}
+    print(f"Brokered tool {tool_name} completed with output: {json.dumps(output, separators=(',', ':'), sort_keys=True)}")
+else:
+    error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+    code = str(error.get("code") or "brokered_tool_denied")
+    message = str(error.get("message") or "brokered tool was not performed")
+    print(f"Brokered tool {tool_name} was not performed: {code}: {message}")
+PY
+  )"
+fi
 initial_request="$transcript_dir/01-initial-request.json"
 initial_response="$transcript_dir/02-initial-response.json"
 continuation_request="$transcript_dir/03-continuation-request.json"
 continuation_response="$transcript_dir/04-continuation-response.json"
 summary_file="$transcript_dir/summary.json"
-rm -f "$continuation_response" "$summary_file" "$summary_file.tmp"
+expected_output_file="$transcript_dir/.expected-output.json"
+expected_final_text_file="$transcript_dir/.expected-final-text.txt"
+rm -f "$continuation_response" "$summary_file" "$summary_file.tmp" "$expected_output_file" "$expected_final_text_file"
 continuation_response_wire="$(mktemp "${TMPDIR:-/tmp}/agentkit-foundry-continuation-response.XXXXXX")"
+continuation_request_wire="$(mktemp "${TMPDIR:-/tmp}/agentkit-foundry-continuation-request.XXXXXX")"
 
 cleanup() {
-  rm -f "$continuation_response_wire" "$summary_file.tmp"
+  rm -f "$continuation_response_wire" "$continuation_request_wire" "$summary_file.tmp" \
+    "$expected_output_file" "$expected_final_text_file"
 }
 trap cleanup EXIT
+printf '%s' "$conformance_output" >"$expected_output_file"
+printf '%s' "$expected_final_text" >"$expected_final_text_file"
 
 PROMPT="$prompt" python3 - <<'PY' >"$initial_request"
 import json
@@ -78,11 +120,13 @@ import os
 print(json.dumps({"input": os.environ["PROMPT"]}, separators=(",", ":")))
 PY
 
-curl -fsS \
-  -H "Authorization: Bearer ${token}" \
+initial_curl_config="$(write_curl_header "Authorization: Bearer ${token}")"
+printf '%s\n' "$initial_curl_config" | curl -fsS \
+  --config - \
   -H 'content-type: application/json' \
   "$AGENT_RESPONSES_ENDPOINT" \
   -d "@$initial_request" >"$initial_response"
+unset initial_curl_config
 
 EXPECTED_TOOL_NAME="$expected_tool_name" \
 EXPECTED_ARGUMENTS="$expected_arguments" \
@@ -135,11 +179,7 @@ if agent_session_id is not None:
 print(json.dumps(continuation, separators=(",", ":")))
 PY
 
-continuation_headers=(-H "Authorization: Bearer ${token}" -H 'content-type: application/json')
-if [[ -n "${AGENTKIT_CONTINUATION_PROOF:-}" ]]; then
-  continuation_headers+=(-H "x-agentkit-brokered-continuation-proof: ${AGENTKIT_CONTINUATION_PROOF}")
-fi
-
+cp "$continuation_request" "$continuation_request_wire"
 if [[ -n "${AGENTKIT_CONTINUATION_PROOF_BODY:-}" ]]; then
   AGENTKIT_CONTINUATION_PROOF_BODY="$AGENTKIT_CONTINUATION_PROOF_BODY" \
     python3 -c '
@@ -151,17 +191,21 @@ from pathlib import Path
 body = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 body["brokered_continuation_proof"] = os.environ["AGENTKIT_CONTINUATION_PROOF_BODY"]
 print(json.dumps(body, separators=(",", ":")))
-' "$continuation_request" |
-    curl -fsS \
-      "${continuation_headers[@]}" \
-      "$AGENT_RESPONSES_ENDPOINT" \
-      --data-binary @- >"$continuation_response_wire"
-else
-  curl -fsS \
-    "${continuation_headers[@]}" \
-    "$AGENT_RESPONSES_ENDPOINT" \
-    -d "@$continuation_request" >"$continuation_response_wire"
+' "$continuation_request" >"$continuation_request_wire"
 fi
+
+continuation_curl_config="$({
+  write_curl_header "Authorization: Bearer ${token}"
+  if [[ -n "${AGENTKIT_CONTINUATION_PROOF:-}" ]]; then
+    write_curl_header "x-agentkit-brokered-continuation-proof: ${AGENTKIT_CONTINUATION_PROOF}"
+  fi
+})"
+printf '%s\n' "$continuation_curl_config" | curl -fsS \
+  --config - \
+  -H 'content-type: application/json' \
+  "$AGENT_RESPONSES_ENDPOINT" \
+  -d "@$continuation_request_wire" >"$continuation_response_wire"
+unset continuation_curl_config
 
 AGENTKIT_CONTINUATION_PROOF="${AGENTKIT_CONTINUATION_PROOF:-}" \
 AGENTKIT_CONTINUATION_PROOF_BODY="${AGENTKIT_CONTINUATION_PROOF_BODY:-}" \
@@ -233,6 +277,8 @@ verifier_args=(
   "$transcript_dir"
   --expected-tool-name "$expected_tool_name"
   --expected-arguments-json "$expected_arguments"
+  --expected-output-file "$expected_output_file"
+  --expected-final-text-file "$expected_final_text_file"
   --expected-call-id "$expected_call_id"
   --write-summary
 )
@@ -240,7 +286,8 @@ if [[ -n "$expected_call_id_prefix" ]]; then
   verifier_args+=(--expected-call-id-prefix "$expected_call_id_prefix")
 fi
 python3 deploy/foundry/scripts/verify_brokered_transcript.py "${verifier_args[@]}" >"$summary_file.tmp"
-rm -f "$summary_file.tmp"
+cleanup
+trap - EXIT
 
 echo "Foundry brokered conformance passed. Sanitized transcript: ${transcript_dir}"
 cat "$summary_file"
