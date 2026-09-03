@@ -543,7 +543,7 @@ class ACPStdioServer:
         state = self.sessions.get(session_id)
         if state is None:
             raise ACPProtocolError(_INVALID_PARAMS, "unknown ACP sessionId")
-        if state.active_run is not None and not state.active_run.done():
+        if state.active_request_key is not None:
             raise ACPProtocolError(_RUNTIME_ERROR, "ACP session already has an active prompt")
         prompt = request.get("prompt")
         if not isinstance(prompt, list) or not prompt:
@@ -569,46 +569,59 @@ class ACPStdioServer:
             name="agentkit-acp-runtime-prompt",
         )
         self.prompt_requests[request_key] = state
-        cancelled = False
-        runtime_error: BaseException | None = None
         try:
-            result = await state.active_run
-        except asyncio.CancelledError:
-            cancelled = True
-            result = None
-        except BaseException as exc:  # noqa: BLE001 - cancellation wins over its fallout.
-            result = None
-            runtime_error = exc
+            cancelled = False
+            runtime_error: BaseException | None = None
+            try:
+                result = await state.active_run
+            except asyncio.CancelledError:
+                cancelled = True
+                result = None
+            except BaseException as exc:  # noqa: BLE001 - cancellation wins over its fallout.
+                result = None
+                runtime_error = exc
+
+            if (
+                cancelled
+                or state.cancel_requested
+                or runtime_error is not None
+                or result is None
+            ):
+                await _discard_runtime_session(state.runtime, session_id)
+            if cancelled or state.cancel_requested:
+                return {"stopReason": "cancelled"}
+            if runtime_error is not None:
+                raise runtime_error
+            if result is None:
+                raise ACPProtocolError(_INTERNAL_ERROR, "runtime returned no prompt result")
+            try:
+                if result.text:
+                    await self.send(
+                        {
+                            "jsonrpc": _JSONRPC_VERSION,
+                            "method": _METHOD_SESSION_UPDATE,
+                            "params": {
+                                "sessionId": session_id,
+                                "update": {
+                                    "sessionUpdate": "agent_message_chunk",
+                                    "content": {"type": "text", "text": result.text},
+                                },
+                            },
+                        }
+                    )
+            except BaseException:  # noqa: BLE001 - failed output must roll back state.
+                await _discard_runtime_session(state.runtime, session_id)
+                raise
+            if state.cancel_requested:
+                await _discard_runtime_session(state.runtime, session_id)
+                return {"stopReason": "cancelled"}
+            state.history.append(ConversationTurn(role="user", text=run_request.prompt))
+            state.history.append(ConversationTurn(role="assistant", text=result.text))
+            return {"stopReason": "end_turn"}
         finally:
             self.prompt_requests.pop(request_key, None)
             state.active_request_key = None
             state.active_run = None
-
-        if cancelled or state.cancel_requested or runtime_error is not None or result is None:
-            await _discard_runtime_session(state.runtime, session_id)
-        if cancelled or state.cancel_requested:
-            return {"stopReason": "cancelled"}
-        if runtime_error is not None:
-            raise runtime_error
-        if result is None:
-            raise ACPProtocolError(_INTERNAL_ERROR, "runtime returned no prompt result")
-        if result.text:
-            await self.send(
-                {
-                    "jsonrpc": _JSONRPC_VERSION,
-                    "method": _METHOD_SESSION_UPDATE,
-                    "params": {
-                        "sessionId": session_id,
-                        "update": {
-                            "sessionUpdate": "agent_message_chunk",
-                            "content": {"type": "text", "text": result.text},
-                        },
-                    },
-                }
-            )
-        state.history.append(ConversationTurn(role="user", text=run_request.prompt))
-        state.history.append(ConversationTurn(role="assistant", text=result.text))
-        return {"stopReason": "end_turn"}
 
     def _cancel_state(self, state: _SessionState | None) -> None:
         if state is None:

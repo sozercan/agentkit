@@ -453,6 +453,95 @@ def test_runtime_error_is_redacted_and_does_not_commit_history(monkeypatch):
     asyncio.run(exercise())
 
 
+def test_update_send_failure_discards_runtime_state(monkeypatch):
+    _set_provider_environment(monkeypatch)
+    runtime = RecordingRuntime([RunResult("oversized answer"), RunResult("recovered")])
+    factory = RecordingFactory(lambda: runtime)
+
+    async def exercise() -> None:
+        messages: list[dict[str, Any]] = []
+        fail_update = True
+
+        async def send(message):  # noqa: ANN001
+            nonlocal fail_update
+            if message.get("method") == "session/update" and fail_update:
+                fail_update = False
+                raise RuntimeError("ACP response exceeds the 8 MiB limit")
+            messages.append(dict(message))
+
+        server = ACPStdioServer(_spec(), factory, send)
+        await _send_to(server, messages, _initialize())
+        created = await _send_to(server, messages, _new_session())
+        session_id = created["result"]["sessionId"]
+
+        failed = await _send_to(server, messages, _prompt(3, session_id, "too large"))
+        assert failed["error"] == {
+            "code": -32603,
+            "message": "AgentKit ACP request failed",
+            "data": {"code": "RuntimeError"},
+        }
+        assert server.sessions[session_id].history == []
+        assert runtime.discarded_sessions == [session_id]
+
+        completed = await _send_to(server, messages, _prompt(4, session_id, "recover"))
+        assert completed["result"] == {"stopReason": "end_turn"}
+        assert runtime.requests[1].history == ()
+        await server.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("cancel_method", ["session/cancel", "$/cancel_request"])
+def test_cancellation_while_update_send_waits_does_not_commit_history(
+    monkeypatch,
+    cancel_method: str,
+):
+    _set_provider_environment(monkeypatch)
+    runtime = RecordingRuntime([RunResult("late answer"), RunResult("clean answer")])
+    factory = RecordingFactory(lambda: runtime)
+
+    async def exercise() -> None:
+        messages: list[dict[str, Any]] = []
+        update_started = asyncio.Event()
+        release_update = asyncio.Event()
+
+        async def send(message):  # noqa: ANN001
+            if (
+                message.get("method") == "session/update"
+                and not update_started.is_set()
+            ):
+                update_started.set()
+                await release_update.wait()
+            messages.append(dict(message))
+
+        server = ACPStdioServer(_spec(), factory, send)
+        await _send_to(server, messages, _initialize())
+        created = await _send_to(server, messages, _new_session())
+        session_id = created["result"]["sessionId"]
+
+        await server.accept(_prompt(3, session_id, "cancel during update"))
+        await asyncio.wait_for(update_started.wait(), timeout=1)
+        params = (
+            {"sessionId": session_id}
+            if cancel_method == "session/cancel"
+            else {"requestId": 3}
+        )
+        await server.accept({"jsonrpc": "2.0", "method": cancel_method, "params": params})
+        release_update.set()
+        await server.wait_idle()
+
+        assert _response(messages, 3)["result"] == {"stopReason": "cancelled"}
+        assert server.sessions[session_id].history == []
+        assert runtime.discarded_sessions == [session_id]
+
+        completed = await _send_to(server, messages, _prompt(4, session_id, "try again"))
+        assert completed["result"] == {"stopReason": "end_turn"}
+        assert runtime.requests[1].history == ()
+        await server.close()
+
+    asyncio.run(exercise())
+
+
 def test_prompt_rejects_non_text_content_without_running_model(monkeypatch):
     _set_provider_environment(monkeypatch)
     runtime = RecordingRuntime([RunResult("must not run")])
