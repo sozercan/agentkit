@@ -19,7 +19,7 @@ import sys
 from contextlib import redirect_stdout
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, BinaryIO, Callable, Mapping
+from typing import Any, Awaitable, BinaryIO, Callable, Iterator, Mapping
 from urllib.parse import urlsplit
 
 from .config import AgentSpec
@@ -40,6 +40,11 @@ _METHOD_SESSION_CANCEL = "session/cancel"
 _METHOD_SESSION_UPDATE = "session/update"
 _METHOD_CANCEL_REQUEST = "$/cancel_request"
 _MAX_MESSAGE_BYTES = 8 << 20
+# orka.harness.v2 limits assistant-message chunks to 4 KiB of UTF-8 text.
+# ACP v1 does not negotiate that limit, so the child must apply it before the
+# supervisor maps notifications into harness events. Even worst-case JSON
+# escaping remains well below harness v2's 512 KiB default event-line limit.
+_MAX_ASSISTANT_MESSAGE_CHUNK_BYTES = 4 << 10
 
 _PARSE_ERROR = -32700
 _INVALID_REQUEST = -32600
@@ -115,6 +120,17 @@ async def _discard_runtime_session(runtime: RuntimeSession, session_id: str) -> 
     result = discard(session_id)
     if inspect.isawaitable(result):
         await result
+
+
+def _utf8_chunks(value: str, max_bytes: int) -> Iterator[str]:
+    encoded = value.encode("utf-8")
+    offset = 0
+    while offset < len(encoded):
+        end = min(offset + max_bytes, len(encoded))
+        while end < len(encoded) and encoded[end] & 0xC0 == 0x80:
+            end -= 1
+        yield encoded[offset:end].decode("utf-8")
+        offset = end
 
 
 def _loopback_http_url(value: str, *, name: str) -> str:
@@ -595,7 +611,9 @@ class ACPStdioServer:
             if result is None:
                 raise ACPProtocolError(_INTERNAL_ERROR, "runtime returned no prompt result")
             try:
-                if result.text:
+                for chunk in _utf8_chunks(result.text, _MAX_ASSISTANT_MESSAGE_CHUNK_BYTES):
+                    if state.cancel_requested:
+                        break
                     await self.send(
                         {
                             "jsonrpc": _JSONRPC_VERSION,
@@ -604,7 +622,7 @@ class ACPStdioServer:
                                 "sessionId": session_id,
                                 "update": {
                                     "sessionUpdate": "agent_message_chunk",
-                                    "content": {"type": "text", "text": result.text},
+                                    "content": {"type": "text", "text": chunk},
                                 },
                             },
                         }

@@ -244,6 +244,45 @@ def test_stdio_server_frames_json_rpc_and_closes_on_eof(monkeypatch):
     assert any(message.get("method") == "session/update" for message in output)
 
 
+def test_stdio_server_splits_output_larger_than_orka_acp_reader_limit(monkeypatch):
+    _set_provider_environment(monkeypatch)
+    monkeypatch.setattr(acp.secrets, "token_hex", lambda size: "c" * (size * 2))
+    session_id = "agentkit-" + "c" * 32
+    result_text = "x" * ((2 << 20) + 1)
+    runtime = RecordingRuntime([RunResult(result_text)])
+    requests = [_initialize(), _new_session(), _prompt(3, session_id, "large output")]
+    reader = io.BytesIO(
+        b"".join(
+            json.dumps(request, separators=(",", ":")).encode() + b"\n"
+            for request in requests
+        )
+    )
+    writer = io.BytesIO()
+
+    asyncio.run(
+        acp.serve_acp_stdio(
+            _spec(),
+            RecordingFactory(lambda: runtime),
+            reader=reader,
+            writer=writer,
+        )
+    )
+
+    lines = writer.getvalue().splitlines()
+    output = [json.loads(line) for line in lines]
+    updates = [message for message in output if message.get("method") == "session/update"]
+    chunks = [message["params"]["update"]["content"]["text"] for message in updates]
+
+    assert len(updates) > 1
+    assert "".join(chunks) == result_text
+    assert all(
+        len(chunk.encode()) <= acp._MAX_ASSISTANT_MESSAGE_CHUNK_BYTES  # noqa: SLF001
+        for chunk in chunks
+    )
+    assert all(len(line) < 512 << 10 for line in lines)
+    assert _response(output, 3)["result"] == {"stopReason": "end_turn"}
+
+
 def test_stdio_server_drains_oversized_line_before_parsing_next_frame(monkeypatch):
     monkeypatch.setattr(acp, "_MAX_MESSAGE_BYTES", 1024)
     injected = json.dumps(_initialize(request_id=99), separators=(",", ":")).encode()
@@ -514,6 +553,58 @@ def test_update_send_failure_discards_runtime_state(monkeypatch):
         completed = await _send_to(server, messages, _prompt(4, session_id, "recover"))
         assert completed["result"] == {"stopReason": "end_turn"}
         assert runtime.requests[1].history == ()
+        await server.close()
+
+    asyncio.run(exercise())
+
+
+def test_multibyte_output_is_split_without_partial_commit(monkeypatch):
+    _set_provider_environment(monkeypatch)
+    result_text = "a" + "🙂" * (acp._MAX_ASSISTANT_MESSAGE_CHUNK_BYTES // 4 + 1)  # noqa: SLF001
+    runtime = RecordingRuntime([RunResult(result_text)])
+    factory = RecordingFactory(lambda: runtime)
+
+    async def exercise() -> None:
+        messages: list[dict[str, Any]] = []
+        second_update_started = asyncio.Event()
+        release_second_update = asyncio.Event()
+        update_count = 0
+
+        async def send(message):  # noqa: ANN001
+            nonlocal update_count
+            if message.get("method") == "session/update":
+                update_count += 1
+                if update_count == 2:
+                    second_update_started.set()
+                    await release_second_update.wait()
+            messages.append(dict(message))
+
+        server = ACPStdioServer(_spec(), factory, send)
+        await _send_to(server, messages, _initialize())
+        created = await _send_to(server, messages, _new_session())
+        session_id = created["result"]["sessionId"]
+
+        await server.accept(_prompt(3, session_id, "multibyte output"))
+        await asyncio.wait_for(second_update_started.wait(), timeout=1)
+        updates = [message for message in messages if message.get("method") == "session/update"]
+        assert len(updates) == 1
+        assert server.sessions[session_id].history == []
+
+        release_second_update.set()
+        await server.wait_idle()
+        updates = [message for message in messages if message.get("method") == "session/update"]
+        chunks = [message["params"]["update"]["content"]["text"] for message in updates]
+
+        assert "".join(chunks) == result_text
+        assert [len(chunk.encode()) for chunk in chunks] == [
+            acp._MAX_ASSISTANT_MESSAGE_CHUNK_BYTES - 3,  # noqa: SLF001
+            8,
+        ]
+        assert server.sessions[session_id].history == [
+            ConversationTurn(role="user", text="multibyte output"),
+            ConversationTurn(role="assistant", text=result_text),
+        ]
+        assert _response(messages, 3)["result"] == {"stopReason": "end_turn"}
         await server.close()
 
     asyncio.run(exercise())
