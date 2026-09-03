@@ -10,6 +10,7 @@ frames honestly for Orka to govern upstream.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -17,6 +18,7 @@ from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Awaitable, Callable, Mapping
+from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
@@ -49,12 +51,28 @@ _ENABLE_BROKERED_WRITE_ENV = "AGENTKIT_ORKA_ENABLE_BROKERED_WRITE"
 _ENABLE_BROKERED_COORDINATION_ENV = "AGENTKIT_ORKA_ENABLE_BROKERED_COORDINATION"
 _MAX_TOOL_SCHEMA_BYTES = 65536
 _TERMINAL_TYPES = frozenset({"TurnCompleted", "TurnFailed", "TurnCancelled"})
+# Orka's canonical Go client scans one SSE line with a 1 MiB token ceiling. The
+# advertised payload ceiling deliberately leaves roughly half the line for the
+# native frame envelope and JSON escaping. Runtime text counts encoded UTF-8
+# bytes; brokered values count their compact JSON UTF-8 representation.
+_MAX_OUTPUT_BYTES = 512 * 1024
+_ORKA_CLIENT_MAX_SSE_TOKEN_BYTES = 1 << 20
+_SSE_DATA_PREFIX = "data: "
+_OUTPUT_LIMIT_CODE = "MaxOutputBytesExceeded"
 _DEFAULT_MAX_TERMINAL_TURNS = 256
 _DEFAULT_MAX_RUNTIME_SESSIONS = 64
 _MAX_TERMINAL_TURNS_ENV = "AGENTKIT_ORKA_MAX_TERMINAL_TURNS"
 _MAX_RUNTIME_SESSIONS_ENV = "AGENTKIT_ORKA_MAX_RUNTIME_SESSIONS"
-_TURN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_JSON_VALUE_ABSENT = object()
+# Go net/url.PathEscape leaves these reserved bytes unescaped in a path segment.
+_ORKA_PATH_SEGMENT_SAFE = "$&+-.:=@_~"
+# Mirrors Go strings.TrimSpace/unicode.IsSpace (which excludes U+001C-U+001F).
+_ORKA_TRIM_SPACE_CHARS = (
+    "\t\n\v\f\r \x85\xa0\u1680"
+    "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+    "\u2028\u2029\u202f\u205f\u3000"
+)
 
 
 @dataclass
@@ -95,7 +113,7 @@ class TurnEvent:
     created_at: str = field(default_factory=_now_iso)
     severity: str = "info"
     summary: str = ""
-    content: Mapping[str, Any] | None = None
+    content: Any = _JSON_VALUE_ABSENT
     content_text: str = ""
     completed: Mapping[str, Any] | None = None
     failed: Mapping[str, Any] | None = None
@@ -110,7 +128,7 @@ class TurnEvent:
         return self.type in _TERMINAL_TYPES
 
     def as_frame(self) -> dict[str, Any]:
-        return {
+        frame = {
             "version": ORKA_HARNESS_VERSION,
             "type": self.type,
             "runtimeSessionID": self.runtime_session_id,
@@ -120,7 +138,6 @@ class TurnEvent:
             "createdAt": self.created_at,
             "severity": self.severity,
             "summary": self.summary,
-            "content": dict(self.content or {}),
             "contentText": self.content_text,
             "toolName": self.tool_name,
             "toolCallID": self.tool_call_id,
@@ -130,13 +147,77 @@ class TurnEvent:
             "error": dict(self.error) if self.error is not None else None,
             "metadata": dict(self.metadata),
         }
+        if self.content is not _JSON_VALUE_ABSENT:
+            frame["content"] = self.content
+        return frame
+
+
+class _SSEFrameTooLargeError(ValueError):
+    pass
+
+
+class _SSEFrameEncodingError(ValueError):
+    pass
+
+
+def _frame_json(event: TurnEvent) -> str:
+    return json.dumps(event.as_frame(), ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _compact_json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+
+
+def _json_snapshot(value: Any) -> Any:
+    return json.loads(_compact_json_bytes(value))
+
+
+def _sse_data_line_bytes(event: TurnEvent) -> int:
+    return len(_SSE_DATA_PREFIX.encode()) + len(_frame_json(event).encode())
+
+
+def _ensure_sse_frame_fits(event: TurnEvent) -> None:
+    try:
+        line_bytes = _sse_data_line_bytes(event)
+    except UnicodeEncodeError as exc:
+        raise _SSEFrameEncodingError(f"{event.type} contains text that is not valid UTF-8") from exc
+    if line_bytes >= _ORKA_CLIENT_MAX_SSE_TOKEN_BYTES:
+        raise _SSEFrameTooLargeError(
+            f"{event.type} SSE data line is {line_bytes} UTF-8 bytes; "
+            f"Orka client limit is {_ORKA_CLIENT_MAX_SSE_TOKEN_BYTES - 1}"
+        )
+
+
+def _ensure_terminal_frame_fits(state: "TurnState") -> None:
+    # Reserve ample room for deterministic failure detail even when identity
+    # fields are unusually long.
+    message = "x" * 1024
+    _ensure_sse_frame_fits(
+        TurnEvent(
+            seq=9_223_372_036_854_775_807,
+            type="TurnFailed",
+            runtime_session_id=state.runtime_session_id,
+            turn_id=state.turn_id,
+            correlation_id=state.correlation_id,
+            severity="error",
+            summary="turn output rejected",
+            failed={"reason": _OUTPUT_LIMIT_CODE, "message": message, "retryable": False},
+            error={"code": _OUTPUT_LIMIT_CODE, "message": message, "retryable": False},
+            metadata={},
+        )
+    )
 
 
 @dataclass
 class PendingBrokeredTool:
     call: BrokeredToolCall
     future: asyncio.Future[BrokeredToolResult]
-    accepted_result: BrokeredToolResult | None = None
 
 
 class TurnState:
@@ -168,6 +249,77 @@ class TurnState:
         self.condition = asyncio.Condition()
         self.terminal_event: TurnEvent | None = None
         self.pending_tools: dict[str, PendingBrokeredTool] = {}
+        # Preserve idempotent /continue replay without retaining a second copy of
+        # each potentially large accepted tool result.
+        self.accepted_tool_result_digests: dict[str, str] = {}
+        self.rejected_tool_result_digests: dict[str, tuple[str, str, str]] = {}
+
+    def _append_locked(
+        self,
+        event_type: str,
+        *,
+        severity: str = "info",
+        summary: str = "",
+        content: Any = _JSON_VALUE_ABSENT,
+        content_text: str = "",
+        completed: Mapping[str, Any] | None = None,
+        failed: Mapping[str, Any] | None = None,
+        error: Mapping[str, Any] | None = None,
+        tool_name: str = "",
+        tool_call_id: str = "",
+        approval_id: str = "",
+        metadata: Mapping[str, str] | None = None,
+    ) -> tuple[TurnEvent, bool]:
+        if self.terminal_event is not None:
+            if event_type in _TERMINAL_TYPES:
+                return self.terminal_event, False
+            raise AgentRunError("turn is already terminal", status=409, code="TurnTerminal")
+        seq = len(self.events) + 1
+        if event_type == "TurnCompleted":
+            completed = dict(completed or {})
+            completed.setdefault("finalEventSeq", seq)
+        event = TurnEvent(
+            seq=seq,
+            type=event_type,
+            runtime_session_id=self.runtime_session_id,
+            turn_id=self.turn_id,
+            correlation_id=self.correlation_id,
+            severity=severity,
+            summary=summary,
+            content=content,
+            content_text=content_text,
+            completed=completed,
+            failed=failed,
+            error=error,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            approval_id=approval_id,
+            metadata=self.metadata if metadata is None else metadata,
+        )
+        try:
+            _ensure_sse_frame_fits(event)
+        except (_SSEFrameTooLargeError, _SSEFrameEncodingError):
+            if event_type != "TurnFailed":
+                raise
+            message = "terminal failure details could not be emitted safely"
+            event = TurnEvent(
+                seq=seq,
+                type="TurnFailed",
+                runtime_session_id=self.runtime_session_id,
+                turn_id=self.turn_id,
+                correlation_id=self.correlation_id,
+                severity="error",
+                summary="turn failed",
+                failed={"reason": "TerminalFrameRejected", "message": message, "retryable": False},
+                error={"code": "TerminalFrameRejected", "message": message, "retryable": False},
+                metadata={},
+            )
+            _ensure_sse_frame_fits(event)
+        self.events.append(event)
+        if event.terminal:
+            self.terminal_event = event
+        self.condition.notify_all()
+        return event, True
 
     async def append(
         self,
@@ -175,7 +327,7 @@ class TurnState:
         *,
         severity: str = "info",
         summary: str = "",
-        content: Mapping[str, Any] | None = None,
+        content: Any = _JSON_VALUE_ABSENT,
         content_text: str = "",
         completed: Mapping[str, Any] | None = None,
         failed: Mapping[str, Any] | None = None,
@@ -186,18 +338,8 @@ class TurnState:
         metadata: Mapping[str, str] | None = None,
     ) -> tuple[TurnEvent, bool]:
         async with self.condition:
-            if event_type in _TERMINAL_TYPES and self.terminal_event is not None:
-                return self.terminal_event, False
-            seq = len(self.events) + 1
-            if event_type == "TurnCompleted":
-                completed = dict(completed or {})
-                completed.setdefault("finalEventSeq", seq)
-            event = TurnEvent(
-                seq=seq,
-                type=event_type,
-                runtime_session_id=self.runtime_session_id,
-                turn_id=self.turn_id,
-                correlation_id=self.correlation_id,
+            return self._append_locked(
+                event_type,
                 severity=severity,
                 summary=summary,
                 content=content,
@@ -208,13 +350,8 @@ class TurnState:
                 tool_name=tool_name,
                 tool_call_id=tool_call_id,
                 approval_id=approval_id,
-                metadata=metadata or self.metadata,
+                metadata=metadata,
             )
-            self.events.append(event)
-            if event.terminal:
-                self.terminal_event = event
-            self.condition.notify_all()
-            return event, True
 
     async def events_after(self, seq: int) -> list[TurnEvent]:
         async with self.condition:
@@ -319,6 +456,7 @@ async def _append_terminal_if_missing(
         completed=completed,
         failed=failed,
         error=error,
+        metadata={},
     )
     if created:
         _record_terminal_turn(state.turn_id, terminal_order, turns, max_terminal_turns)
@@ -364,7 +502,7 @@ def _ensure_terminal_on_task_done(
 
 
 def _sse_frame(event: TurnEvent) -> str:
-    data = json.dumps(event.as_frame(), separators=(",", ":"), sort_keys=True)
+    data = _frame_json(event)
     return f"id: {event.seq}\nevent: {event.type}\ndata: {data}\n\n"
 
 
@@ -383,13 +521,18 @@ def _required_string(data: Mapping[str, Any], field_name: str) -> str:
 
 
 def _turn_id_from_payload(data: Mapping[str, Any]) -> str:
-    turn_id = _required_string(data, "turnID")
-    if not _TURN_ID_RE.fullmatch(turn_id):
+    value = data.get("turnID")
+    if not isinstance(value, str):
+        raise HTTPException(status_code=400, detail="turnID is required")
+    trimmed = value.strip(_ORKA_TRIM_SPACE_CHARS)
+    if not trimmed:
+        raise HTTPException(status_code=400, detail="turnID is required")
+    if value != trimmed or value in {".", ".."} or "/" in value or "\\" in value:
         raise HTTPException(
             status_code=400,
-            detail="turnID must be URL-safe: letters, numbers, '.', '_', or '-'",
+            detail="turnID must be a single safe path segment without surrounding whitespace",
         )
-    return turn_id
+    return value
 
 
 def _mapping_of_strings(data: Any, *, field_name: str) -> dict[str, str]:
@@ -626,6 +769,59 @@ def _usage_payload(result: RunResult) -> dict[str, int]:
     return {key: int(usage.get(key, 0) or 0) for key in sorted(usage)}
 
 
+def _utf8_bytes(value: str) -> int:
+    return len(value.encode())
+
+
+def _output_limit_message(output_kind: str, actual_bytes: int) -> str:
+    return f"{output_kind} is {actual_bytes} UTF-8 bytes; maxOutputBytes is {_MAX_OUTPUT_BYTES}"
+
+
+def _brokered_result_digest(result: BrokeredToolResult) -> str:
+    value: dict[str, Any] = {
+        "approved": result.approved,
+        "outputPresent": result.output_present,
+    }
+    if result.output_present:
+        value["output"] = result.output
+    if result.error is not None:
+        value["error"] = dict(result.error)
+    return hashlib.sha256(_compact_json_bytes(value)).hexdigest()
+
+
+async def _append_output_failure(
+    state: TurnState,
+    terminal_order: list[str],
+    turns: dict[str, TurnState],
+    max_terminal_turns: int,
+    *,
+    message: str,
+    code: str = _OUTPUT_LIMIT_CODE,
+) -> None:
+    await _append_terminal_if_missing(
+        state,
+        terminal_order,
+        turns,
+        max_terminal_turns,
+        "TurnFailed",
+        summary="turn output rejected",
+        failed={"reason": code, "message": message, "retryable": False},
+        error={"code": code, "message": message, "retryable": False},
+    )
+
+
+def _append_output_failure_locked(state: TurnState, message: str, code: str) -> bool:
+    _, created = state._append_locked(
+        "TurnFailed",
+        severity="error",
+        summary="turn output rejected",
+        failed={"reason": code, "message": message, "retryable": False},
+        error={"code": code, "message": message, "retryable": False},
+        metadata={},
+    )
+    return created
+
+
 def health_response(spec: AgentSpec) -> dict[str, Any]:
     return {
         "version": ORKA_HARNESS_VERSION,
@@ -650,6 +846,7 @@ def capabilities_response(spec: AgentSpec, *, brokered_classes: set[str] | None 
         "supportsSuspend": False,
         "supportsWorkspaceSnapshot": False,
         "maxConcurrentTurns": 1,
+        "maxOutputBytes": _MAX_OUTPUT_BYTES,
         "metadata": {
             "agentName": spec.metadata.name,
             "model": spec.model.name,
@@ -675,7 +872,7 @@ def start_turn_response(turn: TurnState) -> dict[str, Any]:
         "runtimeSessionID": turn.runtime_session_id,
         "turnID": turn.turn_id,
         "correlationID": turn.correlation_id,
-        "eventStreamPath": f"/v1/turns/{turn.turn_id}/events",
+        "eventStreamPath": f"/v1/turns/{quote(turn.turn_id, safe=_ORKA_PATH_SEGMENT_SAFE)}/events",
     }
 
 
@@ -729,31 +926,42 @@ class OrkaToolBroker:
             if call.tool_call_id in self.state.pending_tools:
                 raise AgentRunError(f"duplicate brokered tool call id {call.tool_call_id!r}", status=400, code="DuplicateToolCallID")
             future: asyncio.Future[BrokeredToolResult] = asyncio.get_running_loop().create_future()
-            self.state.pending_tools[call.tool_call_id] = PendingBrokeredTool(call=call, future=future)
-        await self.state.append(
-            "ToolCallRequested",
-            summary="brokered tool requested",
-            content=arguments,
-            tool_name=call.name,
-            tool_call_id=call.tool_call_id,
-        )
-        if self.state.deadline is None:
-            result = await future
-        else:
-            seconds = (self.state.deadline - datetime.now(UTC)).total_seconds()
-            if seconds <= 0:
-                raise TimeoutError("turn deadline exceeded while waiting for brokered tool result")
-            async with asyncio.timeout(seconds):
+            pending = PendingBrokeredTool(call=call, future=future)
+            self.state.pending_tools[call.tool_call_id] = pending
+        try:
+            await self.state.append(
+                "ToolCallRequested",
+                summary="brokered tool requested",
+                content=arguments,
+                tool_name=call.name,
+                tool_call_id=call.tool_call_id,
+                metadata={},
+            )
+            if self.state.deadline is None:
                 result = await future
-        await self.state.append(
-            "ToolResultReceived",
-            summary="tool result received",
-            content=dict(result.output or {}),
-            error=dict(result.error) if result.error is not None else None,
-            tool_name=call.name,
-            tool_call_id=call.tool_call_id,
-        )
-        return result
+            else:
+                seconds = (self.state.deadline - datetime.now(UTC)).total_seconds()
+                if seconds <= 0:
+                    raise TimeoutError("turn deadline exceeded while waiting for brokered tool result")
+                async with asyncio.timeout(seconds):
+                    result = await future
+            await self.state.append(
+                "ToolResultReceived",
+                summary="tool result received",
+                content=_json_snapshot(result.output) if result.output_present else _JSON_VALUE_ABSENT,
+                error=_json_snapshot(dict(result.error)) if result.error is not None else None,
+                tool_name=call.name,
+                tool_call_id=call.tool_call_id,
+                metadata={},
+            )
+            return result
+        finally:
+            async with self.state.condition:
+                if self.state.pending_tools.get(call.tool_call_id) is pending:
+                    self.state.pending_tools.pop(call.tool_call_id, None)
+                if not future.done():
+                    future.cancel()
+                self.state.condition.notify_all()
 
 
 async def _run_turn(
@@ -833,22 +1041,56 @@ async def _run_turn(
         )
         return
 
-    if result.text:
-        await state.append(
-            "RuntimeOutput",
-            summary="runtime output",
-            content={"message": result.text, "usage": _usage_payload(result)},
-            content_text=result.text,
+    try:
+        output_bytes = _utf8_bytes(result.text)
+    except UnicodeEncodeError:
+        await _append_output_failure(
+            state,
+            terminal_order,
+            turns,
+            max_terminal_turns,
+            message="runtime output is not valid UTF-8",
+            code="InvalidOutputEncoding",
         )
-    await _append_terminal_if_missing(
-        state,
-        terminal_order,
-        turns,
-        max_terminal_turns,
-        "TurnCompleted",
-        summary="turn completed",
-        completed={"result": result.text},
-    )
+        return
+    if output_bytes > _MAX_OUTPUT_BYTES:
+        await _append_output_failure(
+            state,
+            terminal_order,
+            turns,
+            max_terminal_turns,
+            message=_output_limit_message("runtime output", output_bytes),
+        )
+        return
+    try:
+        if result.text:
+            await state.append(
+                "RuntimeOutput",
+                summary="runtime output",
+                # contentText is the native text channel; keep only structured
+                # usage in content so one SSE frame does not duplicate the text.
+                content={"usage": _usage_payload(result)},
+                content_text=result.text,
+                metadata={},
+            )
+        await _append_terminal_if_missing(
+            state,
+            terminal_order,
+            turns,
+            max_terminal_turns,
+            "TurnCompleted",
+            summary="turn completed",
+            completed={"result": result.text},
+        )
+    except _SSEFrameTooLargeError as exc:
+        await _append_output_failure(
+            state,
+            terminal_order,
+            turns,
+            max_terminal_turns,
+            message=str(exc),
+            code="HarnessFrameTooLarge",
+        )
 
 
 def create_orka_app(
@@ -882,6 +1124,120 @@ def create_orka_app(
     active_runtimes: dict[str, ActiveRuntime] = {}
     runtime_order: list[str] = []
     background_tasks: set[asyncio.Task[None]] = set()
+    runtime_close_tasks: set[asyncio.Task[BaseException | None]] = set()
+    runtime_close_tasks_by_session: dict[str, asyncio.Task[BaseException | None]] = {}
+    runtime_close_failed = False
+
+    async def run_runtime_close(active: ActiveRuntime) -> BaseException | None:
+        try:
+            await active.context.__aexit__(None, None, None)
+        except BaseException as exc:
+            return exc
+        return None
+
+    def runtime_close_error(close_task: asyncio.Task[BaseException | None]) -> BaseException | None:
+        try:
+            return close_task.result()
+        except BaseException as exc:
+            return exc
+
+    def record_runtime_close_failure(close_error: BaseException | None) -> None:
+        nonlocal runtime_close_failed
+        if close_error is not None:
+            # Do not retain exception text or tracebacks across turns: adapter
+            # cleanup errors may contain prior-turn URLs, headers, or env data.
+            runtime_close_failed = True
+
+    def new_runtime_close_failure() -> AgentRunError | None:
+        if not runtime_close_failed:
+            return None
+        return AgentRunError(
+            "runtime cleanup failed; restart required before opening another runtime session",
+            status=500,
+            code="RuntimeCloseFailed",
+        )
+
+    def runtime_close_done(runtime_session_id: str, close_task: asyncio.Task[BaseException | None]) -> None:
+        runtime_close_tasks.discard(close_task)
+        if runtime_close_tasks_by_session.get(runtime_session_id) is close_task:
+            runtime_close_tasks_by_session.pop(runtime_session_id, None)
+        # Retrieve every result even when the awaiting caller was cancelled,
+        # and fail closed after any cleanup error because framework resources
+        # may still occupy the configured runtime-session capacity.
+        record_runtime_close_failure(runtime_close_error(close_task))
+
+    async def close_runtime(runtime_session_id: str, active: ActiveRuntime) -> None:
+        close_task = asyncio.create_task(run_runtime_close(active), name="agentkit-orka-runtime-close")
+        runtime_close_tasks.add(close_task)
+        runtime_close_tasks_by_session[runtime_session_id] = close_task
+        close_task.add_done_callback(lambda task: runtime_close_done(runtime_session_id, task))
+        try:
+            # asyncio.wait does not forward cancellation to the supplied task.
+            # Unlike an abandoned shield future, it also leaves no wrapper that
+            # can report a late close failure before shutdown retrieves it.
+            await asyncio.wait((close_task,))
+        except asyncio.CancelledError:
+            # The runtime has already been removed from active ownership. Keep
+            # the close task rooted so turn cancellation cannot orphan cleanup;
+            # lifespan shutdown will await it if the caller cannot.
+            raise
+        close_error = runtime_close_error(close_task)
+        record_runtime_close_failure(close_error)
+        if close_error is not None:
+            close_failure = new_runtime_close_failure()
+            if close_failure is None:  # pragma: no cover - record above establishes the invariant.
+                raise RuntimeError("runtime cleanup failed") from None
+            raise close_failure from None
+
+    async def drain_runtime_close_tasks() -> list[BaseException]:
+        while runtime_close_tasks:
+            closing = list(runtime_close_tasks)
+            await asyncio.gather(*closing, return_exceptions=True)
+            runtime_close_tasks.difference_update(closing)
+            for close_task in closing:
+                record_runtime_close_failure(runtime_close_error(close_task))
+        runtime_close_tasks_by_session.clear()
+        close_failure = new_runtime_close_failure()
+        return [close_failure] if close_failure is not None else []
+
+    async def wait_for_runtime_session_close(runtime_session_id: str) -> None:
+        while close_task := runtime_close_tasks_by_session.get(runtime_session_id):
+            await asyncio.wait((close_task,))
+            runtime_close_tasks.discard(close_task)
+            if runtime_close_tasks_by_session.get(runtime_session_id) is close_task:
+                runtime_close_tasks_by_session.pop(runtime_session_id, None)
+            record_runtime_close_failure(runtime_close_error(close_task))
+
+    async def wait_for_runtime_close_progress() -> None:
+        closing = tuple(runtime_close_tasks)
+        if not closing:
+            return
+        done, _ = await asyncio.wait(closing, return_when=asyncio.FIRST_COMPLETED)
+        runtime_close_tasks.difference_update(done)
+        for close_task in done:
+            record_runtime_close_failure(runtime_close_error(close_task))
+
+    async def reserve_runtime_slot() -> None:
+        # create_turn enforces the advertised maxConcurrentTurns=1, and a turn
+        # publishes its terminal event only after it has stopped opening a
+        # runtime. Runtime admission is therefore serialized at this seam.
+        while True:
+            if close_failure := new_runtime_close_failure():
+                # A failed close may still own framework resources. Keep the
+                # cache fail-closed instead of treating that slot as reusable.
+                raise close_failure
+            if len(active_runtimes) + len(runtime_close_tasks) < runtime_session_limit:
+                return
+            if runtime_close_tasks:
+                # A removed runtime still owns framework resources until its
+                # close task finishes. Count it against cache capacity so
+                # repeated cancelled turns cannot build an unbounded backlog.
+                await wait_for_runtime_close_progress()
+                continue
+            evict_id = runtime_order.pop(0)
+            evicted = active_runtimes.pop(evict_id, None)
+            if evicted is not None:
+                await close_runtime(evict_id, evicted)
 
     async def get_runtime(run_request: RunRequest) -> Any:
         runtime_session_id = run_request.session_id or ""
@@ -892,10 +1248,14 @@ def create_orka_app(
                     runtime_order.remove(runtime_session_id)
                 runtime_order.append(runtime_session_id)
                 return active.session
+            if close_failure := new_runtime_close_failure():
+                raise close_failure
             active_runtimes.pop(runtime_session_id, None)
             if runtime_session_id in runtime_order:
                 runtime_order.remove(runtime_session_id)
-            await asyncio.shield(active.context.__aexit__(None, None, None))
+            await close_runtime(runtime_session_id, active)
+        await wait_for_runtime_session_close(runtime_session_id)
+        await reserve_runtime_slot()
         # Runtime factories read the process environment today. Keep this scoped
         # section on the event loop thread so cancellation cannot leave a worker
         # thread running with turn credentials in process-global os.environ.
@@ -904,11 +1264,6 @@ def create_orka_app(
             session = await context.__aenter__()
         active_runtimes[runtime_session_id] = ActiveRuntime(context=context, session=session, env=dict(run_request.env))
         runtime_order.append(runtime_session_id)
-        while len(runtime_order) > runtime_session_limit:
-            evict_id = runtime_order.pop(0)
-            evicted = active_runtimes.pop(evict_id, None)
-            if evicted is not None:
-                await evicted.context.__aexit__(None, None, None)
         return session
 
     @asynccontextmanager
@@ -918,18 +1273,26 @@ def create_orka_app(
         try:
             yield
         finally:
-            for state in turns.values():
-                if state.task is not None and not state.task.done():
-                    state.task.cancel()
-            for task in list(background_tasks):
+            active_turn_tasks = [state.task for state in turns.values() if state.task is not None and not state.task.done()]
+            for task in active_turn_tasks:
                 task.cancel()
-            if background_tasks:
-                await asyncio.gather(*background_tasks, return_exceptions=True)
+            if active_turn_tasks:
+                await asyncio.gather(*active_turn_tasks, return_exceptions=True)
+            while background_tasks:
+                terminal_tasks = list(background_tasks)
+                await asyncio.gather(*terminal_tasks, return_exceptions=True)
+                background_tasks.difference_update(terminal_tasks)
             background_tasks.clear()
+            close_errors = await drain_runtime_close_tasks()
             for active in reversed(list(active_runtimes.values())):
-                await active.context.__aexit__(None, None, None)
+                try:
+                    await active.context.__aexit__(None, None, None)
+                except BaseException as exc:
+                    close_errors.append(exc)
             active_runtimes.clear()
             runtime_order.clear()
+            if close_errors:
+                raise close_errors[0]
 
     app = FastAPI(title="agentkit-serve-orka", lifespan=lifespan)
     auth = Depends(make_auth_dependency(auth_token))
@@ -977,8 +1340,14 @@ def create_orka_app(
             deadline=run_request.deadline,
             metadata=run_request.metadata,
         )
+        try:
+            await state.append("TurnStarted", summary="turn started")
+            _ensure_terminal_frame_fits(state)
+        except _SSEFrameTooLargeError as exc:
+            raise HTTPException(status_code=413, detail=str(exc)) from exc
+        except _SSEFrameEncodingError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         turns[turn_id] = state
-        await state.append("TurnStarted", summary="turn started")
         state.task = asyncio.create_task(
             _run_turn(
                 get_runtime,
@@ -1062,7 +1431,7 @@ def create_orka_app(
         raw_results = data.get("toolResults")
         if not isinstance(raw_results, list) or not raw_results:
             raise HTTPException(status_code=400, detail="toolResults must be a non-empty array")
-        results: list[BrokeredToolResult] = []
+        results: list[tuple[BrokeredToolResult, int, str]] = []
         for idx, raw_result in enumerate(raw_results):
             if not isinstance(raw_result, dict):
                 raise HTTPException(status_code=400, detail=f"toolResults[{idx}] must be an object")
@@ -1080,54 +1449,155 @@ def create_orka_app(
             approved = raw_result.get("approved", False)
             if not isinstance(approved, bool):
                 raise HTTPException(status_code=400, detail=f"toolResults[{idx}].approved must be a boolean")
+            output_present = "output" in raw_result
             output_value = raw_result.get("output")
             error_value = raw_result.get("error")
-            if not approved and output_value is not None:
+            if not approved and output_present:
                 raise HTTPException(status_code=400, detail=f"toolResults[{idx}].output is not allowed when approved is false")
-            if output_value is None and error_value is None:
+            if not output_present and error_value is None:
                 if approved:
                     raise HTTPException(status_code=400, detail=f"toolResults[{idx}] output or error is required")
                 error_value = {"code": "ToolCallDenied", "message": "tool call was not approved", "retryable": False}
-            if output_value is not None and not isinstance(output_value, dict):
-                raise HTTPException(status_code=400, detail=f"toolResults[{idx}].output must be an object")
             if error_value is not None and not isinstance(error_value, dict):
                 raise HTTPException(status_code=400, detail=f"toolResults[{idx}].error must be an object")
-            results.append(
-                BrokeredToolResult(
-                    tool_call_id=tool_call_id,
-                    approved=approved,
-                    output=dict(output_value) if output_value is not None else None,
-                    error=dict(error_value) if error_value is not None else None,
-                )
-            )
+            try:
+                output_bytes = len(_compact_json_bytes(output_value)) if output_present else 0
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail=f"toolResults[{idx}].output must be valid JSON") from exc
+            result_kwargs: dict[str, Any] = {
+                "tool_call_id": tool_call_id,
+                "approved": approved,
+                "error": dict(error_value) if error_value is not None else None,
+            }
+            if output_present:
+                result_kwargs["output"] = output_value
+            result = BrokeredToolResult(**result_kwargs)
+            try:
+                digest = _brokered_result_digest(result)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail=f"toolResults[{idx}] must be valid JSON") from exc
+            results.append((result, output_bytes, digest))
+
+        seen_results: set[str] = set()
+        for result, _, _ in results:
+            if result.tool_call_id in seen_results:
+                raise HTTPException(status_code=400, detail=f"duplicate toolCallID {result.tool_call_id!r}")
+            seen_results.add(result.tool_call_id)
+
+        rejection_message: str | None = None
+        rejection_code = _OUTPUT_LIMIT_CODE
+        cancel_runtime_task = False
         async with state.condition:
             if state.terminal_event is not None:
-                known_done = all(
-                    result.tool_call_id in state.pending_tools
-                    and state.pending_tools[result.tool_call_id].accepted_result == result
-                    for result in results
-                )
-                if known_done:
+                rejected_outcomes: set[tuple[str, str]] = set()
+                for result, _, digest in results:
+                    accepted_digest = state.accepted_tool_result_digests.get(result.tool_call_id)
+                    if accepted_digest is not None:
+                        if accepted_digest != digest:
+                            raise HTTPException(
+                                status_code=409,
+                                detail=f"conflicting tool result for toolCallID {result.tool_call_id!r}",
+                            )
+                        continue
+                    rejected = state.rejected_tool_result_digests.get(result.tool_call_id)
+                    if rejected is None:
+                        raise HTTPException(status_code=409, detail="turn is already terminal")
+                    rejected_digest, message, code = rejected
+                    if rejected_digest != digest:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=f"conflicting tool result for toolCallID {result.tool_call_id!r}",
+                        )
+                    rejected_outcomes.add((message, code))
+                if not rejected_outcomes:
                     return continue_turn_response(state)
-                raise HTTPException(status_code=409, detail="turn is already terminal")
-            seen_results: set[str] = set()
-            pending_results: list[tuple[PendingBrokeredTool, BrokeredToolResult]] = []
-            for result in results:
-                if result.tool_call_id in seen_results:
-                    raise HTTPException(status_code=400, detail=f"duplicate toolCallID {result.tool_call_id!r}")
-                seen_results.add(result.tool_call_id)
-                pending = state.pending_tools.get(result.tool_call_id)
-                if pending is None:
-                    raise HTTPException(status_code=400, detail=f"unknown toolCallID {result.tool_call_id!r}")
-                if pending.accepted_result is not None and pending.accepted_result != result:
-                    raise HTTPException(status_code=409, detail=f"conflicting tool result for toolCallID {result.tool_call_id!r}")
-                pending_results.append((pending, result))
-            for pending, result in pending_results:
-                if pending.accepted_result is None:
-                    pending.accepted_result = result
-                if not pending.future.done():
-                    pending.future.set_result(result)
-            state.condition.notify_all()
+                if len(rejected_outcomes) != 1:
+                    raise HTTPException(status_code=409, detail="tool results do not match one rejected continuation")
+                rejection_message, rejection_code = rejected_outcomes.pop()
+
+            pending_results: list[tuple[PendingBrokeredTool, BrokeredToolResult, str]] = []
+            if state.terminal_event is None:
+                fresh_results: list[tuple[PendingBrokeredTool, BrokeredToolResult, int, str]] = []
+                # Validate every identity and accepted-result digest before any
+                # oversized member can terminalize the whole continuation batch.
+                for result, output_bytes, digest in results:
+                    accepted_digest = state.accepted_tool_result_digests.get(result.tool_call_id)
+                    if accepted_digest is not None:
+                        if accepted_digest != digest:
+                            raise HTTPException(
+                                status_code=409,
+                                detail=f"conflicting tool result for toolCallID {result.tool_call_id!r}",
+                            )
+                        continue
+                    pending = state.pending_tools.get(result.tool_call_id)
+                    if pending is None:
+                        raise HTTPException(status_code=400, detail=f"unknown toolCallID {result.tool_call_id!r}")
+                    fresh_results.append((pending, result, output_bytes, digest))
+
+                rejection_candidates: list[tuple[str, str, str]] = []
+                for pending, result, output_bytes, digest in fresh_results:
+                    if output_bytes > _MAX_OUTPUT_BYTES:
+                        rejection_candidates.append(
+                            (
+                                result.tool_call_id,
+                                _output_limit_message("brokered tool output", output_bytes),
+                                _OUTPUT_LIMIT_CODE,
+                            )
+                        )
+                        continue
+                    candidate = TurnEvent(
+                        # Preflight with the widest native int64 sequence so an
+                        # in-flight event cannot add a digit after HTTP 202.
+                        seq=9_223_372_036_854_775_807,
+                        type="ToolResultReceived",
+                        runtime_session_id=state.runtime_session_id,
+                        turn_id=state.turn_id,
+                        correlation_id=state.correlation_id,
+                        summary="tool result received",
+                        content=result.output if result.output_present else _JSON_VALUE_ABSENT,
+                        error=dict(result.error) if result.error is not None else None,
+                        tool_name=pending.call.name,
+                        tool_call_id=result.tool_call_id,
+                        metadata={},
+                    )
+                    try:
+                        _ensure_sse_frame_fits(candidate)
+                    except _SSEFrameTooLargeError as exc:
+                        rejection_candidates.append((result.tool_call_id, str(exc), "HarnessFrameTooLarge"))
+                        continue
+                    pending_results.append((pending, result, digest))
+                if rejection_candidates:
+                    _, rejection_message, rejection_code = min(rejection_candidates)
+
+            if rejection_message is None and state.terminal_event is None:
+                for pending, result, digest in pending_results:
+                    state.accepted_tool_result_digests[result.tool_call_id] = digest
+                    if not pending.future.done():
+                        pending.future.set_result(result)
+                state.condition.notify_all()
+            elif state.terminal_event is None:
+                for result, _, digest in results:
+                    if result.tool_call_id not in state.accepted_tool_result_digests:
+                        state.rejected_tool_result_digests[result.tool_call_id] = (
+                            digest,
+                            rejection_message,
+                            rejection_code,
+                        )
+                created = _append_output_failure_locked(state, rejection_message, rejection_code)
+                if created:
+                    _record_terminal_turn(state.turn_id, terminal_order, turns, retention_limit)
+                pending = list(state.pending_tools.values())
+                state.pending_tools.clear()
+                for item in pending:
+                    if not item.future.done():
+                        item.future.cancel()
+                state.condition.notify_all()
+                cancel_runtime_task = state.task is not None and not state.task.done()
+
+        if rejection_message is not None:
+            if cancel_runtime_task and state.task is not None and state.task is not asyncio.current_task():
+                state.task.cancel()
+            raise HTTPException(status_code=413, detail=rejection_message)
         return continue_turn_response(state)
 
 
@@ -1146,8 +1616,9 @@ def create_orka_app(
             raise HTTPException(status_code=400, detail="cancel turnID must match route turnID")
         runtime_session_id = _required_string(data, "runtimeSessionID")
         correlation_id = _required_string(data, "correlationID")
-        for field_name in ("namespace", "taskName", "sessionName"):
-            _required_string(data, field_name)
+        namespace = _required_string(data, "namespace")
+        task_name = _required_string(data, "taskName")
+        session_name = _required_string(data, "sessionName")
 
         state = turns.get(turn_id)
         if state is None:
@@ -1156,6 +1627,8 @@ def create_orka_app(
             raise HTTPException(status_code=400, detail="cancel runtimeSessionID must match turn runtimeSessionID")
         if correlation_id != state.correlation_id:
             raise HTTPException(status_code=400, detail="cancel correlationID must match turn correlationID")
+        if namespace != state.namespace or task_name != state.task_name or session_name != state.session_name:
+            raise HTTPException(status_code=400, detail="cancel namespace/taskName/sessionName must match turn")
         if state.terminal_event is None and state.task is not None and not state.task.done():
             state.task.cancel()
         elif state.terminal_event is None:

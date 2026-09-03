@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from types import TracebackType
 
 from fastapi.testclient import TestClient
@@ -7,7 +9,7 @@ from fastapi.testclient import TestClient
 from agentkit_serve_common.config import AgentSpec
 from agentkit_serve_common.conversation import RunRequest
 from agentkit_serve_common.foundry import create_foundry_app
-from agentkit_serve_common.runtime import RunResult, RuntimeSession
+from agentkit_serve_common.runtime import AgentRunError, RunResult, RuntimeSession
 
 
 def _spec() -> AgentSpec:
@@ -98,20 +100,144 @@ def test_foundry_responses_tolerates_stream_flag_with_non_streaming_response():
     assert resp.json()["output"][0]["content"][0]["text"] == "echo: hi"
 
 
-def test_foundry_invocations_enforces_request_body_limit_before_runtime():
+def test_foundry_non_brokered_routes_reject_oversized_streamed_request_before_runtime():
     factory = EchoFactory()
     app = create_foundry_app(_spec(), factory, max_request_body_bytes=64)
+    headers = {"content-type": "application/json"}
+
+    with TestClient(app) as client:
+        invocation = client.post(
+            "/invocations",
+            headers=headers,
+            content=iter([b'{"message":"', b"x" * 128, b'"}']),
+        )
+        response = client.post(
+            "/responses",
+            headers=headers,
+            content=iter([b'{"input":"', b"x" * 128, b'"}']),
+        )
+
+    expected = {
+        "message": "Foundry request body is too large",
+        "code": "request_too_large",
+    }
+    assert invocation.status_code == 413
+    assert invocation.json()["error"] == expected
+    assert response.status_code == 413
+    assert response.json()["error"] == expected
+    assert factory.runtime.requests == []
+
+
+def test_foundry_non_brokered_request_limit_can_be_configured_from_environment(monkeypatch):
+    monkeypatch.setenv("AGENTKIT_FOUNDRY_REQUEST_BODY_MAX_BYTES", "64")
+    factory = EchoFactory()
+    app = create_foundry_app(_spec(), factory)
 
     with TestClient(app) as client:
         response = client.post(
-            "/invocations",
-            content='{"message":"' + ("x" * 128) + '"}',
+            "/responses",
             headers={"content-type": "application/json"},
+            content=b'{"input":"' + b"x" * 128 + b'"}',
         )
 
     assert response.status_code == 413
-    assert "too large" in response.text
+    assert response.json()["error"]["code"] == "request_too_large"
     assert factory.runtime.requests == []
+
+
+def test_foundry_non_brokered_runtime_5xx_is_logged_but_public_response_is_sanitized(caplog):
+    marker = "INTERNAL_RUNTIME_FAILURE_MARKER"
+    internal_url = "https://private-runtime.internal.example/v1"
+
+    class FailingRuntime(EchoRuntime):
+        async def run(self, request: RunRequest) -> RunResult:
+            self.requests.append(request)
+            raise AgentRunError(
+                f"provider request to {internal_url} failed: {marker}",
+                status=503,
+                code="PrivateProviderError",
+            )
+
+    factory = EchoFactory()
+    factory.runtime = FailingRuntime()
+    app = create_foundry_app(_spec(), factory)
+
+    with caplog.at_level(logging.WARNING, logger="agentkit_serve_common.foundry"):
+        with TestClient(app) as client:
+            invocation = client.post("/invocations", json={"message": "hello"})
+            response = client.post("/responses", json={"input": "hello"})
+
+    expected = {
+        "message": "agent runtime request failed",
+        "code": "RuntimeFailure",
+    }
+    assert invocation.status_code == 503
+    assert invocation.json()["error"] == expected
+    assert response.status_code == 503
+    assert response.json()["error"] == expected
+    assert marker not in invocation.text
+    assert marker not in response.text
+    assert internal_url not in invocation.text
+    assert internal_url not in response.text
+    assert marker in caplog.text
+    assert internal_url in caplog.text
+
+
+def test_foundry_non_brokered_unexpected_runtime_failure_is_sanitized_and_logged(caplog):
+    marker = "UNEXPECTED_RUNTIME_FAILURE_MARKER"
+    internal_url = "https://unexpected-runtime.internal.example/v1"
+
+    class FailingRuntime(EchoRuntime):
+        async def run(self, request: RunRequest) -> RunResult:
+            self.requests.append(request)
+            raise RuntimeError(f"connection to {internal_url} failed: {marker}")
+
+    factory = EchoFactory()
+    factory.runtime = FailingRuntime()
+    app = create_foundry_app(_spec(), factory)
+
+    with caplog.at_level(logging.ERROR, logger="agentkit_serve_common.foundry"):
+        with TestClient(app) as client:
+            invocation = client.post("/invocations", json={"message": "hello"})
+            response = client.post("/responses", json={"input": "hello"})
+
+    expected = {
+        "message": "agent runtime request failed",
+        "code": "RuntimeFailure",
+    }
+    assert invocation.status_code == 502
+    assert invocation.json()["error"] == expected
+    assert response.status_code == 502
+    assert response.json()["error"] == expected
+    assert marker not in invocation.text
+    assert marker not in response.text
+    assert internal_url not in invocation.text
+    assert internal_url not in response.text
+    assert marker in caplog.text
+    assert internal_url in caplog.text
+
+
+def test_foundry_non_brokered_runtime_4xx_preserves_caller_actionable_detail():
+    detail = "caller must provide a supported deployment name"
+
+    class FailingRuntime(EchoRuntime):
+        async def run(self, request: RunRequest) -> RunResult:
+            self.requests.append(request)
+            raise AgentRunError(detail, status=422, code="InvalidDeployment")
+
+    factory = EchoFactory()
+    factory.runtime = FailingRuntime()
+    app = create_foundry_app(_spec(), factory)
+
+    with TestClient(app) as client:
+        invocation = client.post("/invocations", json={"message": "hello"})
+        response = client.post("/responses", json={"input": "hello"})
+
+    expected = {"message": detail, "code": "InvalidDeployment"}
+    assert invocation.status_code == 422
+    assert invocation.json()["error"] == expected
+    assert response.status_code == 422
+    assert response.json()["error"] == expected
 
 
 def test_foundry_protocols_reject_non_object_json():
@@ -138,6 +264,63 @@ def test_foundry_protocol_forwards_session_header_and_query_param():
     assert resp.status_code == 200
     assert factory.runtime.requests[0].session_id == "session-1"
     assert factory.runtime.requests[1].session_id == "session-2"
+
+
+def test_foundry_invocations_prefers_hosted_session_identity_over_caller_fields(monkeypatch):
+    monkeypatch.setenv("FOUNDRY_AGENT_SESSION_ID", "hosted-session")
+    factory = EchoFactory()
+    app = create_foundry_app(_spec(), factory)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/invocations?agent_session_id=query-session",
+            headers={
+                "x-agent-session-id": "gateway-header-session",
+                "x-agentkit-session-id": "compatibility-header-session",
+            },
+            json={"message": "hello"},
+        )
+
+    assert response.status_code == 200
+    assert factory.runtime.requests[0].session_id == "hosted-session"
+
+
+def test_foundry_invocations_preserves_local_query_and_header_fallback(monkeypatch):
+    monkeypatch.delenv("FOUNDRY_AGENT_SESSION_ID", raising=False)
+    factory = EchoFactory()
+    app = create_foundry_app(_spec(), factory)
+
+    with TestClient(app) as client:
+        query_response = client.post(
+            "/invocations?session_id=query-session",
+            headers={
+                "x-agent-session-id": "gateway-header-session",
+                "x-agentkit-session-id": "compatibility-header-session",
+            },
+            json={"message": "query"},
+        )
+        gateway_header_response = client.post(
+            "/invocations",
+            headers={
+                "x-agent-session-id": "gateway-header-session",
+                "x-agentkit-session-id": "compatibility-header-session",
+            },
+            json={"message": "gateway header"},
+        )
+        compatibility_header_response = client.post(
+            "/invocations",
+            headers={"x-agentkit-session-id": "compatibility-header-session"},
+            json={"message": "compatibility header"},
+        )
+
+    assert query_response.status_code == 200
+    assert gateway_header_response.status_code == 200
+    assert compatibility_header_response.status_code == 200
+    assert [request.session_id for request in factory.runtime.requests] == [
+        "query-session",
+        "gateway-header-session",
+        "compatibility-header-session",
+    ]
 
 
 def test_foundry_responses_prefers_body_session_id_over_local_query_and_header(monkeypatch):
@@ -407,3 +590,21 @@ expose:
         assert "brokeredTools" in str(exc)
     else:  # pragma: no cover - assertion path.
         raise AssertionError("expected missing brokeredTools to fail")
+
+
+# Regression coverage retained from the merged brokered-continuation stack.
+
+def test_foundry_invocations_enforces_request_body_limit_before_runtime():
+    factory = EchoFactory()
+    app = create_foundry_app(_spec(), factory, max_request_body_bytes=64)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/invocations",
+            content='{"message":"' + ("x" * 128) + '"}',
+            headers={"content-type": "application/json"},
+        )
+
+    assert response.status_code == 413
+    assert "too large" in response.text
+    assert factory.runtime.requests == []

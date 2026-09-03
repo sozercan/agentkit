@@ -122,7 +122,6 @@ def verify_transcript(
     expected_call_id: str = "call_conformance_1",
     expected_call_id_prefix: str | None = None,
 ) -> dict[str, Any]:
-    _require(expected_final_text is not None, "expected final text is required for transcript verification")
     root = Path(transcript_dir)
     expected_arguments = _parse_json_lossless(expected_arguments_json)
     expected_output = _parse_json_lossless(expected_output_json)
@@ -132,6 +131,10 @@ def verify_transcript(
     continuation_response = _load_json(root / "04-continuation-response.json")
 
     _require(isinstance(initial_request, dict), "initial request must be a JSON object")
+    _require(
+        "brokered_continuation_proof" not in initial_request,
+        "sanitized initial request must not archive a continuation proof",
+    )
     _require("tools" not in initial_request, "initial request must not contain request-level tools")
     _require("input" in initial_request, "initial request must contain input")
 
@@ -140,6 +143,12 @@ def verify_transcript(
     initial_response_id = initial_response.get("id")
     _require(isinstance(initial_response_id, str) and initial_response_id.startswith("caresp_"), "initial response id must start with caresp_")
     _require(not initial_response_id.startswith("resp_"), "initial response id must not use old resp_ format")
+    agent_session_id = initial_response.get("agent_session_id")
+    if agent_session_id is not None:
+        _require(
+            isinstance(agent_session_id, str) and bool(agent_session_id.strip()),
+            "initial response agent_session_id must be a non-empty string",
+        )
     output = initial_response.get("output")
     _require(isinstance(output, list) and len(output) == 1, "initial response output must contain exactly one item")
     call = output[0]
@@ -161,7 +170,16 @@ def verify_transcript(
     _require(_strict_json_equal(parsed_arguments, expected_arguments), f"function_call arguments must be {expected_arguments}")
 
     _require(isinstance(continuation_request, dict), "continuation request must be a JSON object")
+    _require(
+        "brokered_continuation_proof" not in continuation_request,
+        "sanitized continuation request must not archive a continuation proof",
+    )
     _require(continuation_request.get("previous_response_id") == initial_response_id, "continuation previous_response_id must match initial id")
+    if agent_session_id is not None:
+        _require(
+            continuation_request.get("agent_session_id") == agent_session_id,
+            "continuation agent_session_id must match the initial response",
+        )
     continuation_input = continuation_request.get("input")
     _require(isinstance(continuation_input, list) and len(continuation_input) == 1, "continuation input must contain exactly one item")
     continuation_item = continuation_input[0]
@@ -181,8 +199,8 @@ def verify_transcript(
     _require(isinstance(continuation_response_id, str) and continuation_response_id.startswith("caresp_"), "continuation response id must start with caresp_")
     _require(continuation_response_id != initial_response_id, "continuation response id must differ from initial response id")
     final_text = _message_text(continuation_response, response_id=continuation_response_id)
-    if expected_final_text is not None:
-        _require(final_text == expected_final_text, "final message text did not match expected conformance result")
+    _require(expected_final_text is not None, "expected final text is required for transcript verification")
+    _require(final_text == expected_final_text, "final message text did not match expected conformance result")
 
     return {
         "initial_response_id": initial_response_id,

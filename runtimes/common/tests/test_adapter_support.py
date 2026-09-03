@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -279,3 +281,68 @@ def test_resolve_tool_headers_prefers_per_run_env_and_keeps_errors_secret_free()
     msg = str(exc.value)
     assert "TOOLBOX_TOKEN" in msg
     assert "do-not-mention" not in msg
+
+
+def _fake_azure_identity_module(factory_type: type) -> dict[str, ModuleType]:
+    azure = ModuleType("azure")
+    azure.__path__ = []  # type: ignore[attr-defined]
+    identity = ModuleType("azure.identity")
+    setattr(identity, "DefaultAzureCredential", factory_type)
+    azure.identity = identity  # type: ignore[attr-defined]
+    return {"azure": azure, "azure.identity": identity}
+
+
+def test_default_azure_credential_fallback_closes_after_success():
+    instances = []
+
+    class FakeCredential:
+        def __init__(self) -> None:
+            self.closed = False
+            instances.append(self)
+
+        def get_token(self, audience: str):
+            assert audience == "https://ai.azure.com/.default"
+            result = SimpleNamespace()
+            setattr(result, "token", "azure-token")
+            return result
+
+        def close(self) -> None:
+            self.closed = True
+
+    with (
+        mock.patch.dict(os.environ, {}, clear=True),
+        mock.patch.dict(sys.modules, _fake_azure_identity_module(FakeCredential)),
+    ):
+        resolved = support.resolve_workload_identity_token("https://ai.azure.com/.default")
+
+    assert resolved == "azure-token"
+    assert len(instances) == 1
+    assert instances[0].closed is True
+
+
+def test_default_azure_credential_fallback_closes_after_failure_without_masking_token_error():
+    instances = []
+    acquisition_error = RuntimeError("token unavailable")
+
+    class FakeCredential:
+        def __init__(self) -> None:
+            self.closed = False
+            instances.append(self)
+
+        def get_token(self, audience: str):
+            raise acquisition_error
+
+        def close(self) -> None:
+            self.closed = True
+            raise RuntimeError("close failed")
+
+    with (
+        mock.patch.dict(os.environ, {}, clear=True),
+        mock.patch.dict(sys.modules, _fake_azure_identity_module(FakeCredential)),
+    ):
+        with pytest.raises(support.AgentBuildError, match="token unavailable") as exc_info:
+            support.resolve_workload_identity_token("https://ai.azure.com/.default")
+
+    assert exc_info.value.__cause__ is acquisition_error
+    assert len(instances) == 1
+    assert instances[0].closed is True

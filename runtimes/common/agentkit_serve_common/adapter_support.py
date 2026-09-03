@@ -2,9 +2,10 @@
 
 The adapter modules should spend their complexity budget on translating the
 frozen ``agent.yaml`` ABI into their framework's concrete agent/client/tool
-objects. Cross-runtime invariants live here instead: model API-key resolution,
-secret-safe tool env projection, MCP timeout parsing, command validation, and
-normalizing framework/model failures into the common run error.
+objects. Cross-runtime invariants live here instead: cancellation-safe lifecycle
+cleanup, model API-key resolution, secret-safe tool env projection, MCP timeout
+parsing, command validation, and normalizing framework/model failures into the
+common run error.
 """
 
 from __future__ import annotations
@@ -14,7 +15,10 @@ import os
 import re
 import shlex
 import subprocess
-from typing import Mapping
+from collections.abc import Awaitable, Callable
+from contextlib import AsyncExitStack
+from types import TracebackType
+from typing import Mapping, TypeVar
 
 from .config import AgentSpec, ToolSpec
 from .conversation import FORWARDED_ROLES
@@ -30,10 +34,215 @@ MCP_TIMEOUT_ENV = "AGENTKIT_MCP_TIMEOUT"
 WORKLOAD_TOKEN_ENV = "AGENTKIT_WORKLOAD_IDENTITY_TOKEN"
 WORKLOAD_TOKEN_COMMAND_ENV = "AGENTKIT_WORKLOAD_IDENTITY_TOKEN_COMMAND"
 _BRACED_ENV_REF_RE = re.compile(r"\$\{([^}]+)\}")
+_T = TypeVar("_T")
 
 
 class AgentBuildError(Exception):
     """Raised when an adapter cannot construct its concrete agent."""
+
+
+def _attach_secondary_error(
+    primary: BaseException,
+    secondary: BaseException,
+    *,
+    label: str,
+) -> None:
+    if secondary is primary:
+        return
+    primary.add_note(f"{label} with {secondary.__class__.__name__}")
+    for note in getattr(secondary, "__notes__", ()):
+        primary.add_note(note)
+    if primary.__cause__ is None:
+        primary.__cause__ = secondary
+
+
+async def _wait_for_owner_task(
+    task: asyncio.Task[_T],
+    *,
+    preserve: BaseException | None = None,
+) -> _T | None:
+    """Wait for a lifecycle-owner task without forwarding caller cancellation."""
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            cancellation = cancellation or exc
+            if not task.done():
+                continue
+            try:
+                result = task.result()
+            except BaseException as owner_error:
+                if preserve is not None:
+                    _attach_secondary_error(
+                        preserve,
+                        owner_error,
+                        label="lifecycle owner also failed",
+                    )
+                    return None
+                _attach_secondary_error(
+                    cancellation,
+                    owner_error,
+                    label="cleanup also failed",
+                )
+                raise cancellation from owner_error
+            if preserve is not None:
+                preserve.add_note("cleanup wait was also cancelled")
+                return None
+            raise cancellation
+        except BaseException as owner_error:
+            if preserve is not None:
+                _attach_secondary_error(
+                    preserve,
+                    owner_error,
+                    label="lifecycle owner also failed",
+                )
+                return None
+            if cancellation is not None:
+                _attach_secondary_error(
+                    cancellation,
+                    owner_error,
+                    label="cleanup also failed",
+                )
+                raise cancellation from owner_error
+            raise
+        else:
+            if cancellation is not None:
+                if preserve is not None:
+                    preserve.add_note("cleanup wait was also cancelled")
+                    return None
+                raise cancellation
+            return result
+
+
+async def _close_exit_stack_inline(
+    stack: AsyncExitStack,
+    exc_type: type[BaseException] | None = None,
+    exc: BaseException | None = None,
+    tb: TracebackType | None = None,
+    *,
+    preserve: BaseException | None = None,
+) -> bool | None:
+    """Close a stack in its owner task without replacing a primary exception."""
+    try:
+        return await stack.__aexit__(exc_type, exc, tb)
+    except BaseException as cleanup_error:
+        if preserve is None:
+            raise
+        _attach_secondary_error(
+            preserve,
+            cleanup_error,
+            label="cleanup also failed",
+        )
+        return None
+
+
+class AsyncExitStackLifecycle:
+    """Keep async resource entry and exit on one cancellation-isolated task."""
+
+    def __init__(self, stack: AsyncExitStack) -> None:
+        self.stack = stack
+        self._owner_task: asyncio.Task[bool | None] | None = None
+        self._close_request: asyncio.Future[
+            tuple[
+                type[BaseException] | None,
+                BaseException | None,
+                TracebackType | None,
+            ]
+        ] | None = None
+        self._closing = False
+
+    async def enter(self, start: Callable[[], Awaitable[_T]]) -> _T:
+        """Run startup in the owner task and return its initialized runtime."""
+        if self._owner_task is not None:
+            raise RuntimeError("async lifecycle is already entered")
+
+        loop = asyncio.get_running_loop()
+        ready: asyncio.Future[_T] = loop.create_future()
+        close_request = loop.create_future()
+        self._close_request = close_request
+        owner_task = asyncio.create_task(self._run(start, ready, close_request))
+        self._owner_task = owner_task
+
+        try:
+            return await asyncio.shield(ready)
+        except BaseException as exc:
+            if not owner_task.done() and not self._closing:
+                owner_task.cancel()
+            await _wait_for_owner_task(owner_task, preserve=exc)
+            if ready.done() and not ready.cancelled():
+                owner_error = ready.exception()
+                if owner_error is not None:
+                    _attach_secondary_error(
+                        exc,
+                        owner_error,
+                        label="lifecycle owner also failed",
+                    )
+            self._clear_if_done()
+            raise
+
+    async def exit(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool | None:
+        """Request owner-task cleanup and wait for every exit callback to finish."""
+        owner_task = self._owner_task
+        close_request = self._close_request
+        if owner_task is None or close_request is None:
+            return None
+        if not close_request.done():
+            close_request.set_result((exc_type, exc, tb))
+        try:
+            return await _wait_for_owner_task(owner_task, preserve=exc)
+        finally:
+            self._clear_if_done()
+
+    async def _run(
+        self,
+        start: Callable[[], Awaitable[_T]],
+        ready: asyncio.Future[_T],
+        close_request: asyncio.Future[
+            tuple[
+                type[BaseException] | None,
+                BaseException | None,
+                TracebackType | None,
+            ]
+        ],
+    ) -> bool | None:
+        try:
+            result = await start()
+            ready.set_result(result)
+            exc_type, exc, tb = await close_request
+        except BaseException as error:
+            self._closing = True
+            await _close_exit_stack_inline(
+                self.stack,
+                type(error),
+                error,
+                error.__traceback__,
+                preserve=error,
+            )
+            if not ready.done():
+                ready.set_exception(error)
+                return None
+            raise
+
+        self._closing = True
+        return await _close_exit_stack_inline(
+            self.stack,
+            exc_type,
+            exc,
+            tb,
+            preserve=exc,
+        )
+
+    def _clear_if_done(self) -> None:
+        if self._owner_task is not None and self._owner_task.done():
+            self._owner_task = None
+            self._close_request = None
+            self._closing = False
 
 
 def _env_get(name: str, env: Mapping[str, str] | None = None) -> str | None:
@@ -203,13 +412,34 @@ def resolve_workload_identity_token(audience: str, env: Mapping[str, str] | None
             f"{WORKLOAD_TOKEN_COMMAND_ENV}, set {WORKLOAD_TOKEN_ENV}, or install azure-identity"
         ) from exc
 
-    credential = DefaultAzureCredential()
+    identity_client = DefaultAzureCredential()
     try:
-        return credential.get_token(audience).token
+        value = identity_client.get_token(audience).token
+    except BaseException as exc:
+        error: BaseException
+        if isinstance(exc, Exception):
+            error = AgentBuildError(
+                f"workload identity token acquisition failed for audience {audience!r}: {exc}"
+            )
+        else:
+            error = exc
+        try:
+            identity_client.close()
+        except BaseException as cleanup_error:
+            error.add_note(
+                f"credential cleanup also failed with {cleanup_error.__class__.__name__}"
+            )
+        if error is exc:
+            raise
+        raise error from exc
+
+    try:
+        identity_client.close()
     except Exception as exc:  # noqa: BLE001 - normalize provider failures.
         raise AgentBuildError(
-            f"workload identity token acquisition failed for audience {audience!r}: {exc}"
+            f"workload identity credential cleanup failed for audience {audience!r}: {exc}"
         ) from exc
+    return value
 
 
 def same_origin_mcp_httpx_client_factory(tool: ToolSpec, url: str, *, timeout: float | int | None):

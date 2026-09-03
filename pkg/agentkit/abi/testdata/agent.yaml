@@ -1,19 +1,19 @@
-abiVersion: v0
+abiVersion: "v0"
 metadata:
-  name: acme-support
+  name: "acme-support"
 model:
-  provider: openai-compatible
-  baseURL: https://api.openai.com/v1
-  name: gpt-4o-mini
-  apiKeyEnv: OPENAI_API_KEY
-instructions: Be helpful and cite sources.
+  provider: "openai-compatible"
+  baseURL: "https://api.openai.com/v1"
+  name: "gpt-4o-mini"
+  apiKeyEnv: "OPENAI_API_KEY"
+instructions: "Be helpful and cite sources."
 tools:
-- name: fetch
+- name: "fetch"
   command:
-  - uvx
-  - mcp-server-fetch
+  - "uvx"
+  - "mcp-server-fetch"
   env:
-  - FETCH_TIMEOUT
+  - "FETCH_TIMEOUT"
 expose:
   openai: true
   port: 8080

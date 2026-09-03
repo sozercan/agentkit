@@ -67,15 +67,15 @@ from agentkit_serve_common.runtime import (
     offline_orka_echo_enabled,
 )
 
-# Seconds to wait for a stdio MCP server's initialize handshake. pydantic-ai's
-# default is 5s, which is too tight for a COLD `uvx`/`npx` tool: the first launch
-# resolves, downloads, and installs the server package before it speaks MCP, which
-# routinely exceeds 5s. Default generously and let operators tune via env.
+# Seconds to wait for stdio MCP initialization and each subsequent request.
+# pydantic-ai's 5s initialization default is too tight for a COLD `uvx`/`npx`
+# tool: the first launch resolves, downloads, and installs the server package
+# before it speaks MCP. Default generously and let operators tune both phases.
 _DEFAULT_MCP_INIT_TIMEOUT = 120.0
 
 
 def _mcp_init_timeout() -> float:
-    """MCP stdio init timeout (seconds), overridable via AGENTKIT_MCP_TIMEOUT."""
+    """MCP stdio init/read timeout, overridable via AGENTKIT_MCP_TIMEOUT."""
     return positive_float_env(default=_DEFAULT_MCP_INIT_TIMEOUT)
 
 
@@ -114,8 +114,8 @@ def build_tool_server(tool: ToolSpec) -> Any:
 
     command, args = split_tool_command(tool, example='["npx", "-y", "..."]')
 
-    # Generous init timeout: a cold uvx/npx tool installs its package before
-    # speaking MCP, which exceeds pydantic-ai's 5s default (see above).
+    # A single operator timeout bounds both cold initialization and later tool
+    # calls, preventing a blocked stdio server from hanging a request forever.
     env = declared_tool_env(tool)
 
     if MCPServerStdio is not None:
@@ -124,6 +124,7 @@ def build_tool_server(tool: ToolSpec) -> Any:
             args=args,
             env=env,
             timeout=timeout,
+            read_timeout=timeout,
             # tool_prefix namespaces tool names so two servers can't collide.
             tool_prefix=tool.name,
         )
@@ -142,7 +143,7 @@ def build_tool_server(tool: ToolSpec) -> Any:
         # the stdio subprocess should be torn down instead of kept alive.
         keep_alive=False,
     )
-    return MCPToolset(transport, init_timeout=timeout).prefixed(tool.name)
+    return MCPToolset(transport, init_timeout=timeout, read_timeout=timeout).prefixed(tool.name)
 
 
 def build_agent(spec: AgentSpec) -> Agent:

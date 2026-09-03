@@ -31,6 +31,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
@@ -223,6 +224,24 @@ def create_app(spec: AgentSpec, factory: RuntimeFactory, auth_token: str | None 
             )
 
         return _completion_response(model_name, result)
+
+    @app.exception_handler(RequestValidationError)
+    async def _request_validation_exc_handler(request: Request, exc: RequestValidationError):
+        # Pydantic validation details can embed request inputs. Inspect only the
+        # machine-readable error type and return fixed, secret-safe messages.
+        if any(error.get("type") == "json_invalid" for error in exc.errors()):
+            return _error_response(
+                400,
+                "request body must be valid JSON",
+                "invalid_request_error",
+                "invalid_json",
+            )
+        return _error_response(
+            400,
+            "request body is invalid",
+            "invalid_request_error",
+            "invalid_request",
+        )
 
     # Map HTTPExceptions raised in helpers to the OpenAI error envelope too.
     @app.exception_handler(HTTPException)

@@ -3,6 +3,7 @@ package config
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"math/big"
 	pathpkg "path"
 	"reflect"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -55,10 +57,18 @@ const (
 	jsonSchemaMaximumKey           = "maximum"
 	brokeredDigestDescriptionKey   = "description"
 	brokeredDigestNumberKey        = "\u0000agentkit_json_number"
+	brokeredAuthenticationWord     = "authentication"
+	brokeredSensitiveWord          = "credential"
+	brokeredSensitivePluralWord    = "credentials"
+	brokeredTokenWord              = "token"
+	brokeredTokensWord             = "tokens"
 	brokeredUnsafeCookieKey        = "cookie"
+	authorizationKey               = "authorization"
 	credentialHeaderAPIKey         = "api-key"
 	maxExactJSONFloatInteger       = float64(1<<53 - 1)
 )
+
+var brokeredBasicValuePattern = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9_])basic[^A-Za-z0-9_]+?([A-Za-z0-9+/]+={0,2})`)
 
 // Validate reports every problem with the config at once via errors.Join (plan
 // §16.2 #3 — one report-all validator, not scattered first-error-wins funcs).
@@ -85,6 +95,20 @@ func (c *AgentConfig) Validate() error {
 	// --- metadata ----------------------------------------------------------
 	if c.Metadata.Name == "" {
 		add("metadata.name is required")
+	}
+	metadataLabelKeys := make([]string, 0, len(c.Metadata.Labels))
+	for key := range c.Metadata.Labels {
+		metadataLabelKeys = append(metadataLabelKeys, key)
+	}
+	sort.Strings(metadataLabelKeys)
+	for _, key := range metadataLabelKeys {
+		if namespace, reserved := reservedMetadataLabelNamespace(key); reserved {
+			add("metadata.labels[%q] uses reserved AgentKit/Orka control-plane label namespace %q", key, namespace)
+			continue
+		}
+		if isReservedMetadataLabelKey(key) {
+			add("metadata.labels[%q] is reserved for AgentKit-generated image identity metadata", key)
+		}
 	}
 
 	// --- runtime -----------------------------------------------------------
@@ -223,7 +247,7 @@ func validateBrokeredTools(add func(string, ...any), tools []BrokeredTool, owned
 		}
 		if tool.Description == "" {
 			add("%s.description is required", path)
-		} else if hasUnsafeBrokeredText(tool.Description) {
+		} else if hasUnsafeBrokeredDescription(tool.Description) {
 			add("%s.description must not contain URLs or secret-like material", path)
 		}
 		switch tool.BrokeredClass {
@@ -777,8 +801,228 @@ func isSchemaDigest(value string) bool {
 
 func hasUnsafeBrokeredText(value string) bool {
 	lowered := strings.ToLower(value)
+	return hasUnsafeBrokeredDescription(value) || containsBrokeredWord(lowered, "basic") || strings.Contains(lowered, brokeredTokenWord)
+}
+
+func hasUnsafeBrokeredDescription(value string) bool {
+	lowered := strings.ToLower(value)
 	normalized := normalizeKey(lowered)
-	return containsSecretPrefix(value) || strings.Contains(value, "://") || containsBrokeredWord(lowered, "bearer") || containsBrokeredWord(lowered, "basic") || strings.Contains(lowered, "authorization") || strings.Contains(lowered, "secret") || strings.Contains(lowered, "token") || strings.Contains(lowered, "password") || strings.Contains(lowered, "passphrase") || strings.Contains(lowered, "pwd") || strings.Contains(lowered, "api key") || strings.Contains(lowered, "apikey") || strings.Contains(normalized, "apikey") || strings.Contains(normalized, "xapikey") || strings.Contains(normalized, "subscriptionkey") || strings.Contains(normalized, "xfunctionskey") || strings.Contains(lowered, brokeredUnsafeCookieKey) || strings.Contains(lowered, "set-cookie") || strings.Contains(lowered, "x-api-key") || strings.Contains(lowered, credentialHeaderAPIKey) || strings.Contains(lowered, "subscription-key") || strings.Contains(lowered, "x-functions-key") || strings.Contains(lowered, "ocp-apim-subscription-key") || strings.Contains(lowered, "private key") || strings.Contains(lowered, "privatekey") || strings.Contains(lowered, "key material") || strings.Contains(lowered, ".svc") || strings.Contains(lowered, "cluster.local")
+	return containsSecretPrefix(value) || strings.Contains(value, "://") || containsBrokeredWord(lowered, "bearer") || containsBrokeredWord(lowered, brokeredSensitiveWord) || containsBrokeredWord(lowered, brokeredSensitivePluralWord) || containsBrokeredBasicAuthReference(value) || containsBrokeredCredentialAssignment(value) || containsBrokeredCredentialReference(value) || strings.Contains(lowered, authorizationKey) || strings.Contains(lowered, "secret") || strings.Contains(lowered, "password") || strings.Contains(lowered, "passphrase") || strings.Contains(lowered, "pwd") || strings.Contains(lowered, "api key") || strings.Contains(lowered, "apikey") || strings.Contains(normalized, "apikey") || strings.Contains(normalized, "xapikey") || strings.Contains(normalized, "subscriptionkey") || strings.Contains(normalized, "xfunctionskey") || strings.Contains(lowered, brokeredUnsafeCookieKey) || strings.Contains(lowered, "set-cookie") || strings.Contains(lowered, "x-api-key") || strings.Contains(lowered, credentialHeaderAPIKey) || strings.Contains(lowered, "subscription-key") || strings.Contains(lowered, "x-functions-key") || strings.Contains(lowered, "ocp-apim-subscription-key") || strings.Contains(lowered, "private key") || strings.Contains(lowered, "privatekey") || strings.Contains(lowered, "key material") || strings.Contains(lowered, ".svc") || strings.Contains(lowered, "cluster.local")
+}
+
+func containsBrokeredBasicAuthReference(value string) bool {
+	lowered := strings.ToLower(value)
+	if !containsBrokeredWord(lowered, "basic") {
+		return false
+	}
+	if containsBrokeredWord(lowered, "auth") || containsBrokeredWord(lowered, brokeredAuthenticationWord) || containsBrokeredWord(lowered, authorizationKey) {
+		return true
+	}
+
+	for _, match := range brokeredBasicValuePattern.FindAllStringSubmatch(value, -1) {
+		if isBrokeredBasicValue(match[1]) {
+			return true
+		}
+	}
+	fields := strings.Fields(value)
+	for _, field := range fields {
+		if isBrokeredBasicValue(field) {
+			return true
+		}
+	}
+	for i, field := range fields {
+		if !containsBrokeredWord(strings.ToLower(field), "basic") {
+			continue
+		}
+		for j, candidate := range fields[i+1:] {
+			if isBrokeredBasicValue(candidate) {
+				return true
+			}
+			plain := strings.Trim(candidate, "\"'`()[]{}<>,;.")
+			if strings.HasSuffix(plain, ":") && j+1 < len(fields[i+1:]) {
+				return true
+			}
+			if strings.ContainsAny(candidate, ".!?;") {
+				break
+			}
+		}
+	}
+	return false
+}
+
+func isBrokeredBasicValue(value string) bool {
+	plain := strings.Trim(value, "\"'`()[]{}<>,;.")
+	if separator := strings.IndexByte(plain, ':'); separator > 0 && separator+1 < len(plain) {
+		return true
+	}
+	if decodesBrokeredBasicValue(value) {
+		return true
+	}
+	for separator, r := range value {
+		if (r == ':' || r == '=') && decodesBrokeredBasicValue(value[separator+1:]) {
+			return true
+		}
+	}
+	return false
+}
+
+func decodesBrokeredBasicValue(value string) bool {
+	value = strings.TrimFunc(value, func(r rune) bool { return !isBrokeredBase64Rune(r) })
+	if value == "" {
+		return false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(value)
+	if err != nil {
+		decoded, err = base64.RawStdEncoding.DecodeString(value)
+	}
+	return err == nil && bytes.Contains(decoded, []byte(":"))
+}
+
+func containsBrokeredCredentialAssignment(value string) bool {
+	for separator := 0; separator < len(value); separator++ {
+		if value[separator] != ':' && value[separator] != '=' {
+			continue
+		}
+		if isHarmlessBrokeredTokenCountAssignment(value, separator) {
+			continue
+		}
+		fields := strings.Fields(value[:separator])
+		if len(fields) == 0 {
+			continue
+		}
+		if isUnsafeBrokeredKey(fields[len(fields)-1]) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsBrokeredCredentialReference(value string) bool {
+	fields := strings.Fields(value)
+	previous := ""
+	for i, field := range fields {
+		normalized := normalizeKey(field)
+		if normalized == "" {
+			continue
+		}
+		if normalized == brokeredTokenWord || normalized == brokeredTokensWord {
+			if !isHarmlessBrokeredTokenUse(fields, i, normalizeKey(previous)) {
+				return true
+			}
+			previous = field
+			continue
+		}
+		if strings.Contains(normalized, brokeredTokenWord) && !isHarmlessBrokeredTokenWord(normalized) {
+			return true
+		}
+		if hasBrokeredStructuredKeyShape(field) && isUnsafeBrokeredKey(field) {
+			return true
+		}
+		switch normalized {
+		case "accesstoken", "apitoken", "authtoken", "authenticationtoken", "authorizationtoken", "bearertoken", "credentialtoken", "identitytoken", "oauthtoken", "refreshtoken", "secrettoken", "sessiontoken":
+			return true
+		}
+		previous = field
+	}
+	return false
+}
+
+func isHarmlessBrokeredTokenWord(value string) bool {
+	switch value {
+	case "tokenization", "tokenize", "tokenized", "tokenizer", "tokenizers", "tokenizing":
+		return true
+	default:
+		return false
+	}
+}
+
+func isHarmlessBrokeredTokenUse(fields []string, index int, previous string) bool {
+	if hasBrokeredStructuredKeyShape(fields[index]) || !isHarmlessBrokeredTokenQualifier(previous) || !hasAdjacentBrokeredTokenCountIntent(fields, index) {
+		return false
+	}
+	if index+1 == len(fields) {
+		return true
+	}
+	return index+2 == len(fields) && isBrokeredNumericCount(fields[index+1])
+}
+
+func isHarmlessBrokeredTokenQualifier(value string) bool {
+	switch value {
+	case "completion", "context", "count", "counting", "counts", "input", "model", "output", "prompt", "usage":
+		return true
+	default:
+		return false
+	}
+}
+
+func hasAdjacentBrokeredTokenCountIntent(fields []string, tokenIndex int) bool {
+	if tokenIndex > 0 && !endsBrokeredSentence(fields[tokenIndex-1]) && isHarmlessBrokeredTokenCountIntent(normalizeKey(fields[tokenIndex-1])) {
+		return true
+	}
+	return tokenIndex > 1 && !endsBrokeredSentence(fields[tokenIndex-2]) && isHarmlessBrokeredTokenCountIntent(normalizeKey(fields[tokenIndex-2]))
+}
+
+func endsBrokeredSentence(value string) bool {
+	value = strings.TrimRight(value, "\"'`)]}>,")
+	return value != "" && strings.ContainsRune(".!?;", rune(value[len(value)-1]))
+}
+
+func isHarmlessBrokeredTokenCountIntent(value string) bool {
+	switch value {
+	case "count", "counting", "counts", "measure", "measures", "measuring", "report", "reporting", "reports", "track", "tracking":
+		return true
+	default:
+		return false
+	}
+}
+
+func isHarmlessBrokeredTokenCountAssignment(value string, separator int) bool {
+	if value[separator] != ':' {
+		return false
+	}
+	leftFields := strings.Fields(value[:separator])
+	rightFields := strings.Fields(value[separator+1:])
+	if len(leftFields) < 2 || len(rightFields) != 1 {
+		return false
+	}
+	key := normalizeKey(leftFields[len(leftFields)-1])
+	if key != brokeredTokenWord && key != brokeredTokensWord {
+		return false
+	}
+	qualifier := normalizeKey(leftFields[len(leftFields)-2])
+	return isHarmlessBrokeredTokenQualifier(qualifier) && hasAdjacentBrokeredTokenCountIntent(leftFields, len(leftFields)-1) && isBrokeredNumericCount(rightFields[0])
+}
+
+func isBrokeredNumericCount(value string) bool {
+	wrapped := strings.TrimLeft(value, "([{<")
+	if wrapped != "" && strings.ContainsRune("\"'`", rune(wrapped[0])) {
+		return false
+	}
+	value = strings.Trim(value, "\"'`()[]{}<>,;:.")
+	if value == "" {
+		return false
+	}
+	parts := strings.Split(value, ",")
+	digits := 0
+	for i, part := range parts {
+		if part == "" || i == 0 && len(parts) > 1 && len(part) > 3 || i > 0 && len(part) != 3 {
+			return false
+		}
+		for _, r := range part {
+			if r < '0' || r > '9' {
+				return false
+			}
+			digits++
+			if digits > 20 {
+				return false
+			}
+		}
+	}
+	return digits > 0
+}
+
+func hasBrokeredStructuredKeyShape(value string) bool {
+	return strings.HasPrefix(strings.TrimLeft(value, "\"'`([{<"), "-") || strings.ContainsAny(value, "_/.[]{}()<>\"'`") || value != strings.ToLower(value)
 }
 
 func containsBrokeredWord(value string, word string) bool {
@@ -803,14 +1047,18 @@ func isBrokeredWordByte(value byte) bool {
 	return (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') || (value >= '0' && value <= '9') || value == '_'
 }
 
+func isBrokeredBase64Rune(value rune) bool {
+	return (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') || (value >= '0' && value <= '9') || value == '+' || value == '/' || value == '='
+}
+
 func isUnsafeBrokeredKey(value string) bool {
 	normalized := normalizeKey(value)
 	switch normalized {
-	case "auth", "authorization", "apikey", "bearer", brokeredUnsafeCookieKey, "credential", "credentials", "endpoint", "endpoints", "executionendpoint", "executionurl", "header", "headers", "ocpapimsubscriptionkey", "password", "proxyauthorization", "secret", "secretref", "setcookie", "subscriptionkey", "token", "tokens", "url", "urls", "xapikey", "xfunctionskey":
+	case "auth", authorizationKey, "apikey", "bearer", brokeredUnsafeCookieKey, brokeredSensitiveWord, brokeredSensitivePluralWord, "endpoint", "endpoints", "executionendpoint", "executionurl", "header", "headers", "ocpapimsubscriptionkey", "password", "proxyauthorization", "secret", "secretref", "setcookie", "subscriptionkey", brokeredTokenWord, brokeredTokensWord, "url", "urls", "xapikey", "xfunctionskey":
 		return true
 	}
 	authLike := (strings.HasPrefix(normalized, "auth") && !strings.HasPrefix(normalized, "author")) || strings.HasSuffix(normalized, "auth")
-	return authLike || strings.Contains(normalized, "authorization") || strings.Contains(normalized, "header") || strings.Contains(normalized, "url") || strings.Contains(normalized, "endpoint") || strings.Contains(normalized, brokeredUnsafeCookieKey) || strings.Contains(normalized, "secret") || strings.Contains(normalized, "token") || strings.Contains(normalized, "password") || strings.Contains(normalized, "passphrase") || strings.Contains(normalized, "pwd") || strings.Contains(normalized, "apikey") || strings.Contains(normalized, "accesskey") || strings.Contains(normalized, "privatekey") || strings.Contains(normalized, "keymaterial") || strings.Contains(normalized, "credential") || strings.Contains(normalized, "executionurl") || strings.Contains(normalized, "executionendpoint")
+	return authLike || strings.Contains(normalized, authorizationKey) || strings.Contains(normalized, "header") || strings.Contains(normalized, "url") || strings.Contains(normalized, "endpoint") || strings.Contains(normalized, brokeredUnsafeCookieKey) || strings.Contains(normalized, "secret") || strings.Contains(normalized, brokeredTokenWord) || strings.Contains(normalized, "password") || strings.Contains(normalized, "passphrase") || strings.Contains(normalized, "pwd") || strings.Contains(normalized, "apikey") || strings.Contains(normalized, "accesskey") || strings.Contains(normalized, "privatekey") || strings.Contains(normalized, "keymaterial") || strings.Contains(normalized, brokeredSensitiveWord) || strings.Contains(normalized, "executionurl") || strings.Contains(normalized, "executionendpoint")
 }
 
 func normalizeKey(value string) string {
@@ -1202,7 +1450,7 @@ func validateToolHeaders(add func(string, ...any), i int, t Tool) {
 		if values != 1 {
 			add("%s must set exactly one of value or valueEnv", path)
 		}
-		if t.Auth != nil && strings.EqualFold(h.Name, "authorization") {
+		if t.Auth != nil && strings.EqualFold(h.Name, authorizationKey) {
 			add("%s must not set Authorization when auth is also configured; use one auth path", path)
 		}
 		if h.Value != "" && isCredentialHeaderName(h.Name) {
@@ -1337,7 +1585,7 @@ func isHTTPHeaderName(v string) bool {
 
 func isCredentialHeaderName(name string) bool {
 	switch strings.ToLower(name) {
-	case "authorization", "proxy-authorization", brokeredUnsafeCookieKey, "set-cookie", "x-api-key", credentialHeaderAPIKey, "ocp-apim-subscription-key", "subscription-key", "x-functions-key":
+	case authorizationKey, "proxy-authorization", brokeredUnsafeCookieKey, "set-cookie", "x-api-key", credentialHeaderAPIKey, "ocp-apim-subscription-key", "subscription-key", "x-functions-key":
 		return true
 	default:
 		return false

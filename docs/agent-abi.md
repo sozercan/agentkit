@@ -27,7 +27,7 @@ model:
   provider: openai-compatible
   baseURL: https://api.openai.com/v1
   name: gpt-4o-mini
-  apiKeyEnv: OPENAI_API_KEY
+  apiKeyEnv: "OPENAI_API_KEY"
   # Optional future generic model auth. Capability-gated; apiKeyEnv remains the
   # normal v0 model-auth path.
   # auth:

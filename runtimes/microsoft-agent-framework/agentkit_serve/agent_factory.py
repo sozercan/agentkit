@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import os
 import time
-from contextlib import AsyncExitStack
+from contextlib import AbstractAsyncContextManager, AsyncExitStack
+from datetime import timedelta
 from types import TracebackType
 from urllib.parse import urlsplit
 
@@ -26,8 +28,10 @@ from agent_framework import (
     SkillsProvider,
 )
 from agent_framework.openai import OpenAIChatCompletionClient
+from httpx import AsyncClient, URL
 from agentkit_serve_common.adapter_support import (
     FORWARDED_ROLES,
+    AsyncExitStackLifecycle,
     AgentBuildError,
     declared_tool_env,
     normalize_agent_run_error,
@@ -57,17 +61,18 @@ _CONTEXT_SOURCE_FILESYSTEM = "filesystem"
 _CONTEXT_SOURCE_MCP = "mcp"
 _DEFAULT_SEARCH_AUDIENCE = "https://search.azure.com/.default"
 _DEFAULT_FOUNDRY_AUDIENCE = "https://ai.azure.com/.default"
+_DEFAULT_MCP_REQUEST_TIMEOUT = 120
 _DEFAULT_SESSION_CACHE_MAX = 256
 
 
-def _mcp_request_timeout() -> int | None:
+def _mcp_request_timeout() -> int:
     """MCP request timeout (seconds), overridable via ``AGENTKIT_MCP_TIMEOUT``."""
-    return positive_int_env(default=None)
+    return positive_int_env(default=_DEFAULT_MCP_REQUEST_TIMEOUT) or _DEFAULT_MCP_REQUEST_TIMEOUT
 
 
 def _remote_mcp_timeout() -> float:
-    """Bound network-backed MCP calls even when stdio timeout is left uncapped."""
-    return float(_mcp_request_timeout() or 120)
+    """Use the shared bounded MCP timeout for network-backed calls."""
+    return float(_mcp_request_timeout())
 
 
 def _resolve_api_key(spec: AgentSpec) -> str:
@@ -183,12 +188,35 @@ def _model_workload_api_key_provider(audience: str):
     return _provider
 
 
+def _uses_model_workload_identity_fallback(spec: AgentSpec) -> bool:
+    auth = spec.model.auth
+    return bool(
+        auth is not None
+        and auth.type == _AUTH_WORKLOAD_IDENTITY
+        and not (
+            os.environ.get("AGENTKIT_MODEL_WORKLOAD_IDENTITY_TOKEN")
+            or os.environ.get("AGENTKIT_WORKLOAD_IDENTITY_TOKEN")
+            or os.environ.get("AGENTKIT_WORKLOAD_IDENTITY_TOKEN_COMMAND")
+        )
+    )
+
+
 def _disable_mcp_ping(mcp_tool: object) -> None:
     if hasattr(mcp_tool, "_ping_available"):
         setattr(mcp_tool, "_ping_available", False)
 
 
-def build_client(spec: AgentSpec):
+async def _close_resource(resource: object) -> None:
+    """Close a sync or async runtime-owned resource."""
+    close = getattr(resource, "close", None)
+    if not callable(close):
+        return
+    result = close()
+    if inspect.isawaitable(result):
+        await result
+
+
+def build_client(spec: AgentSpec, *, workload_identity_credential: object | None = None):
     """Construct the chat client for the configured model auth mode."""
     auth = spec.model.auth
     if auth is not None and auth.type == _AUTH_WORKLOAD_IDENTITY:
@@ -209,10 +237,15 @@ def build_client(spec: AgentSpec):
             raise AgentBuildError(
                 "model workload identity auth requires agent-framework-foundry and azure-identity"
             ) from exc
+        credential = (
+            workload_identity_credential
+            if workload_identity_credential is not None
+            else DefaultAzureCredential()
+        )
         return FoundryChatClient(
             project_endpoint=_project_endpoint_from_openai_base_url(spec.model.base_url),
             model=spec.model.name,
-            credential=DefaultAzureCredential(),
+            credential=credential,
         )
 
     return OpenAIChatCompletionClient(
@@ -227,12 +260,10 @@ def _tool_env(tool: ToolSpec) -> dict[str, str]:
     return declared_tool_env(tool)
 
 
-def build_tool(tool: ToolSpec):
+def build_tool(tool: ToolSpec, *, stack: AsyncExitStack | None = None):
     """Create a stdio or Streamable HTTP MCP server for one tool spec."""
     timeout = _mcp_request_timeout()
     if tool.url_env:
-        from httpx import AsyncClient, URL
-
         url = resolve_tool_url(tool)
         target_url = URL(url)
         target_origin = (target_url.scheme, target_url.host, target_url.port)
@@ -245,16 +276,22 @@ def build_tool(tool: ToolSpec):
             for key, value in (await asyncio.to_thread(resolve_tool_headers, tool)).items():
                 request.headers[key] = value
 
+        http_client = AsyncClient(
+            event_hooks={"request": [inject_headers]},
+            follow_redirects=False,
+            timeout=remote_timeout,
+        )
+        if stack is not None:
+            # MAF owns the MCP tool/session lifecycle, but the MCP SDK deliberately
+            # leaves caller-supplied HTTP clients open. Register the client before
+            # the Agent so LIFO cleanup disconnects the tool before closing HTTP.
+            stack.push_async_callback(http_client.aclose)
         kwargs: dict[str, object] = {
             "name": tool.name,
             "url": url,
             "tool_name_prefix": tool.name,
             "load_prompts": False,
-            "http_client": AsyncClient(
-                event_hooks={"request": [inject_headers]},
-                follow_redirects=False,
-                timeout=remote_timeout,
-            ),
+            "http_client": http_client,
         }
         kwargs["request_timeout"] = int(remote_timeout)
         mcp_tool = MCPStreamableHTTPTool(**kwargs)
@@ -272,18 +309,23 @@ def build_tool(tool: ToolSpec):
         "env": declared_tool_env(tool),
         "tool_name_prefix": tool.name,
     }
-    if timeout is not None:
-        kwargs["request_timeout"] = timeout
+    kwargs["request_timeout"] = timeout
     return MCPStdioTool(**kwargs)
 
 
-def build_agent(spec: AgentSpec, *, context_providers=None) -> Agent:
+def build_agent(
+    spec: AgentSpec,
+    *,
+    context_providers=None,
+    stack: AsyncExitStack | None = None,
+    client=None,
+) -> Agent:
     """Assemble the MAF agent: client + system prompt + tools + context."""
     return Agent(
-        client=build_client(spec),
+        client=client if client is not None else build_client(spec),
         instructions=spec.instructions,
         name=spec.metadata.name,
-        tools=[build_tool(t) for t in spec.tools],
+        tools=[build_tool(t, stack=stack) for t in spec.tools],
         context_providers=context_providers,
     )
 
@@ -294,19 +336,36 @@ class MAFRuntime:
     def __init__(self, spec: AgentSpec) -> None:
         self.spec = spec
         self.stack = AsyncExitStack()
+        self.lifecycle = AsyncExitStackLifecycle(self.stack)
         self.agent: Agent | None = None
         self.sessions: dict[str, AgentSession] = {}
         self.session_locks: dict[str, asyncio.Lock] = {}
+        # Claims cover both lock holders and queued waiters during eviction.
+        self.session_claims: dict[str, int] = {}
+        self.initialized_sessions: set[str] = set()
+        self.most_recent_session_id: str | None = None
         self.session_cache_max = _session_cache_max()
 
     async def __aenter__(self) -> RuntimeSession:
-        try:
+        async def start() -> RuntimeSession:
             context_providers = await self._build_context_providers()
-            self.agent = build_agent(self.spec, context_providers=context_providers)
+            client = await self._build_model_fallback_client()
+            self.agent = build_agent(
+                self.spec,
+                context_providers=context_providers,
+                stack=self.stack,
+                client=client,
+            )
+            # Register before entering so a partially failed Agent.__aenter__ still
+            # unwinds the Agent's own internal AsyncExitStack.
+            self.stack.push_async_exit(self.agent)
             await self.agent.__aenter__()
             return self
-        except Exception:
-            await self.stack.aclose()
+
+        try:
+            return await self.lifecycle.enter(start)
+        except BaseException:
+            self.agent = None
             raise
 
     async def __aexit__(
@@ -315,47 +374,123 @@ class MAFRuntime:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> bool | None:
-        agent_result = None
-        if self.agent is not None:
-            agent_result = await self.agent.__aexit__(exc_type, exc, tb)
+        try:
+            return await self.lifecycle.exit(exc_type, exc, tb)
+        finally:
             self.agent = None
-        await self.stack.aclose()
-        return agent_result
 
     async def run(self, request: RunRequest) -> RunResult:
         if self.agent is None:
             raise AgentBuildError("MAF runtime session is not initialized")
-        session, existed, lock = self._session_for(request.session_id)
-        include_history = not (session is not None and existed)
+        session_id = request.session_id
+        session, lock = self._session_for(session_id)
         if lock is None:
-            return await run_agent(self.agent, request, session=session, include_history=include_history)
-        async with lock:
-            return await run_agent(self.agent, request, session=session, include_history=include_history)
+            return await run_agent(self.agent, request, session=session, include_history=True)
+        assert session_id
+        try:
+            async with lock:
+                self._touch_session(session_id)
+                include_history = session_id not in self.initialized_sessions
+                result = await run_agent(self.agent, request, session=session, include_history=include_history)
+                self.initialized_sessions.add(session_id)
+                return result
+        finally:
+            self._release_session_claim(session_id)
 
-    def _session_for(self, session_id: str | None) -> tuple[AgentSession | None, bool, asyncio.Lock | None]:
+    def _session_for(self, session_id: str | None) -> tuple[AgentSession | None, asyncio.Lock | None]:
         if not session_id:
-            return None, False, None
-        session = self.sessions.pop(session_id, None)
-        lock = self.session_locks.pop(session_id, None)
-        existed = session is not None
+            return None, None
+        session = self.sessions.get(session_id)
+        lock = self.session_locks.get(session_id)
         if session is None:
             session = AgentSession(session_id=session_id)
+            self.sessions[session_id] = session
+            self.initialized_sessions.discard(session_id)
         if lock is None:
             lock = asyncio.Lock()
+            self.session_locks[session_id] = lock
+        self.session_claims[session_id] = self.session_claims.get(session_id, 0) + 1
+        self._evict_idle_sessions()
+        return session, lock
+
+    def _touch_session(self, session_id: str) -> None:
+        session = self.sessions.pop(session_id)
+        lock = self.session_locks.pop(session_id)
         self.sessions[session_id] = session
         self.session_locks[session_id] = lock
+        self.most_recent_session_id = session_id
         self._evict_idle_sessions()
-        return session, existed, lock
+
+    def _release_session_claim(self, session_id: str) -> None:
+        claims = self.session_claims.get(session_id, 0)
+        if claims <= 1:
+            self.session_claims.pop(session_id, None)
+            self._evict_idle_sessions()
+        else:
+            self.session_claims[session_id] = claims - 1
 
     def _evict_idle_sessions(self) -> None:
         for session_id in list(self.sessions):
             if len(self.sessions) <= self.session_cache_max:
                 return
+            if session_id == self.most_recent_session_id:
+                continue
+            if self.session_claims.get(session_id, 0) > 0:
+                continue
             lock = self.session_locks.get(session_id)
             if lock is not None and lock.locked():
                 continue
             self.sessions.pop(session_id, None)
             self.session_locks.pop(session_id, None)
+            self.session_claims.pop(session_id, None)
+            self.initialized_sessions.discard(session_id)
+
+    async def _enter_owned_async_context(self, resource):
+        """Enter an adapter-owned async context with partial-enter cleanup."""
+        enter = getattr(resource, "__aenter__", None)
+        exit_ = getattr(resource, "__aexit__", None)
+        if not callable(enter) or not callable(exit_):
+            return resource
+        self.stack.push_async_exit(resource)
+        return await enter()
+
+    async def _build_model_fallback_client(self):
+        if not _uses_model_workload_identity_fallback(self.spec):
+            return None
+        try:
+            from azure.identity import DefaultAzureCredential
+        except ImportError as exc:  # pragma: no cover - dependency guard.
+            raise AgentBuildError(
+                "model workload identity auth requires agent-framework-foundry and azure-identity"
+            ) from exc
+
+        credential = DefaultAzureCredential()
+        if callable(getattr(credential, "close", None)):
+            self.stack.push_async_callback(_close_resource, credential)
+        client = build_client(self.spec, workload_identity_credential=credential)
+        # FoundryChatClient exposes its internally-created AIProjectClient, but
+        # MAF's Agent does not enter that project client. Own it here while leaving
+        # the framework chat client itself exclusively under Agent ownership.
+        project_client = getattr(client, "project_client", None)
+        if callable(getattr(project_client, "__aenter__", None)) and callable(
+            getattr(project_client, "__aexit__", None)
+        ):
+            await self._enter_owned_async_context(project_client)
+
+        # Current FoundryChatClient is not an async context manager, while the
+        # AsyncOpenAI client it creates is. Close that model HTTP pool after the
+        # Agent but before the project client. If a future framework version owns
+        # the chat client lifecycle, leave its internals exclusively to Agent.
+        if not isinstance(client, AbstractAsyncContextManager):
+            model_http_client = getattr(client, "client", None)
+            if model_http_client is not None and model_http_client is not project_client:
+                enter = getattr(model_http_client, "__aenter__", None)
+                exit_ = getattr(model_http_client, "__aexit__", None)
+                if callable(enter) and callable(exit_):
+                    await self._enter_owned_async_context(model_http_client)
+                elif callable(getattr(model_http_client, "close", None)):
+                    self.stack.push_async_callback(_close_resource, model_http_client)
+        return client
 
     async def _build_context_providers(self):
         providers = []
@@ -368,7 +503,7 @@ class MAFRuntime:
                 elif provider.source == _CONTEXT_SOURCE_MCP:
                     providers.append(await self._build_mcp_skills_provider(provider))
             elif provider.type == _CONTEXT_TYPE_MEMORY:
-                providers.append(self._build_memory_provider(provider))
+                providers.append(await self._build_memory_provider(provider))
         return providers or None
 
     async def _build_search_provider(self, provider: ContextProviderSpec):
@@ -387,16 +522,18 @@ class MAFRuntime:
             default_audience=_DEFAULT_SEARCH_AUDIENCE,
             async_credential=True,
         )
-        close = getattr(credential, "close", None)
-        if callable(close):
-            self.stack.push_async_callback(close)
-        return search_provider(
+        if callable(getattr(credential, "close", None)):
+            self.stack.push_async_callback(_close_resource, credential)
+        # Agent invokes context providers but does not manage their async
+        # lifecycle, so the runtime must close their internally-created clients.
+        context_provider = search_provider(
             endpoint=endpoint,
             index_name=index,
             credential=credential,
         )
+        return await self._enter_owned_async_context(context_provider)
 
-    def _build_memory_provider(self, provider: ContextProviderSpec):
+    async def _build_memory_provider(self, provider: ContextProviderSpec):
         try:
             foundry_mod = importlib.import_module("agent_framework.foundry")
             memory_provider = getattr(foundry_mod, "FoundryMemoryProvider")
@@ -407,14 +544,20 @@ class MAFRuntime:
 
         endpoint = _env_required(provider.endpoint_env, field="context.providers[].endpointEnv")
         store_name = _env_required(provider.store_name_env, field="context.providers[].storeNameEnv")
-        return memory_provider(
+        credential = _credential_for_context(provider, default_audience=_DEFAULT_FOUNDRY_AUDIENCE)
+        if callable(getattr(credential, "close", None)):
+            self.stack.push_async_callback(_close_resource, credential)
+        # Entering the provider enters/closes its internally-created project
+        # client. Keep the credential below it on the stack so it closes last.
+        context_provider = memory_provider(
             source_id=provider.name or "memory",
             project_endpoint=endpoint,
-            credential=_credential_for_context(provider, default_audience=_DEFAULT_FOUNDRY_AUDIENCE),
+            credential=credential,
             memory_store_name=store_name,
             scope=_memory_scope(),
             update_delay=_memory_update_delay(),
         )
+        return await self._enter_owned_async_context(context_provider)
 
     async def _build_mcp_skills_provider(self, provider: ContextProviderSpec):
         tool = next((t for t in self.spec.tools if t.name == provider.tool_ref), None)
@@ -427,15 +570,25 @@ class MAFRuntime:
         from mcp.client.streamable_http import streamablehttp_client
 
         url = resolve_tool_url(tool)
+        timeout = _remote_mcp_timeout()
         http_client_factory = same_origin_mcp_httpx_client_factory(
             tool,
             url,
-            timeout=_remote_mcp_timeout(),
+            timeout=timeout,
         )
+        # This compatibility API creates the AsyncClient from the factory inside
+        # its own async context. Owning the transport context on our stack also
+        # owns that client; registering it separately would double-close it.
         read, write, _ = await self.stack.enter_async_context(
             streamablehttp_client(url=url, httpx_client_factory=http_client_factory)
         )
-        session = await self.stack.enter_async_context(ClientSession(read, write))
+        session = await self.stack.enter_async_context(
+            ClientSession(
+                read,
+                write,
+                read_timeout_seconds=timedelta(seconds=timeout),
+            )
+        )
         await session.initialize()
         return SkillsProvider(MCPSkillsSource(client=session))
 

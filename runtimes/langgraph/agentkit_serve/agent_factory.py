@@ -39,6 +39,7 @@ from langchain_openai import ChatOpenAI
 
 from agentkit_serve_common.adapter_support import (
     FORWARDED_ROLES,
+    AsyncExitStackLifecycle,
     AgentBuildError,
     declared_tool_env,
     normalize_agent_run_error,
@@ -127,11 +128,12 @@ class LangGraphRuntime:
     def __init__(self, spec: AgentSpec) -> None:
         self.spec = spec
         self.stack = AsyncExitStack()
+        self.lifecycle = AsyncExitStackLifecycle(self.stack)
         self.graph: Any | None = None
         self.client: MultiServerMCPClient | None = None
 
     async def __aenter__(self) -> RuntimeSession:
-        try:
+        async def start() -> RuntimeSession:
             model = build_model(self.spec)
             tools = await self._load_tools()
             self.graph = create_agent(
@@ -140,8 +142,12 @@ class LangGraphRuntime:
                 system_prompt=self.spec.instructions,
             )
             return self
-        except Exception:
-            await self.stack.aclose()
+
+        try:
+            return await self.lifecycle.enter(start)
+        except BaseException:
+            self.graph = None
+            self.client = None
             raise
 
     async def __aexit__(
@@ -150,9 +156,11 @@ class LangGraphRuntime:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> bool | None:
-        self.graph = None
-        await self.stack.aclose()
-        return None
+        try:
+            return await self.lifecycle.exit(exc_type, exc, tb)
+        finally:
+            self.graph = None
+            self.client = None
 
     async def run(self, request: RunRequest) -> RunResult:
         return await run_agent(self, request)
