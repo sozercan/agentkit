@@ -687,7 +687,17 @@ async def serve_acp_stdio(
             line = await asyncio.to_thread(input_stream.readline, _MAX_MESSAGE_BYTES + 2)
             if not line:
                 break
-            await server.accept_line(line.rstrip(b"\r\n"))
+            complete = line.endswith(b"\n")
+            frame = line.rstrip(b"\r\n") if complete else line
+            if len(frame) > _MAX_MESSAGE_BYTES:
+                await server.accept_line(frame)
+                while not complete:
+                    line = await asyncio.to_thread(input_stream.readline, _MAX_MESSAGE_BYTES + 2)
+                    if not line:
+                        break
+                    complete = line.endswith(b"\n")
+                continue
+            await server.accept_line(frame)
     finally:
         await server.close()
 

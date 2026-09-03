@@ -244,6 +244,34 @@ def test_stdio_server_frames_json_rpc_and_closes_on_eof(monkeypatch):
     assert any(message.get("method") == "session/update" for message in output)
 
 
+def test_stdio_server_drains_oversized_line_before_parsing_next_frame(monkeypatch):
+    monkeypatch.setattr(acp, "_MAX_MESSAGE_BYTES", 1024)
+    injected = json.dumps(_initialize(request_id=99), separators=(",", ":")).encode()
+    oversized_line = b"x" * (acp._MAX_MESSAGE_BYTES + 2) + injected + b"\n"
+    valid_line = json.dumps(_initialize(), separators=(",", ":")).encode() + b"\n"
+    reader = io.BytesIO(oversized_line + valid_line)
+    writer = io.BytesIO()
+
+    asyncio.run(
+        acp.serve_acp_stdio(
+            _spec(),
+            OfflineEchoRuntimeFactory(),
+            reader=reader,
+            writer=writer,
+        )
+    )
+
+    output = [json.loads(line) for line in writer.getvalue().splitlines()]
+    oversized_errors = [
+        message
+        for message in output
+        if message.get("error", {}).get("message") == "ACP message exceeds the 8 MiB limit"
+    ]
+    assert len(oversized_errors) == 1
+    assert not any(message.get("id") == 99 for message in output)
+    assert _response(output, 1)["result"]["protocolVersion"] == 1
+
+
 def test_offline_echo_gate_applies_to_acp(monkeypatch):
     monkeypatch.setenv("AGENTKIT_PROTOCOL", "acp")
     monkeypatch.setenv("AGENTKIT_ORKA_OFFLINE_ECHO", "true")
