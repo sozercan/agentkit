@@ -12,6 +12,7 @@ checkout, layer the v2 supervisor onto that immutable image:
 ```sh
 make docker-build-acp-agentkit-runtime \
   AGENTKIT_RUNTIME_IMAGE=ghcr.io/acme/fibey@sha256:<agentkit-image-digest> \
+  AGENTKIT_ADAPTER_DIGEST=sha256:<agentkit-serve-acp-adapter-digest> \
   ACP_AGENTKIT_RUNTIME_IMG=ghcr.io/acme/fibey-orka-v2:dev
 ```
 
@@ -42,7 +43,9 @@ Deploy the composed image as an operator-owned v2 supervisor service, configure
 the standard `ORKA_ACP_*` profile, fence, token-file, and runtime identity
 settings, then register it with Orka's strict-governed `AgentRuntime` sample.
 The profile model and `agentConfigurationDigest` must match the baked AgentKit
-config, and the registration's `adapterName` must be `agentkit-serve-acp`.
+config. The registration's `adapterName` must be `agentkit-serve-acp`, and its
+`adapterDigest` must equal the `AGENTKIT_ADAPTER_DIGEST` baked into the composed
+image.
 
 Orka freezes the AgentRuntime UID, generation, endpoint, profile, authentication
 Secret versions, and observed instance into each Task binding. It revalidates
