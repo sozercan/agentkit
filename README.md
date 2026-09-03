@@ -63,7 +63,7 @@ The image also exposes:
 
 ## Select a protocol surface
 
-AgentKit builds one custom-agent image and selects the HTTP protocol at runtime:
+AgentKit builds one custom-agent image and selects the protocol at runtime:
 
 ```sh
 # default standalone OpenAI-compatible surface
@@ -78,6 +78,10 @@ docker run \
   -e AGENTKIT_PROTOCOL=orka \
   -e AGENTKIT_AUTH_TOKEN=dev-token \
   ... image
+
+# ACP stdio child for an Orka harness v2 supervisor. The supervisor supplies
+# the provider proxy, MCP broker, model, and image-bound configuration digest.
+agentkit-serve --config /agent/agent.yaml --protocol acp
 ```
 
 Protocol endpoints:
@@ -87,6 +91,7 @@ Protocol endpoints:
 | `openai` | `/healthz`, `/v1/models`, `/v1/chat/completions` | Default, non-streaming Chat Completions. |
 | `foundry` | `/readiness`, `/invocations`, `/responses` | `/responses` is `foundry-responses-minimal`: synchronous/non-streaming only. |
 | `orka` | `/v1/health`, `/v1/capabilities`, `/v1/turns`, `/v1/turns/{turnID}/events`, `/v1/turns/{turnID}/continue`, `/v1/turns/{turnID}/cancel` | Observed-mode `orka.harness.v1` over HTTP+SSE by default. AgentKit reports frames; Orka enforces policy. Brokered read/write/coordination are feature-gated for conformance. |
+| `acp` | stdin/stdout | ACP protocol v1 child mode for Orka `orka.harness.v2`. It opens no network listener and accepts only the supervisor's loopback provider proxy and prompt-scoped HTTP MCP server. |
 
 After deploying the image with `AGENTKIT_PROTOCOL=orka` and an
 `AGENTKIT_AUTH_TOKEN` sourced from the Orka client-auth Secret, render an Orka
@@ -118,6 +123,12 @@ The event stream emits Orka `HarnessEventFrame` SSE payloads using flat identity
 fields (`runtimeSessionID`, `turnID`, `correlationID`), `createdAt`,
 `contentText` for runtime output, and `completed` / `failed` terminal payloads.
 See [`docs/orka.md`](docs/orka.md) for complete request/response examples.
+
+For harness v2, layer Orka's supervisor onto a digest-pinned AgentKit image and
+register the resulting service as a strict-governed external `AgentRuntime`.
+The supervisor starts `agentkit-serve --protocol acp` as an isolated child and
+keeps provider, MCP, workspace, permission, and publication authority outside
+AgentKit. See [`docs/orka.md`](docs/orka.md) for the composition contract.
 
 Note: this repository's `agentkit-serve` runtime is distinct from OpenAI's public
 AgentKit/Agents SDK product surface unless a future adapter explicitly targets it.

@@ -390,12 +390,32 @@ class MAFRuntime:
         try:
             async with lock:
                 self._touch_session(session_id)
+                session = self.sessions[session_id]
                 include_history = session_id not in self.initialized_sessions
-                result = await run_agent(self.agent, request, session=session, include_history=include_history)
+                try:
+                    result = await run_agent(
+                        self.agent,
+                        request,
+                        session=session,
+                        include_history=include_history,
+                    )
+                except BaseException:
+                    self._reset_session(session_id)
+                    raise
                 self.initialized_sessions.add(session_id)
                 return result
         finally:
             self._release_session_claim(session_id)
+
+    async def discard_session(self, session_id: str) -> None:
+        """Discard framework state for an ACP prompt that did not commit."""
+
+        lock = self.session_locks.get(session_id)
+        if lock is None:
+            return
+        async with lock:
+            if self.session_locks.get(session_id) is lock and session_id in self.sessions:
+                self._reset_session(session_id)
 
     def _session_for(self, session_id: str | None) -> tuple[AgentSession | None, asyncio.Lock | None]:
         if not session_id:
@@ -420,6 +440,10 @@ class MAFRuntime:
         self.session_locks[session_id] = lock
         self.most_recent_session_id = session_id
         self._evict_idle_sessions()
+
+    def _reset_session(self, session_id: str) -> None:
+        self.sessions[session_id] = AgentSession(session_id=session_id)
+        self.initialized_sessions.discard(session_id)
 
     def _release_session_claim(self, session_id: str) -> None:
         claims = self.session_claims.get(session_id, 0)
@@ -603,6 +627,10 @@ def supports_brokered_write() -> bool:
 
 def supports_brokered_coordination() -> bool:
     return offline_orka_echo_enabled()
+
+
+def supports_acp_http_mcp() -> bool:
+    return True
 
 
 def build_runtime(spec: AgentSpec) -> RuntimeSession:

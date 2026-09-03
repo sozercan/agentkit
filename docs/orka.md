@@ -1,4 +1,60 @@
-# Register an AgentKit image with Orka
+# Use an AgentKit image with Orka
+
+AgentKit supports two distinct Orka integrations. New BYO deployments should
+use `orka.harness.v2`: Orka's hardened supervisor runs AgentKit as an ACP stdio
+child. The older `orka.harness.v1` mode remains an observed HTTP+SSE adapter.
+
+## Harness v2 BYO runtime
+
+Build the AgentKit agent image first and address it by digest. In an Orka
+checkout, layer the v2 supervisor onto that immutable image:
+
+```sh
+make docker-build-acp-agentkit-runtime \
+  AGENTKIT_RUNTIME_IMAGE=ghcr.io/acme/fibey@sha256:<agentkit-image-digest> \
+  ACP_AGENTKIT_RUNTIME_IMG=ghcr.io/acme/fibey-orka-v2:dev
+```
+
+The composed image runs `orka-acp-runtime`. For each RuntimeSession, the
+supervisor starts this child under a private UID/GID and session tree:
+
+```sh
+/opt/agentkit/bin/agentkit-serve \
+  --config /agent/agent.yaml \
+  --protocol acp
+```
+
+The v2 path is strict:
+
+- `/agent/agent.yaml` must not contain direct `tools`, `brokeredTools`, or
+  context providers;
+- the registered model must equal `model.name` in the baked config;
+- `agentConfigurationDigest` is `sha256:` plus the SHA-256 of the exact
+  `/agent/agent.yaml` bytes;
+- the runtime advertises only the `agentkit-serve-acp` adapter digest;
+- Orka sends `AgentConfiguration: null`; the image-bound config is authoritative;
+- provider calls use the supervisor's loopback proxy, and tools use its one
+  prompt-scoped loopback HTTP MCP server;
+- the child retains successful user/assistant history for Session continuation
+  and discards cancelled or failed prompt history.
+
+Deploy the composed image as an operator-owned v2 supervisor service, configure
+the standard `ORKA_ACP_*` profile, fence, token-file, and runtime identity
+settings, then register it with Orka's strict-governed `AgentRuntime` sample.
+The profile model and `agentConfigurationDigest` must match the baked AgentKit
+config, and the registration's `adapterName` must be `agentkit-serve-acp`.
+
+Orka freezes the AgentRuntime UID, generation, endpoint, profile, authentication
+Secret versions, and observed instance into each Task binding. It revalidates
+them before dispatch and recovery mutations. `Task.spec.execution.workspace`
+is not supported for external runtimes; repository input still uses
+`Task.spec.workspace`.
+
+See Orka's `website/docs/guides/bring-your-own-agent-runtime.md` and
+`config/samples/core_v1alpha1_agentruntime.yaml` for the registration and
+authentication contract.
+
+## Harness v1 observed mode
 
 AgentKit images can expose observed-mode `orka.harness.v1` without rebuilding the
 agent. Start the same image with Orka mode enabled:
@@ -240,10 +296,11 @@ For deeper local validation, run the common Python Orka protocol tests:
 uv run --directory runtimes/common --extra dev pytest -q tests/test_orka_protocol.py
 ```
 
-## Render an AgentRuntime manifest
+## Render a harness v1 AgentRuntime manifest
 
-The current Orka `AgentRuntime` CRD supports external endpoints first. Deploy the
-AgentKit image yourself (for example as a Kubernetes Deployment/Service) with:
+The AgentKit renderer currently emits the harness v1 registration shape. Deploy
+the AgentKit image yourself, for example as a Kubernetes Deployment/Service,
+with:
 
 - `AGENTKIT_PROTOCOL=orka`
 - `AGENTKIT_BIND=0.0.0.0` so the Kubernetes Service can reach the harness outside

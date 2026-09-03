@@ -12,10 +12,11 @@ must be identical across adapters:
 | Module | Responsibility |
 |---|---|
 | `config.py` | Strict `/agent/agent.yaml` reader and ABI version check. |
-| `cli.py` | `agentkit-serve --config ... --protocol openai\|foundry\|orka`, bind/port handling, auth startup gates. |
+| `cli.py` | `agentkit-serve --config ... --protocol openai\|foundry\|orka\|acp`, bind/port handling, auth startup gates. |
 | `server.py` | FastAPI app and OpenAI-compatible response/error envelopes. |
 | `foundry.py` | Foundry `/readiness`, `/invocations`, and minimal `/responses` skin. |
 | `orka.py` | Observed-mode `orka.harness.v1` HTTP+SSE skin. |
+| `acp.py` | Strict ACP stdio child for an Orka `orka.harness.v2` supervisor. |
 | `conversation.py` | Protocol request normalization into `RunRequest`. |
 | `runtime.py` | `RuntimeFactory`, `RuntimeSession`, `RunResult`, `AgentRunError`. |
 | `adapter_support.py` | API-key lookup, tool env projection, timeout parsing, error normalization. |
@@ -26,7 +27,7 @@ The protocol app factories receive an adapter module that satisfies
 `RuntimeSession.run(request)`, so it never imports pydantic-ai, Microsoft Agent
 Framework, LangChain, OpenAI SDK types, Azure, Foundry SDKs, or Orka controllers.
 
-## HTTP surface
+## Protocol surfaces
 
 All adapters can serve the same selected protocol surface. `openai` is the
 default. `foundry` and `orka` are selected with `--protocol` or
@@ -44,6 +45,13 @@ Foundry mode exposes `/readiness`, `/invocations`, and synchronous
 port; generated images expose both `8080` and `8088` in OCI metadata for that
 case. Orka mode exposes `orka.harness.v1` health, capabilities, turn
 acceptance, SSE replay, and cancel endpoints.
+
+ACP mode opens no listener. It speaks newline-delimited ACP JSON-RPC on stdin
+and stdout. The child verifies the configured model and SHA-256 digest of the
+exact `/agent/agent.yaml` bytes before accepting a session. It rejects baked
+direct tools, `brokeredTools`, and context providers. At session creation it
+accepts at most one loopback HTTP MCP server with bearer authentication, which
+is the prompt-scoped broker created by the Orka supervisor.
 
 Request behavior is intentionally narrow:
 
@@ -76,7 +84,7 @@ configured `baseURL` at runtime.
 
 ## Network posture
 
-The generated image defaults to `AGENTKIT_BIND=127.0.0.1`. At runtime:
+The generated image defaults to `AGENTKIT_BIND=127.0.0.1`. In HTTP modes:
 
 - loopback binds need no token except in Orka mode,
 - non-loopback binds such as `0.0.0.0` require `AGENTKIT_AUTH_TOKEN`, and
@@ -86,6 +94,11 @@ The generated image defaults to `AGENTKIT_BIND=127.0.0.1`. At runtime:
 OpenAI `/healthz` and Orka `/v1/health` and `/v1/capabilities` are intentionally
 unauthenticated so container platforms and orchestrators can probe/discover the
 service. Orka turn, event, cancel, and output endpoints always require a token.
+
+ACP mode ignores bind and port settings because it uses stdio. The Orka
+supervisor injects only `AGENTKIT_ACP_PROVIDER_BASE_URL`,
+`AGENTKIT_ACP_PROVIDER_TOKEN`, `AGENTKIT_ACP_MODEL`, and
+`AGENTKIT_ACP_AGENT_CONFIGURATION_DIGEST` into the child.
 
 ## Tool lifecycle and env projection
 

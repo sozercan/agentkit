@@ -191,6 +191,13 @@ def supports_brokered_coordination() -> bool:
     return offline_orka_echo_enabled()
 
 
+def supports_acp_http_mcp() -> bool:
+    return (
+        offline_orka_echo_enabled()
+        or (MCPToolset is not None and StreamableHttpTransport is not None)
+    )
+
+
 def build_runtime(spec: AgentSpec) -> RuntimeSession:
     """Build the runtime session consumed by the shared server."""
     if offline_orka_echo_enabled():

@@ -9,9 +9,11 @@ or LangGraph.
 
 - `config.py` — strict `/agent/agent.yaml` ABI loader, version check, env
   requirement validation, and provider-neutral schema validation.
-- `cli.py` — `agentkit-serve --config ... --protocol openai|foundry|orka`,
+- `cli.py` — `agentkit-serve --config ... --protocol acp|openai|foundry|orka`,
   bind/port handling, and startup auth gates for non-loopback binds and Orka
   protected endpoints.
+- `acp.py` — ACP protocol v1 over newline-delimited JSON-RPC on stdio for the
+  Orka harness v2 supervisor.
 - `server.py` — FastAPI app for `/healthz`, `/v1/models`, and
   `/v1/chat/completions`.
 - `foundry.py` — reusable Foundry Hosted Agent protocol wrapper for
@@ -37,6 +39,25 @@ and `RuntimeSession.run(request) -> RunResult`. It never imports framework
 packages or touches raw framework agent lifecycle.
 
 This keeps framework dependency lock-in inside each adapter's `agent_factory.py`.
+
+## Orka ACP child mode
+
+Orka harness v2 starts the adapter as one child process per RuntimeSession:
+
+```sh
+agentkit-serve --config /agent/agent.yaml --protocol acp
+```
+
+ACP mode requires `AGENTKIT_ACP_AGENT_CONFIGURATION_DIGEST` to equal the
+`sha256:` digest of the exact config file bytes and `AGENTKIT_ACP_MODEL` to
+equal `model.name`. It replaces the baked model endpoint and credential with
+`AGENTKIT_ACP_PROVIDER_BASE_URL` and `AGENTKIT_ACP_PROVIDER_TOKEN`.
+
+The child accepts one ACP session, text prompts, cancellation, and at most one
+loopback HTTP MCP server carrying a bearer Authorization header. The runtime
+keeps successful user and assistant turns for later prompts. It rejects baked
+`tools`, `brokeredTools`, and context providers. Orka owns process and workspace
+isolation, prompt-scoped MCP authority, provider proxying, and cleanup proof.
 
 ## Adding a runtime adapter
 

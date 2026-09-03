@@ -753,7 +753,7 @@ def test_reused_session_does_not_duplicate_explicit_history(monkeypatch):
     assert include_history_values == [True, False]
 
 
-def test_failed_first_turn_keeps_explicit_history_on_retry(monkeypatch):
+def test_failed_first_turn_replaces_session_and_keeps_explicit_history_on_retry(monkeypatch):
     from agentkit_serve_common.config import AgentSpec
     from agentkit_serve_common.conversation import ConversationTurn, RunRequest
     from agentkit_serve_common.runtime import RunResult
@@ -797,7 +797,8 @@ def test_failed_first_turn_keeps_explicit_history_on_retry(monkeypatch):
     asyncio.run(exercise())
 
     assert include_history_values == [True, True, False]
-    assert seen_sessions[0] is seen_sessions[1] is seen_sessions[2]
+    assert seen_sessions[0] is not seen_sessions[1]
+    assert seen_sessions[1] is seen_sessions[2]
 
 
 def test_remote_mcp_disables_ping(monkeypatch):
@@ -976,3 +977,5 @@ def test_maf_orka_offline_echo_bypasses_provider_runtime(monkeypatch):
     runtime = agent_factory.build_runtime(spec)
 
     assert runtime.__class__.__name__ == "OfflineEchoRuntime"
+    monkeypatch.setenv("AGENTKIT_PROTOCOL", "acp")
+    assert agent_factory.supports_acp_http_mcp() is True
