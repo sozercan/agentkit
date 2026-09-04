@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Awaitable, BinaryIO, Callable, Iterator, Mapping
 from urllib.parse import urlsplit
 
+from .adapter_support import _attach_secondary_error, _wait_for_owner_task
 from .config import AgentSpec, load_with_bytes
 from .conversation import ConversationTurn, RunRequest
 from .runtime import AgentRunError, RuntimeFactory, RuntimeSession
@@ -68,6 +69,85 @@ class ACPProtocolError(Exception):
 
 class ACPConfigurationError(ValueError):
     """An ACP startup binding or strict-mode configuration failure."""
+
+
+@dataclass
+class _PendingStdioWrite:
+    frame: bytes
+    completed: asyncio.Future[None]
+
+
+def _retrieve_future_exception(future: asyncio.Future[None]) -> None:
+    if not future.cancelled():
+        future.exception()
+
+
+class _ACPStdioWriter:
+    """Serialize protocol frames without blocking the asyncio event loop."""
+
+    def __init__(self, output_stream: BinaryIO) -> None:
+        self._output_stream = output_stream
+        self._queue: asyncio.Queue[_PendingStdioWrite | None] = asyncio.Queue()
+        self._failure: BaseException | None = None
+        self._closed = False
+        self._worker = asyncio.create_task(self._run(), name="agentkit-acp-stdio-writer")
+
+    async def send(self, message: Mapping[str, Any]) -> None:
+        frame = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
+        if len(frame) > _MAX_MESSAGE_BYTES:
+            raise RuntimeError("ACP response exceeds the 8 MiB limit")
+        if self._failure is not None:
+            raise RuntimeError("ACP stdio writer failed") from self._failure
+        if self._closed:
+            raise RuntimeError("ACP stdio writer is closed")
+
+        completed = asyncio.get_running_loop().create_future()
+        self._queue.put_nowait(_PendingStdioWrite(frame=frame, completed=completed))
+        try:
+            await asyncio.shield(completed)
+        except asyncio.CancelledError:
+            # The worker owns an enqueued frame until the physical write finishes.
+            # Keep its completion observable without letting caller cancellation
+            # release serialization or produce an unhandled future exception.
+            completed.add_done_callback(_retrieve_future_exception)
+            raise
+
+    async def close(self, *, preserve: BaseException | None = None) -> None:
+        if not self._closed:
+            self._closed = True
+            self._queue.put_nowait(None)
+        await _wait_for_owner_task(self._worker, preserve=preserve)
+
+    async def _run(self) -> None:
+        pending: _PendingStdioWrite | None = None
+        try:
+            while True:
+                pending = await self._queue.get()
+                if pending is None:
+                    return
+                await asyncio.to_thread(self._write, pending.frame)
+                pending.completed.set_result(None)
+                pending = None
+        except BaseException as exc:  # noqa: BLE001 - wake every sender on terminal worker failure.
+            self._failure = exc
+            self._closed = True
+            if pending is not None and not pending.completed.done():
+                pending.completed.set_exception(exc)
+            self._fail_queued_writes(exc)
+            raise
+
+    def _write(self, frame: bytes) -> None:
+        self._output_stream.write(frame)
+        self._output_stream.flush()
+
+    def _fail_queued_writes(self, error: BaseException) -> None:
+        while True:
+            try:
+                pending = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            if pending is not None and not pending.completed.done():
+                pending.completed.set_exception(error)
 
 
 @dataclass
@@ -749,18 +829,10 @@ async def serve_acp_stdio(
 
     input_stream = reader or sys.stdin.buffer
     output_stream = writer or sys.stdout.buffer
-    write_lock = asyncio.Lock()
-
-    async def send(message: Mapping[str, Any]) -> None:
-        encoded = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
-        if len(encoded) > _MAX_MESSAGE_BYTES:
-            raise RuntimeError("ACP response exceeds the 8 MiB limit")
-        async with write_lock:
-            output_stream.write(encoded)
-            output_stream.flush()
-
-    server = ACPStdioServer(spec, factory, send)
+    stdio_writer = _ACPStdioWriter(output_stream)
+    server: ACPStdioServer | None = None
     try:
+        server = ACPStdioServer(spec, factory, stdio_writer.send)
         while True:
             line = await asyncio.to_thread(input_stream.readline, _MAX_MESSAGE_BYTES + 2)
             if not line:
@@ -777,7 +849,21 @@ async def serve_acp_stdio(
                 continue
             await server.accept_line(frame)
     finally:
-        await server.close()
+        primary_error = sys.exc_info()[1]
+        try:
+            if server is not None:
+                await server.close()
+        except BaseException as close_error:
+            if primary_error is None:
+                primary_error = close_error
+                raise
+            _attach_secondary_error(
+                primary_error,
+                close_error,
+                label="ACP server cleanup also failed",
+            )
+        finally:
+            await stdio_writer.close(preserve=primary_error)
 
 
 def run_acp_stdio(spec: AgentSpec, factory: RuntimeFactory) -> None:

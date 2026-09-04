@@ -5,6 +5,8 @@ import hashlib
 import io
 import json
 import os
+import queue
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from types import TracebackType
@@ -236,6 +238,63 @@ class BlockingExitRuntime(BlockingEnterRuntime):
         return None
 
 
+class FeedingReader:
+    def __init__(self) -> None:
+        self.lines: queue.Queue[bytes] = queue.Queue()
+
+    def readline(self, limit: int) -> bytes:  # noqa: ARG002
+        return self.lines.get()
+
+    def feed(self, message: dict[str, Any]) -> None:
+        self.lines.put(json.dumps(message, separators=(",", ":")).encode() + b"\n")
+
+    def close(self) -> None:
+        self.lines.put(b"")
+
+
+class RecordingWriter:
+    def __init__(self, *, block_first_update: bool = False) -> None:
+        self.block_first_update = block_first_update
+        self.blocked = threading.Event()
+        self.release = threading.Event()
+        self.frames: list[bytes] = []
+        self.lock = threading.Lock()
+
+    def write(self, frame: bytes) -> int:
+        message = json.loads(frame)
+        if (
+            self.block_first_update
+            and message.get("method") == "session/update"
+            and not self.blocked.is_set()
+        ):
+            self.blocked.set()
+            if not self.release.wait(timeout=5):
+                raise TimeoutError("test did not release blocked ACP writer")
+        with self.lock:
+            self.frames.append(bytes(frame))
+        return len(frame)
+
+    def flush(self) -> None:
+        return None
+
+    def messages(self) -> list[dict[str, Any]]:
+        with self.lock:
+            frames = list(self.frames)
+        return [json.loads(frame) for frame in frames]
+
+
+async def _wait_for_stdio_response(writer: RecordingWriter, request_id: int) -> dict[str, Any]:
+    async def wait() -> dict[str, Any]:
+        while True:
+            matches = [message for message in writer.messages() if message.get("id") == request_id]
+            if matches:
+                assert len(matches) == 1
+                return matches[0]
+            await asyncio.sleep(0)
+
+    return await asyncio.wait_for(wait(), timeout=5)
+
+
 def test_offline_echo_round_trip_uses_canonical_acp_shapes(monkeypatch):
     _set_provider_environment(monkeypatch)
 
@@ -278,30 +337,31 @@ def test_offline_echo_round_trip_uses_canonical_acp_shapes(monkeypatch):
 def test_stdio_server_frames_json_rpc_and_closes_on_eof(monkeypatch):
     _set_provider_environment(monkeypatch)
     monkeypatch.setattr(acp.secrets, "token_hex", lambda size: "b" * (size * 2))
-    session_id = "agentkit-" + "b" * 32
-    requests = [
-        _initialize(),
-        _new_session(),
-        _prompt(3, session_id, "through stdio"),
-    ]
-    reader = io.BytesIO(
-        b"".join(
-            json.dumps(request, separators=(",", ":")).encode() + b"\n"
-            for request in requests
-        )
-    )
-    writer = io.BytesIO()
 
-    asyncio.run(
-        acp.serve_acp_stdio(
-            _spec(),
-            OfflineEchoRuntimeFactory(),
-            reader=reader,
-            writer=writer,
+    async def exercise() -> list[dict[str, Any]]:
+        reader = FeedingReader()
+        writer = RecordingWriter()
+        serve_task = asyncio.create_task(
+            acp.serve_acp_stdio(
+                _spec(),
+                OfflineEchoRuntimeFactory(),
+                reader=reader,
+                writer=writer,
+            )
         )
-    )
+        try:
+            reader.feed(_initialize())
+            await _wait_for_stdio_response(writer, 1)
+            reader.feed(_new_session())
+            created = await _wait_for_stdio_response(writer, 2)
+            reader.feed(_prompt(3, created["result"]["sessionId"], "through stdio"))
+            await _wait_for_stdio_response(writer, 3)
+        finally:
+            reader.close()
+            await asyncio.wait_for(serve_task, timeout=1)
+        return writer.messages()
 
-    output = [json.loads(line) for line in writer.getvalue().splitlines()]
+    output = asyncio.run(exercise())
     assert _response(output, 3)["result"] == {"stopReason": "end_turn"}
     assert any(message.get("method") == "session/update" for message in output)
 
@@ -312,26 +372,33 @@ def test_stdio_server_splits_output_larger_than_orka_acp_reader_limit(monkeypatc
     session_id = "agentkit-" + "c" * 32
     result_text = "x" * ((2 << 20) + 1)
     runtime = RecordingRuntime([RunResult(result_text)])
-    requests = [_initialize(), _new_session(), _prompt(3, session_id, "large output")]
-    reader = io.BytesIO(
-        b"".join(
-            json.dumps(request, separators=(",", ":")).encode() + b"\n"
-            for request in requests
-        )
-    )
-    writer = io.BytesIO()
 
-    asyncio.run(
-        acp.serve_acp_stdio(
-            _spec(),
-            RecordingFactory(lambda: runtime),
-            reader=reader,
-            writer=writer,
+    async def exercise() -> RecordingWriter:
+        reader = FeedingReader()
+        writer = RecordingWriter()
+        serve_task = asyncio.create_task(
+            acp.serve_acp_stdio(
+                _spec(),
+                RecordingFactory(lambda: runtime),
+                reader=reader,
+                writer=writer,
+            )
         )
-    )
+        try:
+            reader.feed(_initialize())
+            await _wait_for_stdio_response(writer, 1)
+            reader.feed(_new_session())
+            await _wait_for_stdio_response(writer, 2)
+            reader.feed(_prompt(3, session_id, "large output"))
+            await _wait_for_stdio_response(writer, 3)
+        finally:
+            reader.close()
+            await asyncio.wait_for(serve_task, timeout=1)
+        return writer
 
-    lines = writer.getvalue().splitlines()
-    output = [json.loads(line) for line in lines]
+    writer = asyncio.run(exercise())
+    lines = list(writer.frames)
+    output = writer.messages()
     updates = [message for message in output if message.get("method") == "session/update"]
     chunks = [message["params"]["update"]["content"]["text"] for message in updates]
 
@@ -371,6 +438,103 @@ def test_stdio_server_drains_oversized_line_before_parsing_next_frame(monkeypatc
     assert len(oversized_errors) == 1
     assert not any(message.get("id") == 99 for message in output)
     assert _response(output, 1)["result"]["protocolVersion"] == 1
+
+
+def test_stdio_blocked_writer_does_not_block_cancel_dispatch(monkeypatch):
+    _set_provider_environment(monkeypatch)
+    runtime = RecordingRuntime([RunResult("late answer"), RunResult("clean answer")])
+    factory = RecordingFactory(lambda: runtime)
+    cancel_dispatched = asyncio.Event()
+    original_cancel_state = ACPStdioServer._cancel_state  # noqa: SLF001
+
+    def record_cancel(server: ACPStdioServer, state) -> None:  # noqa: ANN001
+        cancel_dispatched.set()
+        original_cancel_state(server, state)
+
+    monkeypatch.setattr(ACPStdioServer, "_cancel_state", record_cancel)
+
+    async def exercise() -> None:
+        reader = FeedingReader()
+        writer = RecordingWriter(block_first_update=True)
+        serve_task = asyncio.create_task(
+            acp.serve_acp_stdio(_spec(), factory, reader=reader, writer=writer)
+        )
+        try:
+            reader.feed(_initialize())
+            await _wait_for_stdio_response(writer, 1)
+            reader.feed(_new_session())
+            created = await _wait_for_stdio_response(writer, 2)
+            session_id = created["result"]["sessionId"]
+
+            reader.feed(_prompt(3, session_id, "cancel under backpressure"))
+            assert await asyncio.to_thread(writer.blocked.wait, 1)
+            reader.feed(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/cancel",
+                    "params": {"sessionId": session_id},
+                }
+            )
+            await asyncio.wait_for(cancel_dispatched.wait(), timeout=1)
+
+            writer.release.set()
+            cancelled = await _wait_for_stdio_response(writer, 3)
+            assert cancelled["result"] == {"stopReason": "cancelled"}
+            assert runtime.discarded_sessions == [session_id]
+
+            reader.feed(_prompt(4, session_id, "try again"))
+            completed = await _wait_for_stdio_response(writer, 4)
+            assert completed["result"] == {"stopReason": "end_turn"}
+            assert runtime.requests[1].history == ()
+        finally:
+            writer.release.set()
+            reader.close()
+            await asyncio.wait_for(serve_task, timeout=1)
+
+    asyncio.run(exercise())
+
+
+def test_stdio_writer_close_waits_for_in_flight_write_after_cancellation():
+    async def exercise() -> None:
+        output = RecordingWriter(block_first_update=True)
+        writer = acp._ACPStdioWriter(output)  # noqa: SLF001
+        send_task = asyncio.create_task(
+            writer.send({"jsonrpc": "2.0", "method": "session/update"})
+        )
+        assert await asyncio.to_thread(output.blocked.wait, 1)
+
+        close_task = asyncio.create_task(writer.close())
+        await asyncio.sleep(0)
+        close_task.cancel()
+        await asyncio.sleep(0)
+        assert not close_task.done()
+
+        output.release.set()
+        await send_task
+        with pytest.raises(asyncio.CancelledError):
+            await close_task
+
+    asyncio.run(exercise())
+
+
+def test_stdio_server_surfaces_writer_failure():
+    class FailingWriter:
+        def write(self, frame: bytes) -> int:  # noqa: ARG002
+            raise BrokenPipeError("supervisor closed stdout")
+
+        def flush(self) -> None:
+            return None
+
+    request = json.dumps(_initialize(), separators=(",", ":")).encode() + b"\n"
+    with pytest.raises(BrokenPipeError, match="supervisor closed stdout"):
+        asyncio.run(
+            acp.serve_acp_stdio(
+                _spec(),
+                OfflineEchoRuntimeFactory(),
+                reader=io.BytesIO(request),
+                writer=FailingWriter(),
+            )
+        )
 
 
 def test_offline_echo_gate_applies_to_acp(monkeypatch):
