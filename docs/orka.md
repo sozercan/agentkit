@@ -12,7 +12,7 @@ checkout, layer the v2 supervisor onto that immutable image:
 ```sh
 make docker-build-acp-agentkit-runtime \
   AGENTKIT_RUNTIME_IMAGE=ghcr.io/acme/fibey@sha256:<agentkit-image-digest> \
-  AGENTKIT_ADAPTER_DIGEST=sha256:<agentkit-serve-acp-adapter-digest> \
+  AGENTKIT_ADAPTER_DIGEST=sha256:<agentkit-image-digest> \
   ACP_AGENTKIT_RUNTIME_IMG=ghcr.io/acme/fibey-orka-v2:dev
 ```
 
@@ -32,7 +32,8 @@ The v2 path is strict:
 - the registered model must equal `model.name` in the baked config;
 - `agentConfigurationDigest` is `sha256:` plus the SHA-256 of the exact
   `/agent/agent.yaml` bytes;
-- the runtime advertises only the `agentkit-serve-acp` adapter digest;
+- the runtime advertises only `agentkit-serve-acp`, with the digest-pinned
+  AgentKit source image identity as its adapter digest;
 - Orka sends `AgentConfiguration: null`; the image-bound config is authoritative;
 - provider calls use the supervisor's loopback proxy, and tools use its one
   prompt-scoped loopback HTTP MCP server;
@@ -43,9 +44,9 @@ Deploy the composed image as an operator-owned v2 supervisor service, configure
 the standard `ORKA_ACP_*` profile, fence, token-file, and runtime identity
 settings, then register it with Orka's strict-governed `AgentRuntime` sample.
 The profile model and `agentConfigurationDigest` must match the baked AgentKit
-config. The registration's `adapterName` must be `agentkit-serve-acp`, and its
-`adapterDigest` must equal the `AGENTKIT_ADAPTER_DIGEST` baked into the composed
-image.
+config. The registration's `adapterName` must be `agentkit-serve-acp`. Its
+`adapterDigest` and the composition build's `AGENTKIT_ADAPTER_DIGEST` must both
+equal the `sha256:` digest from `AGENTKIT_RUNTIME_IMAGE`.
 
 Orka freezes the AgentRuntime UID, generation, endpoint, profile, authentication
 Secret versions, and observed instance into each Task binding. It revalidates
