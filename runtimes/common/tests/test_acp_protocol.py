@@ -258,6 +258,7 @@ class RecordingWriter:
         self.blocked = threading.Event()
         self.release = threading.Event()
         self.frames: list[bytes] = []
+        self.parsed_messages: list[dict[str, Any]] = []
         self.lock = threading.Lock()
 
     def write(self, frame: bytes) -> int:
@@ -272,6 +273,7 @@ class RecordingWriter:
                 raise TimeoutError("test did not release blocked ACP writer")
         with self.lock:
             self.frames.append(bytes(frame))
+            self.parsed_messages.append(message)
         return len(frame)
 
     def flush(self) -> None:
@@ -279,8 +281,7 @@ class RecordingWriter:
 
     def messages(self) -> list[dict[str, Any]]:
         with self.lock:
-            frames = list(self.frames)
-        return [json.loads(frame) for frame in frames]
+            return list(self.parsed_messages)
 
 
 async def _wait_for_stdio_response(writer: RecordingWriter, request_id: int) -> dict[str, Any]:
