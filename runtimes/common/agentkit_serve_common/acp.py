@@ -472,9 +472,9 @@ class ACPStdioServer:
         mcp_servers: list[Any],
     ) -> tuple[AgentSpec, dict[str, str]]:
         provider_base_url = os.environ.get(ACP_PROVIDER_BASE_URL_ENV, "")
-        provider_token = os.environ.get(ACP_PROVIDER_TOKEN_ENV, "")
+        provider_auth_value = os.environ.get(ACP_PROVIDER_TOKEN_ENV, "")
         provider_base_url = _loopback_http_url(provider_base_url, name=ACP_PROVIDER_BASE_URL_ENV)
-        _safe_environment_value(provider_token, name=ACP_PROVIDER_TOKEN_ENV)
+        _safe_environment_value(provider_auth_value, name=ACP_PROVIDER_TOKEN_ENV)
 
         data = self.spec.model_dump(by_alias=True)
         data["model"]["baseURL"] = provider_base_url
