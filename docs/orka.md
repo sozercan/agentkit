@@ -46,7 +46,12 @@ settings, then register it with Orka's strict-governed `AgentRuntime` sample.
 The profile model and `agentConfigurationDigest` must match the baked AgentKit
 config. The registration's `adapterName` must be `agentkit-serve-acp`. Its
 `adapterDigest` and the composition build's `AGENTKIT_ADAPTER_DIGEST` must both
-equal the `sha256:` digest from `AGENTKIT_RUNTIME_IMAGE`.
+equal the `sha256:` digest from `AGENTKIT_RUNTIME_IMAGE`. Set the profile's
+`providerKind` to `agentkit` and advertise
+`supportsAgentSessionConfiguration: false`. `approvalRequiredTools` must stay
+empty because the AgentKit ACP child does not implement permission callbacks.
+If the registration allows brokered tools, the Task must submit that exact
+`allowedTools` list.
 
 Set `ORKA_ACP_CONTROLLER_EPOCH` from Orka's current `ControllerEpoch` record:
 
