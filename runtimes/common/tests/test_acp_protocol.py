@@ -517,6 +517,72 @@ def test_stdio_writer_close_waits_for_in_flight_write_after_cancellation():
     asyncio.run(exercise())
 
 
+def test_stdio_writer_retains_write_ownership_after_sender_cancellation():
+    class BlockingWriter:
+        def __init__(self) -> None:
+            self.first_started = threading.Event()
+            self.second_started = threading.Event()
+            self.release_first = threading.Event()
+            self.frames: list[bytes] = []
+            self.active_writes = 0
+            self.max_active_writes = 0
+            self.lock = threading.Lock()
+
+        def write(self, frame: bytes) -> int:
+            message = json.loads(frame)
+            with self.lock:
+                self.active_writes += 1
+                self.max_active_writes = max(self.max_active_writes, self.active_writes)
+            try:
+                if message["id"] == 1:
+                    self.first_started.set()
+                    if not self.release_first.wait(timeout=5):
+                        raise TimeoutError("test did not release first ACP writer call")
+                else:
+                    self.second_started.set()
+                with self.lock:
+                    self.frames.append(bytes(frame))
+                return len(frame)
+            finally:
+                with self.lock:
+                    self.active_writes -= 1
+
+        def flush(self) -> None:
+            return None
+
+    async def exercise() -> None:
+        output = BlockingWriter()
+        writer = acp._ACPStdioWriter(output)  # noqa: SLF001
+        first_send = asyncio.create_task(
+            writer.send({"jsonrpc": "2.0", "id": 1, "result": {}})
+        )
+        assert await asyncio.to_thread(output.first_started.wait, 1)
+
+        first_send.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first_send
+
+        second_send = asyncio.create_task(
+            writer.send({"jsonrpc": "2.0", "id": 2, "result": {}})
+        )
+        await asyncio.sleep(0)
+        assert not second_send.done()
+
+        close_task = asyncio.create_task(writer.close())
+        await asyncio.sleep(0)
+        assert not output.second_started.is_set()
+        assert not close_task.done()
+
+        output.release_first.set()
+        await second_send
+        await close_task
+
+        assert [json.loads(frame)["id"] for frame in output.frames] == [1, 2]
+        assert output.max_active_writes == 1
+
+    asyncio.run(exercise())
+
+
 def test_stdio_server_surfaces_writer_failure():
     class FailingWriter:
         def write(self, frame: bytes) -> int:  # noqa: ARG002
