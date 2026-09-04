@@ -51,7 +51,7 @@ _INVALID_REQUEST = -32600
 _METHOD_NOT_FOUND = -32601
 _INVALID_PARAMS = -32602
 _INTERNAL_ERROR = -32603
-_RUNTIME_ERROR = -32000
+_REQUEST_CANCELLED = -32800
 
 _MessageSender = Callable[[Mapping[str, Any]], Awaitable[None]]
 
@@ -246,6 +246,9 @@ class ACPStdioServer:
         )
         self.sessions: dict[str, _SessionState] = {}
         self.requests: dict[str, asyncio.Task[None]] = {}
+        self.active_handlers: dict[str, asyncio.Task[None]] = {}
+        self.started_handlers: set[str] = set()
+        self.handler_cancellations: set[str] = set()
         self.prompt_requests: dict[str, _SessionState] = {}
         self.session_creation_active = False
         self.closed = False
@@ -291,6 +294,8 @@ class ACPStdioServer:
             name=f"agentkit-acp-{method}",
         )
         self.requests[key] = task
+        if method != _METHOD_SESSION_PROMPT:
+            self.active_handlers[key] = task
         task.add_done_callback(lambda completed, request_key=key: self._request_done(request_key, completed))
         # Give prompt dispatch a chance to register its cancellation target before
         # the reader accepts an immediately following session/cancel notification.
@@ -312,6 +317,8 @@ class ACPStdioServer:
             state.cancel_requested = True
             if state.active_run is not None and not state.active_run.done():
                 state.active_run.cancel()
+        for key in tuple(self.active_handlers):
+            self._cancel_handler(key)
         await self.wait_idle()
         errors: list[BaseException] = []
         for state in reversed(tuple(self.sessions.values())):
@@ -328,36 +335,56 @@ class ACPStdioServer:
     def _request_done(self, key: str, task: asyncio.Task[None]) -> None:
         if self.requests.get(key) is task:
             self.requests.pop(key, None)
+        if self.active_handlers.get(key) is task:
+            self.active_handlers.pop(key, None)
+        self.started_handlers.discard(key)
+        self.handler_cancellations.discard(key)
         # Retrieve exceptions even if stdout failed after the caller disconnected.
         if not task.cancelled():
             task.exception()
 
     async def _dispatch_request(self, response_id: Any, key: str, method: str, params: Any) -> None:
+        handler = asyncio.current_task()
+        if handler is None:
+            raise RuntimeError("ACP request dispatch requires an asyncio task")
+        if method != _METHOD_SESSION_PROMPT:
+            self.started_handlers.add(key)
+        result: Any = None
+        error: tuple[int, str, Mapping[str, Any] | None] | None = None
         try:
-            if method == _METHOD_INITIALIZE:
-                result = self._initialize(params)
-            elif method == _METHOD_SESSION_NEW:
-                result = await self._new_session(params)
-            elif method == _METHOD_SESSION_PROMPT:
-                result = await self._prompt(key, params)
-            else:
-                raise ACPProtocolError(_METHOD_NOT_FOUND, f"unsupported ACP method {method!r}")
-        except ACPProtocolError as exc:
-            await self._send_protocol_error(response_id, exc)
-            return
-        except AgentRunError as exc:
-            data = {"code": exc.code or exc.__class__.__name__}
-            await self._send_error(response_id, _RUNTIME_ERROR, "AgentKit runtime prompt failed", data)
-            return
-        except BaseException as exc:  # noqa: BLE001 - keep provider details off stdout.
-            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-                raise
-            await self._send_error(
-                response_id,
-                _INTERNAL_ERROR,
-                "AgentKit ACP request failed",
-                {"code": exc.__class__.__name__},
-            )
+            try:
+                if key in self.handler_cancellations:
+                    raise asyncio.CancelledError
+                if method == _METHOD_INITIALIZE:
+                    result = self._initialize(params)
+                elif method == _METHOD_SESSION_NEW:
+                    result = await self._new_session(params)
+                elif method == _METHOD_SESSION_PROMPT:
+                    result = await self._prompt(key, params)
+                else:
+                    raise ACPProtocolError(_METHOD_NOT_FOUND, f"unsupported ACP method {method!r}")
+            except asyncio.CancelledError:
+                error = (_REQUEST_CANCELLED, "ACP request cancelled", None)
+            except ACPProtocolError as exc:
+                error = (exc.code, exc.message, exc.data)
+            except AgentRunError as exc:
+                data = {"code": exc.code or exc.__class__.__name__}
+                error = (_INTERNAL_ERROR, "AgentKit runtime prompt failed", data)
+            except BaseException as exc:  # noqa: BLE001 - keep provider details off stdout.
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
+                error = (
+                    _INTERNAL_ERROR,
+                    "AgentKit ACP request failed",
+                    {"code": exc.__class__.__name__},
+                )
+        finally:
+            if self.active_handlers.get(key) is handler:
+                self.active_handlers.pop(key, None)
+            self.started_handlers.discard(key)
+            self.handler_cancellations.discard(key)
+        if error is not None:
+            await self._send_error(response_id, *error)
             return
         await self.send({"jsonrpc": _JSONRPC_VERSION, "id": response_id, "result": result})
 
@@ -375,7 +402,11 @@ class ACPStdioServer:
                 key = _request_key(params["requestId"])
             except ACPProtocolError:
                 return
-            self._cancel_state(self.prompt_requests.get(key))
+            state = self.prompt_requests.get(key)
+            if state is not None:
+                self._cancel_state(state)
+                return
+            self._cancel_handler(key)
 
     def _initialize(self, params: Any) -> dict[str, Any]:
         request = _required_object(params)
@@ -562,17 +593,34 @@ class ACPStdioServer:
         if state is None:
             raise ACPProtocolError(_INVALID_PARAMS, "unknown ACP sessionId")
         if state.active_request_key is not None:
-            raise ACPProtocolError(_RUNTIME_ERROR, "ACP session already has an active prompt")
+            raise ACPProtocolError(_REQUEST_CANCELLED, "ACP session already has an active prompt")
         prompt = request.get("prompt")
         if not isinstance(prompt, list) or not prompt:
             raise ACPProtocolError(_INVALID_PARAMS, "prompt must be a non-empty array")
         text_blocks: list[str] = []
         for index, raw_block in enumerate(prompt):
             block = _required_object(raw_block, name=f"prompt[{index}]")
-            if block.get("type") != "text":
-                raise ACPProtocolError(_INVALID_PARAMS, "ACP mode accepts only text prompt blocks")
-            text_blocks.append(
-                _required_prompt_text(block.get("text"), name=f"prompt[{index}].text")
+            block_type = block.get("type")
+            if block_type == "text":
+                text_blocks.append(
+                    _required_prompt_text(block.get("text"), name=f"prompt[{index}].text")
+                )
+                continue
+            if block_type == "resource_link":
+                name = _required_string(block.get("name"), name=f"prompt[{index}].name")
+                uri = _required_string(block.get("uri"), name=f"prompt[{index}].uri")
+                projected = [f"Resource link: {name}", f"URI: {uri}"]
+                if block.get("mimeType") is not None:
+                    mime_type = _required_string(
+                        block.get("mimeType"),
+                        name=f"prompt[{index}].mimeType",
+                    )
+                    projected.append(f"MIME type: {mime_type}")
+                text_blocks.append("\n".join(projected))
+                continue
+            raise ACPProtocolError(
+                _INVALID_PARAMS,
+                "ACP mode accepts only text and resource_link prompt blocks",
             )
 
         run_request = RunRequest(
@@ -649,6 +697,16 @@ class ACPStdioServer:
         state.cancel_requested = True
         if state.active_run is not None and not state.active_run.done():
             state.active_run.cancel()
+
+    def _cancel_handler(self, key: str) -> None:
+        handler = self.active_handlers.get(key)
+        if handler is None or handler.done():
+            return
+        if key in self.handler_cancellations:
+            return
+        self.handler_cancellations.add(key)
+        if key in self.started_handlers:
+            handler.cancel()
 
     @staticmethod
     def _install_environment(environment: Mapping[str, str]) -> dict[str, str | None]:

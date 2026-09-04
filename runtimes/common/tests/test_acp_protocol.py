@@ -77,13 +77,25 @@ def _new_session(request_id: int = 2, *, mcp_servers: list[dict[str, Any]] | Non
 
 
 def _prompt(request_id: int, session_id: str, text: str) -> dict[str, Any]:
+    return _prompt_content(
+        request_id,
+        session_id,
+        [{"type": "text", "text": text}],
+    )
+
+
+def _prompt_content(
+    request_id: int,
+    session_id: str,
+    content: list[dict[str, Any]],
+) -> dict[str, Any]:
     return {
         "jsonrpc": "2.0",
         "id": request_id,
         "method": "session/prompt",
         "params": {
             "sessionId": session_id,
-            "prompt": [{"type": "text", "text": text}],
+            "prompt": content,
         },
     }
 
@@ -111,6 +123,21 @@ async def _send_to(
     await server.accept(request)
     await server.wait_idle()
     return _response(messages, request["id"])
+
+
+async def _wait_for_response(
+    messages: list[dict[str, Any]],
+    request_id: int,
+) -> dict[str, Any]:
+    async def wait() -> dict[str, Any]:
+        while True:
+            matches = [message for message in messages if message.get("id") == request_id]
+            if matches:
+                assert len(matches) == 1
+                return matches[0]
+            await asyncio.sleep(0)
+
+    return await asyncio.wait_for(wait(), timeout=1)
 
 
 class RecordingRuntime:
@@ -173,6 +200,40 @@ class RecordingFactory:
         runtime = self.runtime_builder()
         self.runtimes.append(runtime)
         return runtime
+
+
+class BlockingEnterRuntime:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.exited = 0
+
+    async def __aenter__(self) -> RuntimeSession:
+        self.started.set()
+        await self.release.wait()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):  # noqa: ANN001
+        self.exited += 1
+        return None
+
+    async def run(self, request: RunRequest) -> RunResult:
+        raise AssertionError(f"unexpected prompt for {request.session_id}")
+
+
+class BlockingExitRuntime(BlockingEnterRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.exit_started = asyncio.Event()
+        self.release_exit = asyncio.Event()
+        self.exit_completed = False
+
+    async def __aexit__(self, exc_type, exc, tb):  # noqa: ANN001
+        self.exited += 1
+        self.exit_started.set()
+        await self.release_exit.wait()
+        self.exit_completed = True
+        return None
 
 
 def test_offline_echo_round_trip_uses_canonical_acp_shapes(monkeypatch):
@@ -383,6 +444,65 @@ def test_session_reuses_runtime_and_passes_full_successful_history(monkeypatch):
     asyncio.run(exercise())
 
 
+def test_resource_links_are_projected_and_preserved_in_history(monkeypatch):
+    _set_provider_environment(monkeypatch)
+    runtime = RecordingRuntime([RunResult("first answer"), RunResult("second answer")])
+    factory = RecordingFactory(lambda: runtime)
+    projected_prompt = (
+        "Review this resource.\n"
+        "Resource link: design notes\n"
+        "URI: https://example.com/design.md\n"
+        "MIME type: text/markdown\n"
+        "Summarize it."
+    )
+
+    async def exercise() -> None:
+        messages: list[dict[str, Any]] = []
+
+        async def send(message):  # noqa: ANN001
+            messages.append(dict(message))
+
+        server = ACPStdioServer(_spec(), factory, send)
+        await _send_to(server, messages, _initialize())
+        created = await _send_to(server, messages, _new_session())
+        session_id = created["result"]["sessionId"]
+        prompt = _prompt_content(
+            3,
+            session_id,
+            [
+                {"type": "text", "text": "Review this resource."},
+                {
+                    "type": "resource_link",
+                    "name": "design notes",
+                    "uri": "https://example.com/design.md",
+                    "mimeType": "text/markdown",
+                },
+                {"type": "text", "text": "Summarize it."},
+            ],
+        )
+
+        assert (await _send_to(server, messages, prompt))["result"] == {
+            "stopReason": "end_turn"
+        }
+        assert (
+            await _send_to(server, messages, _prompt(4, session_id, "What changed?"))
+        )["result"] == {"stopReason": "end_turn"}
+        assert runtime.requests == [
+            RunRequest(prompt=projected_prompt, history=(), session_id=session_id),
+            RunRequest(
+                prompt="What changed?",
+                history=(
+                    ConversationTurn(role="user", text=projected_prompt),
+                    ConversationTurn(role="assistant", text="first answer"),
+                ),
+                session_id=session_id,
+            ),
+        ]
+        await server.close()
+
+    asyncio.run(exercise())
+
+
 def test_child_rejects_a_second_session(monkeypatch):
     _set_provider_environment(monkeypatch)
     factory = RecordingFactory(lambda: RecordingRuntime([RunResult("unused")]))
@@ -401,6 +521,190 @@ def test_child_rejects_a_second_session(monkeypatch):
         assert rejected["error"]["code"] == -32600
         assert "already owns a session" in rejected["error"]["message"]
         assert len(factory.specs) == 1
+        await server.close()
+
+    asyncio.run(exercise())
+
+
+def test_cancel_request_stops_blocked_session_creation_and_restores_environment(monkeypatch):
+    _set_provider_environment(monkeypatch)
+    runtime = BlockingEnterRuntime()
+    factory = RecordingFactory(lambda: runtime, supports_http_mcp=True)
+
+    async def exercise() -> None:
+        messages: list[dict[str, Any]] = []
+
+        async def send(message):  # noqa: ANN001
+            messages.append(dict(message))
+
+        server = ACPStdioServer(_spec(), factory, send)
+        await _send_to(server, messages, _initialize())
+        await server.accept(_new_session(mcp_servers=[_orka_mcp_server()]))
+        await asyncio.wait_for(runtime.started.wait(), timeout=1)
+        projected_names = set(factory.environment_snapshots[0])
+        assert projected_names
+        assert all(os.environ.get(name) for name in projected_names)
+
+        await server.accept(
+            {
+                "jsonrpc": "2.0",
+                "method": "$/cancel_request",
+                "params": {"requestId": 2},
+            }
+        )
+        await asyncio.wait_for(server.wait_idle(), timeout=1)
+
+        assert _response(messages, 2)["error"] == {
+            "code": -32800,
+            "message": "ACP request cancelled",
+        }
+        assert server.sessions == {}
+        assert runtime.exited == 1
+        assert all(name not in os.environ for name in projected_names)
+        await asyncio.wait_for(server.close(), timeout=1)
+
+    asyncio.run(exercise())
+
+
+def test_cancel_request_before_session_dispatch_prevents_runtime_start(monkeypatch):
+    _set_provider_environment(monkeypatch)
+    runtime = BlockingEnterRuntime()
+    factory = RecordingFactory(lambda: runtime)
+
+    async def exercise() -> None:
+        messages: list[dict[str, Any]] = []
+
+        async def send(message):  # noqa: ANN001
+            messages.append(dict(message))
+
+        server = ACPStdioServer(_spec(), factory, send)
+        await _send_to(server, messages, _initialize())
+        accept_task = asyncio.create_task(server.accept(_new_session()))
+        await asyncio.sleep(0)
+        assert not runtime.started.is_set()
+
+        await server.accept(
+            {
+                "jsonrpc": "2.0",
+                "method": "$/cancel_request",
+                "params": {"requestId": 2},
+            }
+        )
+        await accept_task
+        await asyncio.wait_for(server.wait_idle(), timeout=1)
+
+        assert _response(messages, 2)["error"]["code"] == -32800
+        assert factory.runtimes == []
+        assert server.sessions == {}
+        await server.close()
+
+    asyncio.run(exercise())
+
+
+def test_close_cancels_blocked_session_creation(monkeypatch):
+    _set_provider_environment(monkeypatch)
+    runtime = BlockingEnterRuntime()
+    factory = RecordingFactory(lambda: runtime)
+
+    async def exercise() -> None:
+        messages: list[dict[str, Any]] = []
+
+        async def send(message):  # noqa: ANN001
+            messages.append(dict(message))
+
+        server = ACPStdioServer(_spec(), factory, send)
+        await _send_to(server, messages, _initialize())
+        accept_task = asyncio.create_task(server.accept(_new_session()))
+        await asyncio.sleep(0)
+        assert not runtime.started.is_set()
+
+        async with asyncio.timeout(1):
+            await server.close()
+        await accept_task
+
+        assert _response(messages, 2)["error"]["code"] == -32800
+        assert server.sessions == {}
+        assert factory.runtimes == []
+
+    asyncio.run(exercise())
+
+
+def test_close_does_not_interrupt_cancelled_session_cleanup(monkeypatch):
+    _set_provider_environment(monkeypatch)
+    runtime = BlockingExitRuntime()
+    factory = RecordingFactory(lambda: runtime)
+
+    async def exercise() -> None:
+        messages: list[dict[str, Any]] = []
+
+        async def send(message):  # noqa: ANN001
+            messages.append(dict(message))
+
+        server = ACPStdioServer(_spec(), factory, send)
+        await _send_to(server, messages, _initialize())
+        await server.accept(_new_session())
+        await asyncio.wait_for(runtime.started.wait(), timeout=1)
+        await server.accept(
+            {
+                "jsonrpc": "2.0",
+                "method": "$/cancel_request",
+                "params": {"requestId": 2},
+            }
+        )
+        await asyncio.wait_for(runtime.exit_started.wait(), timeout=1)
+
+        close_task = asyncio.create_task(server.close())
+        await asyncio.sleep(0)
+        assert not close_task.done()
+        assert not runtime.exit_completed
+
+        runtime.release_exit.set()
+        await asyncio.wait_for(close_task, timeout=1)
+
+        assert runtime.exit_completed
+        assert runtime.exited == 1
+        assert _response(messages, 2)["error"]["code"] == -32800
+        assert server.sessions == {}
+
+    asyncio.run(exercise())
+
+
+def test_cancel_request_after_session_commit_does_not_replace_success(monkeypatch):
+    _set_provider_environment(monkeypatch)
+    runtime = RecordingRuntime([RunResult("unused")])
+    factory = RecordingFactory(lambda: runtime)
+
+    async def exercise() -> None:
+        messages: list[dict[str, Any]] = []
+        response_started = asyncio.Event()
+        release_response = asyncio.Event()
+
+        async def send(message):  # noqa: ANN001
+            if message.get("id") == 2 and "result" in message:
+                response_started.set()
+                await release_response.wait()
+            messages.append(dict(message))
+
+        server = ACPStdioServer(_spec(), factory, send)
+        await _send_to(server, messages, _initialize())
+        await server.accept(_new_session())
+        await asyncio.wait_for(response_started.wait(), timeout=1)
+
+        for request_id in (2, 2, 999):
+            await server.accept(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "$/cancel_request",
+                    "params": {"requestId": request_id},
+                }
+            )
+        release_response.set()
+        await asyncio.wait_for(server.wait_idle(), timeout=1)
+
+        created = _response(messages, 2)
+        assert "error" not in created
+        assert created["result"]["sessionId"] in server.sessions
+        assert runtime.entered == 1
         await server.close()
 
     asyncio.run(exercise())
@@ -435,6 +739,56 @@ class CancellingRuntime:
 
     async def discard_session(self, session_id: str) -> None:
         self.discarded_sessions.append(session_id)
+
+
+def test_concurrent_prompt_is_rejected_as_cancelled_without_disturbing_active_prompt(
+    monkeypatch,
+):
+    _set_provider_environment(monkeypatch)
+    runtime = CancellingRuntime(swallow_cancellation=False)
+    factory = RecordingFactory(lambda: runtime)
+
+    async def exercise() -> None:
+        messages: list[dict[str, Any]] = []
+
+        async def send(message):  # noqa: ANN001
+            messages.append(dict(message))
+
+        server = ACPStdioServer(_spec(), factory, send)
+        await _send_to(server, messages, _initialize())
+        created = await _send_to(server, messages, _new_session())
+        session_id = created["result"]["sessionId"]
+
+        await server.accept(_prompt(3, session_id, "keep running"))
+        await asyncio.wait_for(runtime.started.wait(), timeout=1)
+        await server.accept(_prompt(4, session_id, "reject me"))
+        rejected = await _wait_for_response(messages, 4)
+
+        assert rejected["error"] == {
+            "code": -32800,
+            "message": "ACP session already has an active prompt",
+        }
+        assert not any(message.get("id") == 3 for message in messages)
+        assert len(runtime.requests) == 1
+        assert server.sessions[session_id].history == []
+
+        await server.accept(
+            {
+                "jsonrpc": "2.0",
+                "method": "session/cancel",
+                "params": {"sessionId": session_id},
+            }
+        )
+        await asyncio.wait_for(server.wait_idle(), timeout=1)
+        assert _response(messages, 3)["result"] == {"stopReason": "cancelled"}
+        assert server.sessions[session_id].history == []
+
+        completed = await _send_to(server, messages, _prompt(5, session_id, "try again"))
+        assert completed["result"] == {"stopReason": "end_turn"}
+        assert runtime.requests[1].history == ()
+        await server.close()
+
+    asyncio.run(exercise())
 
 
 @pytest.mark.parametrize(
@@ -505,7 +859,7 @@ def test_runtime_error_is_redacted_and_does_not_commit_history(monkeypatch):
 
         failed = await _send_to(server, messages, _prompt(3, session_id, "fail"))
         assert failed["error"] == {
-            "code": -32000,
+            "code": -32603,
             "message": "AgentKit runtime prompt failed",
             "data": {"code": "ProviderFailure"},
         }
@@ -662,7 +1016,7 @@ def test_cancellation_while_update_send_waits_does_not_commit_history(
     asyncio.run(exercise())
 
 
-def test_prompt_rejects_non_text_content_without_running_model(monkeypatch):
+def test_prompt_rejects_capability_gated_content_without_running_model(monkeypatch):
     _set_provider_environment(monkeypatch)
     runtime = RecordingRuntime([RunResult("must not run")])
     factory = RecordingFactory(lambda: runtime)
@@ -689,7 +1043,48 @@ def test_prompt_rejects_non_text_content_without_running_model(monkeypatch):
 
         failed = await _send_to(server, messages, invalid)
         assert failed["error"]["code"] == -32602
-        assert "only text" in failed["error"]["message"]
+        assert "only text and resource_link" in failed["error"]["message"]
+        assert runtime.requests == []
+        await server.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        {"type": "resource_link", "uri": "https://example.com/file.txt"},
+        {"type": "resource_link", "name": "file"},
+        {
+            "type": "resource_link",
+            "name": "file",
+            "uri": "https://example.com/file.txt",
+            "mimeType": "",
+        },
+    ],
+)
+def test_prompt_rejects_malformed_resource_links_without_running_model(monkeypatch, block):
+    _set_provider_environment(monkeypatch)
+    runtime = RecordingRuntime([RunResult("must not run")])
+    factory = RecordingFactory(lambda: runtime)
+
+    async def exercise() -> None:
+        messages: list[dict[str, Any]] = []
+
+        async def send(message):  # noqa: ANN001
+            messages.append(dict(message))
+
+        server = ACPStdioServer(_spec(), factory, send)
+        await _send_to(server, messages, _initialize())
+        created = await _send_to(server, messages, _new_session())
+        session_id = created["result"]["sessionId"]
+
+        failed = await _send_to(
+            server,
+            messages,
+            _prompt_content(3, session_id, [block]),
+        )
+        assert failed["error"]["code"] == -32602
         assert runtime.requests == []
         await server.close()
 
