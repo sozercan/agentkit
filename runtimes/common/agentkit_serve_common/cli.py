@@ -35,8 +35,8 @@ import uvicorn
 from .acp import (
     ACPConfigurationError,
     ACPProtocolError,
+    load_verified_acp_runtime_binding,
     run_acp_stdio,
-    validate_acp_runtime_binding,
 )
 from .config import ConfigError, load, load_or_exit
 from .foundry import create_foundry_app
@@ -136,14 +136,14 @@ def run(factory: RuntimeFactory, argv: list[str] | None = None) -> None:
     # are intentionally adapter-owned and read AGENTKIT_PROTOCOL when a turn later
     # builds a runtime session.
     os.environ["AGENTKIT_PROTOCOL"] = protocol
-    spec = _load_spec_or_exit(args.config, protocol)
     if protocol == "acp":
         try:
-            validate_acp_runtime_binding(args.config, spec)
-        except (ACPConfigurationError, ACPProtocolError) as exc:
+            spec = load_verified_acp_runtime_binding(args.config)
+        except (ConfigError, ACPConfigurationError, ACPProtocolError) as exc:
             _fail(str(exc))
         run_acp_stdio(spec, factory)
         return
+    spec = _load_spec_or_exit(args.config, protocol)
     if spec.brokered_tools and protocol != "foundry":
         _fail(
             "brokeredTools require AGENTKIT_PROTOCOL=foundry (or --protocol foundry); "

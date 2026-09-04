@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Awaitable, BinaryIO, Callable, Iterator, Mapping
 from urllib.parse import urlsplit
 
-from .config import AgentSpec
+from .config import AgentSpec, load_with_bytes
 from .conversation import ConversationTurn, RunRequest
 from .runtime import AgentRunError, RuntimeFactory, RuntimeSession
 
@@ -177,8 +177,15 @@ def _required_environment(name: str) -> str:
         raise ACPConfigurationError(exc.message) from exc
 
 
-def validate_acp_runtime_binding(config_path: str | Path, spec: AgentSpec) -> None:
-    """Fail closed unless Orka's immutable profile matches the baked config."""
+def load_verified_acp_runtime_binding(config_path: str | Path) -> AgentSpec:
+    """Read, parse, and verify one immutable ACP agent configuration buffer."""
+    spec, config_bytes = load_with_bytes(config_path)
+    validate_acp_runtime_binding(config_bytes, spec)
+    return spec
+
+
+def validate_acp_runtime_binding(config_bytes: bytes, spec: AgentSpec) -> None:
+    """Fail closed unless Orka's immutable profile matches the parsed config bytes."""
 
     if spec.tools:
         raise ACPConfigurationError("ACP strict mode rejects baked direct tools")
@@ -205,11 +212,6 @@ def validate_acp_runtime_binding(config_path: str | Path, spec: AgentSpec) -> No
             f"{ACP_AGENT_CONFIGURATION_DIGEST_ENV} must be a lowercase sha256 digest"
         ) from exc
 
-    path = Path(config_path)
-    try:
-        config_bytes = path.read_bytes()
-    except OSError as exc:
-        raise ACPConfigurationError(f"cannot read ACP agent config {path}: {exc}") from exc
     actual_digest = prefix + hashlib.sha256(config_bytes).hexdigest()
     if not secrets.compare_digest(expected_digest, actual_digest):
         raise ACPConfigurationError(

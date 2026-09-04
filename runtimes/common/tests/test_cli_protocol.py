@@ -162,12 +162,12 @@ def test_cli_protocol_flag_sets_agentkit_protocol_for_adapter_runtime(monkeypatc
 def test_cli_acp_uses_verified_stdio_entrypoint_without_uvicorn(monkeypatch):
     captured = {}
     spec = _spec()
-    monkeypatch.setattr(cli, "load", lambda path: spec)
-    monkeypatch.setattr(
-        cli,
-        "validate_acp_runtime_binding",
-        lambda path, loaded: captured.update({"path": path, "verified": loaded}),
-    )
+
+    def load_verified(path):  # noqa: ANN001
+        captured.update({"path": path, "verified": spec})
+        return spec
+
+    monkeypatch.setattr(cli, "load_verified_acp_runtime_binding", load_verified)
     monkeypatch.setattr(
         cli,
         "run_acp_stdio",

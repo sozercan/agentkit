@@ -6,6 +6,7 @@ import io
 import json
 import os
 from collections.abc import Callable
+from pathlib import Path
 from types import TracebackType
 from typing import Any
 
@@ -773,11 +774,55 @@ def test_runtime_binding_verifies_exact_config_digest_model_and_provider(monkeyp
     monkeypatch.setenv(acp.ACP_MODEL_ENV, "test-model")
     _set_provider_environment(monkeypatch)
 
-    acp.validate_acp_runtime_binding(config, _spec())
+    acp.validate_acp_runtime_binding(config_bytes, _spec())
 
-    config.write_bytes(config_bytes + b"# changed\n")
     with pytest.raises(ACPConfigurationError, match="exact agent config bytes"):
-        acp.validate_acp_runtime_binding(config, _spec())
+        acp.validate_acp_runtime_binding(config_bytes + b"# changed\n", _spec())
+
+
+def test_verified_runtime_binding_parses_the_hashed_bytes_after_file_replacement(monkeypatch, tmp_path):
+    config = tmp_path / "agent.yaml"
+    verified_bytes = b"""abiVersion: v0
+metadata:
+  name: verified
+model:
+  provider: openai-compatible
+  baseURL: https://baked.example.invalid/v1
+  name: test-model
+  apiKeyEnv: TEST
+instructions: Verified instructions.
+tools: []
+expose:
+  openai: true
+  port: 8080
+"""
+    replaced_bytes = verified_bytes.replace(b"Verified instructions.", b"Replaced instructions.")
+    config.write_bytes(verified_bytes)
+    monkeypatch.setenv(
+        acp.ACP_AGENT_CONFIGURATION_DIGEST_ENV,
+        "sha256:" + hashlib.sha256(verified_bytes).hexdigest(),
+    )
+    monkeypatch.setenv(acp.ACP_MODEL_ENV, "test-model")
+    _set_provider_environment(monkeypatch)
+
+    original_read_bytes = Path.read_bytes
+    reads = 0
+
+    def read_then_replace(path: Path) -> bytes:
+        nonlocal reads
+        raw = original_read_bytes(path)
+        if path == config:
+            reads += 1
+            config.write_bytes(replaced_bytes)
+        return raw
+
+    monkeypatch.setattr(Path, "read_bytes", read_then_replace)
+
+    spec = acp.load_verified_acp_runtime_binding(config)
+
+    assert reads == 1
+    assert spec.instructions == "Verified instructions."
+    assert original_read_bytes(config) == replaced_bytes
 
 
 @pytest.mark.parametrize(
@@ -807,7 +852,7 @@ def test_runtime_binding_rejects_profile_or_provider_mismatch(
     monkeypatch.setenv(environment_name, environment_value)
 
     with pytest.raises(ACPConfigurationError, match=message):
-        acp.validate_acp_runtime_binding(config, _spec())
+        acp.validate_acp_runtime_binding(b"exact", _spec())
 
 
 @pytest.mark.parametrize(
@@ -849,4 +894,4 @@ def test_runtime_binding_rejects_baked_tool_and_context_paths(tmp_path, override
     config.write_bytes(b"unused")
 
     with pytest.raises(ACPConfigurationError, match=message):
-        acp.validate_acp_runtime_binding(config, _spec(**override))
+        acp.validate_acp_runtime_binding(b"unused", _spec(**override))
