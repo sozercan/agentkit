@@ -753,7 +753,7 @@ def test_reused_session_does_not_duplicate_explicit_history(monkeypatch):
     assert include_history_values == [True, False]
 
 
-def test_failed_first_turn_replaces_session_and_keeps_explicit_history_on_retry(monkeypatch):
+def test_discarded_failed_first_turn_replaces_session_and_keeps_explicit_history_on_retry(monkeypatch):
     from agentkit_serve_common.config import AgentSpec
     from agentkit_serve_common.conversation import ConversationTurn, RunRequest
     from agentkit_serve_common.runtime import RunResult
@@ -791,6 +791,7 @@ def test_failed_first_turn_replaces_session_and_keeps_explicit_history_on_retry(
     async def exercise():
         with pytest.raises(RuntimeError, match="provider unavailable"):
             await runtime.run(request)
+        await runtime.discard_session("s1")
         await runtime.run(request)
         await runtime.run(request)
 
@@ -799,6 +800,49 @@ def test_failed_first_turn_replaces_session_and_keeps_explicit_history_on_retry(
     assert include_history_values == [True, True, False]
     assert seen_sessions[0] is not seen_sessions[1]
     assert seen_sessions[1] is seen_sessions[2]
+
+
+def test_failed_reused_session_preserves_native_conversation_state(monkeypatch):
+    from agentkit_serve_common.config import AgentSpec
+    from agentkit_serve_common.conversation import RunRequest
+    from agentkit_serve_common.runtime import RunResult
+
+    include_history_values = []
+    seen_sessions = []
+
+    async def fake_run_agent(agent, request, *, session=None, include_history=True):
+        include_history_values.append(include_history)
+        seen_sessions.append(session)
+        if len(seen_sessions) == 2:
+            raise RuntimeError("provider unavailable")
+        return RunResult(text="ok")
+
+    monkeypatch.setattr(agent_factory, "run_agent", fake_run_agent)
+    spec = AgentSpec.model_validate({
+        "abiVersion": "v0",
+        "metadata": {"name": "x"},
+        "model": {"provider": "openai-compatible", "baseURL": "https://api.openai.com/v1", "name": "gpt-4o-mini"},
+        "instructions": "hi",
+        "tools": [],
+        "expose": {"openai": True, "port": 8080},
+    })
+    runtime = agent_factory.MAFRuntime(spec)
+    runtime.agent = object()
+    request = RunRequest(prompt="current", session_id="s1")
+
+    import asyncio
+    import pytest
+
+    async def exercise():
+        await runtime.run(request)
+        with pytest.raises(RuntimeError, match="provider unavailable"):
+            await runtime.run(request)
+        await runtime.run(request)
+
+    asyncio.run(exercise())
+
+    assert include_history_values == [True, False, False]
+    assert seen_sessions[0] is seen_sessions[1] is seen_sessions[2]
 
 
 def test_remote_mcp_disables_ping(monkeypatch):

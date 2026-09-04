@@ -392,16 +392,12 @@ class MAFRuntime:
                 self._touch_session(session_id)
                 session = self.sessions[session_id]
                 include_history = session_id not in self.initialized_sessions
-                try:
-                    result = await run_agent(
-                        self.agent,
-                        request,
-                        session=session,
-                        include_history=include_history,
-                    )
-                except BaseException:
-                    self._reset_session(session_id)
-                    raise
+                result = await run_agent(
+                    self.agent,
+                    request,
+                    session=session,
+                    include_history=include_history,
+                )
                 self.initialized_sessions.add(session_id)
                 return result
         finally:
