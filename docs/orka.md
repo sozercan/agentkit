@@ -48,6 +48,20 @@ config. The registration's `adapterName` must be `agentkit-serve-acp`. Its
 `adapterDigest` and the composition build's `AGENTKIT_ADAPTER_DIGEST` must both
 equal the `sha256:` digest from `AGENTKIT_RUNTIME_IMAGE`.
 
+Set `ORKA_ACP_CONTROLLER_EPOCH` from Orka's current `ControllerEpoch` record:
+
+```sh
+kubectl -n <orka-controller-namespace> get cepoch controller-epoch-orka-controller \
+  -o jsonpath='{.status.epoch}'
+```
+
+The supervisor reads the epoch only during startup. The operator that owns this
+service must watch the record and restart or replace the supervisor whenever it
+changes. Preserve `ORKA_ACP_RUNTIME_INSTANCE_ID` across that restart and issue a
+new `ORKA_ACP_SUPERVISOR_BOOT_ID`. Orka keeps a stale-epoch registration not
+ready and refuses new Task bindings until authenticated status reports the
+current value. AgentKit itself is the ACP child and does not manage this fence.
+
 Orka freezes the AgentRuntime UID, generation, endpoint, profile, authentication
 Secret versions, and observed instance into each Task binding. It revalidates
 them before dispatch and recovery mutations. `Task.spec.execution.workspace`
