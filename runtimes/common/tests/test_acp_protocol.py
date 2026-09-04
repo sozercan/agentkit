@@ -1405,6 +1405,29 @@ def test_runtime_binding_verifies_exact_config_digest_model_and_provider(monkeyp
         acp.validate_acp_runtime_binding(config_bytes + b"# changed\n", _spec())
 
 
+def test_runtime_binding_accepts_unicode_model_name(monkeypatch):
+    config_bytes = b"exact"
+    model_name = "模型"
+    monkeypatch.setenv(
+        acp.ACP_AGENT_CONFIGURATION_DIGEST_ENV,
+        "sha256:" + hashlib.sha256(config_bytes).hexdigest(),
+    )
+    monkeypatch.setenv(acp.ACP_MODEL_ENV, model_name)
+    _set_provider_environment(monkeypatch)
+
+    acp.validate_acp_runtime_binding(
+        config_bytes,
+        _spec(
+            model={
+                "provider": "openai-compatible",
+                "baseURL": "https://baked.example.invalid/v1",
+                "name": model_name,
+                "apiKeyEnv": "BAKED_MODEL_TOKEN",
+            }
+        ),
+    )
+
+
 def test_verified_runtime_binding_parses_the_hashed_bytes_after_file_replacement(monkeypatch, tmp_path):
     config = tmp_path / "agent.yaml"
     verified_bytes = b"""abiVersion: v0

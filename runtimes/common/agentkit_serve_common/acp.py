@@ -299,7 +299,7 @@ def validate_acp_runtime_binding(config_bytes: bytes, spec: AgentSpec) -> None:
         )
 
     expected_model = _required_environment(ACP_MODEL_ENV)
-    if not secrets.compare_digest(expected_model, spec.model.name):
+    if expected_model != spec.model.name:
         raise ACPConfigurationError(f"{ACP_MODEL_ENV} does not match model.name in the agent config")
 
     provider_base_url = _required_environment(ACP_PROVIDER_BASE_URL_ENV)
