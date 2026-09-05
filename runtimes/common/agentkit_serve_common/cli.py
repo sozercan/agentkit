@@ -1,8 +1,9 @@
 """Shared CLI / network-posture core for AgentKit runtime adapters.
 
-Loads ``/agent/agent.yaml``, selects one protocol skin, applies the network
-posture, and runs uvicorn. Each adapter's console script calls :func:`run` with
-its own framework-specific ``agent_factory`` module — the only per-adapter input.
+Loads ``/agent/agent.yaml`` and selects one protocol skin. HTTP modes apply the
+network posture and run uvicorn; ACP uses stdio. Each adapter's console script
+calls :func:`run` with its own framework-specific ``agent_factory`` module, the
+only per-adapter input.
 
 Protocol modes:
 
@@ -10,6 +11,7 @@ Protocol modes:
 * ``foundry``: ``/readiness``, ``/invocations``, minimal non-streaming
   ``/responses``.
 * ``orka``: observed-mode ``orka.harness.v1`` over HTTP+SSE.
+* ``acp``: Orka-owned ACP protocol v1 over newline-delimited JSON-RPC on stdio.
 
 Network posture:
 
@@ -30,6 +32,12 @@ from typing import NoReturn
 
 import uvicorn
 
+from .acp import (
+    ACPConfigurationError,
+    ACPProtocolError,
+    load_verified_acp_runtime_binding,
+    run_acp_stdio,
+)
 from .config import ConfigError, load, load_or_exit
 from .foundry import create_foundry_app
 from .orka import create_orka_app
@@ -38,7 +46,7 @@ from .server import create_app
 
 # Hosts that mean "loopback only" — a bind to any of these needs no auth token.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"})
-_PROTOCOLS = frozenset({"openai", "foundry", "orka"})
+_PROTOCOLS = frozenset({"acp", "openai", "foundry", "orka"})
 
 DEFAULT_CONFIG_PATH = "/agent/agent.yaml"
 DEFAULT_PORT = 8080
@@ -98,10 +106,8 @@ def _resolve_port(protocol: str, spec_port: int | None) -> int:
         return DEFAULT_FOUNDRY_PORT
     return spec_port or DEFAULT_PORT
 
-
-
 def _load_spec_or_exit(path: str, protocol: str):  # noqa: ANN001
-    if protocol != "orka":
+    if protocol not in {"acp", "orka"}:
         return load_or_exit(path)
     try:
         return load(path)
@@ -130,6 +136,13 @@ def run(factory: RuntimeFactory, argv: list[str] | None = None) -> None:
     # are intentionally adapter-owned and read AGENTKIT_PROTOCOL when a turn later
     # builds a runtime session.
     os.environ["AGENTKIT_PROTOCOL"] = protocol
+    if protocol == "acp":
+        try:
+            spec = load_verified_acp_runtime_binding(args.config)
+        except (ConfigError, ACPConfigurationError, ACPProtocolError) as exc:
+            _fail(str(exc))
+        run_acp_stdio(spec, factory)
+        return
     spec = _load_spec_or_exit(args.config, protocol)
     if spec.brokered_tools and protocol != "foundry":
         _fail(

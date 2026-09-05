@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Awaitable, Callable, Literal, Mapping, Protocol, Sequence
 
 FORWARDED_ROLES = frozenset({"system", "user", "assistant"})
 
@@ -25,6 +25,20 @@ class ConversationTurn:
 
     role: str
     text: str
+
+
+@dataclass(frozen=True)
+class ToolCallEvent:
+    """One tool lifecycle observation, without arguments, results, or errors.
+
+    Adapters await the observer before continuing the run. A call starts with
+    ``in_progress`` and ends with ``completed`` or ``failed`` under the same ID.
+    The ID is adapter-local and must not be used as a host authorization token.
+    """
+
+    tool_call_id: str
+    tool_name: str
+    status: Literal["in_progress", "completed", "failed"]
 
 
 @dataclass(frozen=True)
@@ -50,6 +64,9 @@ class RunRequest:
     turn_id: str | None = None
     correlation_id: str | None = None
     metadata: Mapping[str, str] = field(default_factory=dict)
+    on_tool_event: Callable[[ToolCallEvent], Awaitable[None]] | None = field(
+        default=None, repr=False, compare=False
+    )
 
 
 class OpenAIMessage(Protocol):

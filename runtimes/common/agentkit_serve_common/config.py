@@ -1245,27 +1245,14 @@ class ConfigError(Exception):
     """Raised when ``agent.yaml`` is missing, unparseable, or invalid."""
 
 
-def load(path: str | Path) -> AgentSpec:
-    """Read and validate ``agent.yaml`` at ``path``.
-
-    Raises :class:`ConfigError` with a clear, single-line message on any problem
-    (missing file, non-mapping YAML, schema violation, or unsupported abiVersion).
-    """
-    p = Path(path)
-    try:
-        raw = p.read_text(encoding="utf-8")
-    except FileNotFoundError as exc:
-        raise ConfigError(f"agent config not found: {p}") from exc
-    except OSError as exc:
-        raise ConfigError(f"cannot read agent config {p}: {exc}") from exc
-
+def _parse_agent_spec(raw: str, source: Path) -> AgentSpec:
     try:
         data = safe_load_lossless(raw)
     except (yaml.YAMLError, ValueError, RecursionError) as exc:
-        raise ConfigError(f"agent config {p} is not valid YAML: {exc}") from exc
+        raise ConfigError(f"agent config {source} is not valid YAML: {exc}") from exc
 
     if not isinstance(data, dict):
-        raise ConfigError(f"agent config {p} must be a YAML mapping, got {type(data).__name__}")
+        raise ConfigError(f"agent config {source} must be a YAML mapping, got {type(data).__name__}")
 
     try:
         spec = AgentSpec.model_validate(data)
@@ -1276,15 +1263,47 @@ def load(path: str | Path) -> AgentSpec:
             for err in exc.errors()
         ]
         raise ConfigError(
-            f"agent config {p} is invalid:\n" + "\n".join(lines)
+            f"agent config {source} is invalid:\n" + "\n".join(lines)
         ) from exc
 
     if spec.abi_version != ABI_VERSION:
         raise ConfigError(
-            f"agent config {p}: unsupported abiVersion {spec.abi_version!r} "
+            f"agent config {source}: unsupported abiVersion {spec.abi_version!r} "
             f"(this build of agentkit-serve understands {ABI_VERSION!r})"
         )
 
+    return spec
+
+
+def load_bytes(raw: bytes, *, source: str | Path) -> AgentSpec:
+    """Parse and validate one exact ``agent.yaml`` byte buffer."""
+    source_path = Path(source)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ConfigError(f"agent config {source_path} is not valid UTF-8: {exc}") from exc
+    return _parse_agent_spec(text, source_path)
+
+
+def load_with_bytes(path: str | Path) -> tuple[AgentSpec, bytes]:
+    """Read ``agent.yaml`` once and return its validated spec and exact bytes."""
+    source = Path(path)
+    try:
+        raw = source.read_bytes()
+    except FileNotFoundError as exc:
+        raise ConfigError(f"agent config not found: {source}") from exc
+    except OSError as exc:
+        raise ConfigError(f"cannot read agent config {source}: {exc}") from exc
+    return load_bytes(raw, source=source), raw
+
+
+def load(path: str | Path) -> AgentSpec:
+    """Read and validate ``agent.yaml`` at ``path``.
+
+    Raises :class:`ConfigError` with a clear, single-line message on any problem
+    (missing file, non-mapping YAML, schema violation, or unsupported abiVersion).
+    """
+    spec, _ = load_with_bytes(path)
     return spec
 
 
