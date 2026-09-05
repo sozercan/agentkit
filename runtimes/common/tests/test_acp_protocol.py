@@ -17,7 +17,7 @@ import pytest
 from agentkit_serve_common import acp
 from agentkit_serve_common.acp import ACPConfigurationError, ACPStdioServer
 from agentkit_serve_common.config import AgentSpec
-from agentkit_serve_common.conversation import ConversationTurn, RunRequest
+from agentkit_serve_common.conversation import ConversationTurn, RunRequest, ToolCallEvent
 from agentkit_serve_common.runtime import (
     AgentRunError,
     OfflineEchoRuntimeFactory,
@@ -1139,6 +1139,200 @@ def test_update_send_failure_discards_runtime_state(monkeypatch):
         completed = await _send_to(server, messages, _prompt(4, session_id, "recover"))
         assert completed["result"] == {"stopReason": "end_turn"}
         assert runtime.requests[1].history == ()
+        await server.close()
+
+    asyncio.run(exercise())
+
+
+def test_tool_events_precede_output_and_keep_ids_private_and_unique(monkeypatch):
+    _set_provider_environment(monkeypatch)
+
+    async def exercise() -> None:
+        messages: list[dict[str, Any]] = []
+
+        async def send(message):  # noqa: ANN001
+            messages.append(dict(message))
+
+        class ToolRuntime(RecordingRuntime):
+            async def run(self, request: RunRequest) -> RunResult:
+                self.requests.append(request)
+                assert request.on_tool_event is not None
+                for name in ["orka_echo", "orka_recover"]:
+                    await request.on_tool_event(ToolCallEvent(name + "-private-id", name, "in_progress"))
+                    assert messages[-1]["params"]["update"]["title"] == name
+                # Parallel calls may finish in a different order than they start.
+                await request.on_tool_event(ToolCallEvent("orka_recover-private-id", "orka_recover", "failed"))
+                await request.on_tool_event(ToolCallEvent("orka_echo-private-id", "orka_echo", "completed"))
+                return RunResult("héllo 世界 🌍")
+
+        runtime = ToolRuntime([])
+        server = ACPStdioServer(_spec(), RecordingFactory(lambda: runtime), send)
+        await _send_to(server, messages, _initialize())
+        created = await _send_to(server, messages, _new_session())
+        session_id = created["result"]["sessionId"]
+        ids: set[str] = set()
+        for request_id in [3, 4]:
+            offset = len(messages)
+            completed = await _send_to(server, messages, _prompt(request_id, session_id, "tools"))
+            assert completed["result"] == {"stopReason": "end_turn"}
+            updates = [message["params"]["update"] for message in messages[offset:-1]]
+            assert [update["sessionUpdate"] for update in updates] == [
+                "tool_call", "tool_call", "tool_call_update", "tool_call_update", "agent_message_chunk"
+            ]
+            assert [update["status"] for update in updates[:4]] == [
+                "in_progress", "in_progress", "failed", "completed"
+            ]
+            assert updates[0]["toolCallId"] == updates[3]["toolCallId"]
+            assert updates[1]["toolCallId"] == updates[2]["toolCallId"]
+            current_ids = {updates[0]["toolCallId"], updates[1]["toolCallId"]}
+            assert len(current_ids) == 2 and ids.isdisjoint(current_ids)
+            ids.update(current_ids)
+            for update in updates[:4]:
+                assert update["kind"] == "other"
+                assert set(update) == {"sessionUpdate", "toolCallId", "title", "kind", "status"}
+            assert updates[-1]["content"]["text"] == "héllo 世界 🌍"
+        assert "private-id" not in json.dumps(messages)
+        # A retained adapter callback cannot append events after its prompt settles.
+        offset = len(messages)
+        await runtime.requests[0].on_tool_event(ToolCallEvent("late", "late", "in_progress"))
+        assert len(messages) == offset
+        await server.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("outcome", ["error", "cancel", "incomplete"])
+def test_unsettled_tool_is_failed_before_prompt_ends_and_history_is_discarded(monkeypatch, outcome):
+    _set_provider_environment(monkeypatch)
+
+    async def exercise() -> None:
+        messages: list[dict[str, Any]] = []
+        started = asyncio.Event()
+
+        async def send(message):  # noqa: ANN001
+            messages.append(dict(message))
+
+        class ToolRuntime(RecordingRuntime):
+            async def run(self, request: RunRequest) -> RunResult:
+                self.requests.append(request)
+                if len(self.requests) > 1:
+                    return RunResult("recovered")
+                assert request.on_tool_event is not None
+                await request.on_tool_event(ToolCallEvent("private-call-id", "https://secret.invalid/token", "in_progress"))
+                started.set()
+                if outcome == "error":
+                    raise RuntimeError("private tool credentials and result")
+                if outcome == "cancel":
+                    await asyncio.Future()
+                return RunResult("must not commit incomplete tools")
+
+        runtime = ToolRuntime([])
+        server = ACPStdioServer(_spec(), RecordingFactory(lambda: runtime), send)
+        await _send_to(server, messages, _initialize())
+        created = await _send_to(server, messages, _new_session())
+        session_id = created["result"]["sessionId"]
+        await server.accept(_prompt(3, session_id, "unsettled tool"))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        if outcome == "cancel":
+            await server.accept({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": session_id}})
+        await server.wait_idle()
+        response = _response(messages, 3)
+        if outcome == "cancel":
+            assert response["result"] == {"stopReason": "cancelled"}
+        else:
+            assert response["error"]["code"] == -32603
+        assert messages[-1] == response
+        updates = [message["params"]["update"] for message in messages if message.get("method") == "session/update"]
+        assert [update["status"] for update in updates] == ["in_progress", "failed"]
+        assert updates[0]["toolCallId"] == updates[1]["toolCallId"]
+        assert all(update["title"] == "Tool call" for update in updates)
+        assert "private" not in json.dumps(messages) and "token" not in json.dumps(messages)
+        assert server.sessions[session_id].history == []
+        assert runtime.discarded_sessions == [session_id]
+        completed = await _send_to(server, messages, _prompt(4, session_id, "recover"))
+        assert completed["result"] == {"stopReason": "end_turn"}
+        assert runtime.requests[1].history == ()
+        await server.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("fail_status", ["in_progress", "completed"])
+def test_tool_event_write_failure_discards_prompt_state(monkeypatch, fail_status):
+    _set_provider_environment(monkeypatch)
+
+    async def exercise() -> None:
+        messages: list[dict[str, Any]] = []
+        failed_once = False
+
+        async def send(message):  # noqa: ANN001
+            nonlocal failed_once
+            update = message.get("params", {}).get("update", {})
+            if update.get("status") == fail_status and not failed_once:
+                failed_once = True
+                raise RuntimeError("private transport failure")
+            messages.append(dict(message))
+
+        class ToolRuntime(RecordingRuntime):
+            async def run(self, request: RunRequest) -> RunResult:
+                self.requests.append(request)
+                assert request.on_tool_event is not None
+                await request.on_tool_event(ToolCallEvent("call", "echo", "in_progress"))
+                await request.on_tool_event(ToolCallEvent("call", "echo", "completed"))
+                return RunResult("done")
+
+        runtime = ToolRuntime([])
+        server = ACPStdioServer(_spec(), RecordingFactory(lambda: runtime), send)
+        await _send_to(server, messages, _initialize())
+        created = await _send_to(server, messages, _new_session())
+        session_id = created["result"]["sessionId"]
+        response = await _send_to(server, messages, _prompt(3, session_id, "tools"))
+        assert failed_once and response["error"]["code"] == -32603
+        assert server.sessions[session_id].history == []
+        assert runtime.discarded_sessions == [session_id]
+        updates = [message["params"]["update"] for message in messages if message.get("method") == "session/update"]
+        assert all(update["sessionUpdate"] != "agent_message_chunk" for update in updates)
+        assert "private transport failure" not in json.dumps(messages)
+        await server.close()
+
+    asyncio.run(exercise())
+
+
+def test_cancellation_during_terminal_tool_write_does_not_emit_conflicting_terminal(monkeypatch):
+    _set_provider_environment(monkeypatch)
+
+    async def exercise() -> None:
+        messages: list[dict[str, Any]] = []
+        terminal_started = asyncio.Event()
+
+        async def send(message):  # noqa: ANN001
+            messages.append(dict(message))
+            if message.get("params", {}).get("update", {}).get("status") == "completed":
+                terminal_started.set()
+                await asyncio.Future()
+
+        class ToolRuntime(RecordingRuntime):
+            async def run(self, request: RunRequest) -> RunResult:
+                self.requests.append(request)
+                assert request.on_tool_event is not None
+                await request.on_tool_event(ToolCallEvent("call", "echo", "in_progress"))
+                await request.on_tool_event(ToolCallEvent("call", "echo", "completed"))
+                return RunResult("must not commit")
+
+        runtime = ToolRuntime([])
+        server = ACPStdioServer(_spec(), RecordingFactory(lambda: runtime), send)
+        await _send_to(server, messages, _initialize())
+        created = await _send_to(server, messages, _new_session())
+        session_id = created["result"]["sessionId"]
+        await server.accept(_prompt(3, session_id, "tools"))
+        await asyncio.wait_for(terminal_started.wait(), timeout=1)
+        await server.accept({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": session_id}})
+        await asyncio.wait_for(server.wait_idle(), timeout=1)
+        assert _response(messages, 3)["result"] == {"stopReason": "cancelled"}
+        updates = [message["params"]["update"] for message in messages if message.get("method") == "session/update"]
+        assert [update["status"] for update in updates] == ["in_progress", "completed"]
+        assert server.sessions[session_id].history == []
+        assert runtime.discarded_sessions == [session_id]
         await server.close()
 
     asyncio.run(exercise())

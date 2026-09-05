@@ -53,11 +53,19 @@ empty because the AgentKit ACP child does not implement permission callbacks.
 If the registration allows brokered tools, the Task must submit that exact
 `allowedTools` list.
 
-Set `ORKA_ACP_CONTROLLER_EPOCH` from Orka's current `ControllerEpoch` record:
+Set `ORKA_ACP_CONTROLLER_EPOCH` from Orka's current `ControllerEpoch` record.
+Select by `spec.name` because the resource name is hashed. This lookup requires
+exactly one matching record with a positive integer epoch:
 
 ```sh
-kubectl -n <orka-controller-namespace> get cepoch controller-epoch-orka-controller \
-  -o jsonpath='{.status.epoch}'
+kubectl -n <orka-controller-namespace> get cepoch -o json |
+  jq -er '
+    [.items[] | select(.spec.name == "orka-controller") | .status.epoch] |
+    if length == 1 then
+      .[0] | select(type == "number") | select(. > 0 and . == floor)
+    else
+      error("expected exactly one ControllerEpoch for orka-controller")
+    end'
 ```
 
 The supervisor reads the epoch only during startup. The operator that owns this

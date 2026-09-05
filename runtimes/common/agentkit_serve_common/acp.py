@@ -14,6 +14,7 @@ import inspect
 import ipaddress
 import json
 import os
+import re
 import secrets
 import sys
 from contextlib import redirect_stdout
@@ -24,7 +25,7 @@ from urllib.parse import urlsplit
 
 from .adapter_support import _attach_secondary_error, _wait_for_owner_task
 from .config import AgentSpec, load_with_bytes
-from .conversation import ConversationTurn, RunRequest
+from .conversation import ConversationTurn, RunRequest, ToolCallEvent
 from .runtime import AgentRunError, RuntimeFactory, RuntimeSession
 
 ACP_PROTOCOL_VERSION = 1
@@ -160,6 +161,61 @@ class _SessionState:
     active_request_key: str | None = None
     active_run: asyncio.Task[Any] | None = None
     cancel_requested: bool = False
+
+
+class _ACPToolObserver:
+    """Serialize payload-free tool updates within one prompt's lifetime."""
+
+    def __init__(self, session_id: str, send: _MessageSender) -> None:
+        self.session_id = session_id
+        self.send = send
+        self.pending: dict[str, dict[str, str]] = {}
+        self.closed = False
+        self.lock = asyncio.Lock()
+
+    async def observe(self, event: ToolCallEvent) -> None:
+        async with self.lock:
+            if self.closed:
+                return
+            if not event.tool_call_id or event.status not in {"in_progress", "completed", "failed"}:
+                raise AgentRunError("runtime emitted an invalid tool lifecycle event")
+            if event.status == "in_progress":
+                if event.tool_call_id in self.pending:
+                    raise AgentRunError("runtime repeated an active tool call ID")
+                # Never forward provider call IDs, arguments, results, or exception
+                # text. A new ACP ID also avoids collisions across prompt turns.
+                title = "Tool call"
+                if re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", event.tool_name):
+                    title = event.tool_name
+                tool = {"toolCallId": "tool-" + secrets.token_hex(16), "title": title, "kind": "other"}
+                self.pending[event.tool_call_id] = tool
+                update = {"sessionUpdate": "tool_call", **tool, "status": "in_progress"}
+            else:
+                tool = self.pending.pop(event.tool_call_id, None)
+                if tool is None:
+                    raise AgentRunError("runtime finished an unknown tool call")
+                # Remove before awaiting output, since a cancelled write remains
+                # owned by the stdio writer and must not get a second terminal.
+                update = {"sessionUpdate": "tool_call_update", **tool, "status": event.status}
+            await self._send(update)
+
+    async def close(self) -> bool:
+        async with self.lock:
+            self.closed = True
+            unfinished = bool(self.pending)
+            while self.pending:
+                _, tool = self.pending.popitem()
+                await self._send({"sessionUpdate": "tool_call_update", **tool, "status": "failed"})
+            return unfinished
+
+    async def _send(self, update: dict[str, str]) -> None:
+        await self.send(
+            {
+                "jsonrpc": _JSONRPC_VERSION,
+                "method": _METHOD_SESSION_UPDATE,
+                "params": {"sessionId": self.session_id, "update": update},
+            }
+        )
 
 
 def _factory_supports_http_mcp(factory: RuntimeFactory) -> bool:
@@ -703,10 +759,12 @@ class ACPStdioServer:
                 "ACP mode accepts only text and resource_link prompt blocks",
             )
 
+        tool_observer = _ACPToolObserver(session_id, self.send)
         run_request = RunRequest(
             prompt="\n".join(text_blocks),
             history=tuple(state.history),
             session_id=session_id,
+            on_tool_event=tool_observer.observe,
         )
         state.cancel_requested = False
         state.active_request_key = request_key
@@ -726,6 +784,18 @@ class ACPStdioServer:
             except BaseException as exc:  # noqa: BLE001 - cancellation wins over its fallout.
                 result = None
                 runtime_error = exc
+
+            try:
+                unfinished_tools = await tool_observer.close()
+                if unfinished_tools and runtime_error is None and not cancelled:
+                    runtime_error = AgentRunError("runtime returned before its tool calls settled")
+            except asyncio.CancelledError:
+                cancelled = True
+            except BaseException as exc:  # noqa: BLE001 - retain the original runtime failure.
+                if runtime_error is None:
+                    runtime_error = exc
+                else:
+                    _attach_secondary_error(runtime_error, exc, label="tool event completion failed")
 
             if (
                 cancelled
@@ -767,6 +837,7 @@ class ACPStdioServer:
             state.history.append(ConversationTurn(role="assistant", text=result.text))
             return {"stopReason": "end_turn"}
         finally:
+            tool_observer.closed = True
             self.prompt_requests.pop(request_key, None)
             state.active_request_key = None
             state.active_run = None

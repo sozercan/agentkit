@@ -24,7 +24,7 @@ error normalization live in ``agentkit_serve_common.adapter_support``.
 from __future__ import annotations
 
 from types import TracebackType
-from typing import Any
+from typing import Any, AsyncIterable
 
 from pydantic_ai import Agent
 
@@ -59,7 +59,7 @@ from agentkit_serve_common.adapter_support import (
     split_tool_command,
 )
 from agentkit_serve_common.config import AgentSpec, ToolSpec
-from agentkit_serve_common.conversation import RunRequest
+from agentkit_serve_common.conversation import RunRequest, ToolCallEvent
 from agentkit_serve_common.runtime import (
     OfflineEchoRuntimeFactory,
     RunResult,
@@ -263,8 +263,38 @@ def _result_usage(result: object) -> dict[str, int]:
 async def run_agent(agent: Agent, request: RunRequest) -> RunResult:
     """Run the pydantic-ai agent and return the neutral result shape."""
     message_history = _to_message_history(request)
+    run_options: dict[str, Any] = {"message_history": message_history}
+    on_tool_event = request.on_tool_event
+    if on_tool_event is not None:
+        from pydantic_ai.messages import (
+            AgentStreamEvent,
+            FunctionToolCallEvent,
+            FunctionToolResultEvent,
+            RetryPromptPart,
+        )
+
+        async def observe_tools(_: Any, events: AsyncIterable[AgentStreamEvent]) -> None:
+            async for event in events:
+                if isinstance(event, FunctionToolCallEvent):
+                    await on_tool_event(
+                        ToolCallEvent(event.part.tool_call_id, event.part.tool_name, "in_progress")
+                    )
+                elif isinstance(event, FunctionToolResultEvent):
+                    failed = (
+                        isinstance(event.part, RetryPromptPart)
+                        or getattr(event.part, "outcome", "success") != "success"
+                    )
+                    await on_tool_event(
+                        ToolCallEvent(
+                            event.part.tool_call_id,
+                            event.part.tool_name or "",
+                            "failed" if failed else "completed",
+                        )
+                    )
+
+        run_options["event_stream_handler"] = observe_tools
     try:
-        result = await agent.run(request.prompt, message_history=message_history)
+        result = await agent.run(request.prompt, **run_options)
     except Exception as exc:  # noqa: BLE001 — normalized for the façade
         raise normalize_agent_run_error(exc) from exc
     return RunResult(text=_result_text(result), usage=_result_usage(result))

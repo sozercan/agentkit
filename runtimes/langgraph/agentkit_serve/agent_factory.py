@@ -26,13 +26,16 @@ adapter/target.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
 from datetime import timedelta
 from types import TracebackType
 from typing import Any
+from uuid import UUID
 
 from langchain.agents import create_agent
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.callbacks import AsyncCallbackHandler
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.tools import load_mcp_tools
 from langchain_openai import ChatOpenAI
@@ -51,7 +54,7 @@ from agentkit_serve_common.adapter_support import (
     upstream_status_code,
 )
 from agentkit_serve_common.config import AgentSpec, ToolSpec
-from agentkit_serve_common.conversation import RunRequest
+from agentkit_serve_common.conversation import RunRequest, ToolCallEvent
 from agentkit_serve_common.runtime import (
     AgentRunError,
     OfflineEchoRuntimeFactory,
@@ -339,13 +342,52 @@ def _state_usage(state: Any) -> dict[str, int]:
     return totals
 
 
+class _ToolEventCallback(AsyncCallbackHandler):
+    """Observe real tool execution without forwarding its payload or errors."""
+
+    raise_error = True
+    run_inline = True
+
+    def __init__(self, observe: Callable[[ToolCallEvent], Awaitable[None]]) -> None:
+        self.observe = observe
+        self.names: dict[UUID, str] = {}
+
+    async def _emit(self, event: ToolCallEvent) -> None:
+        try:
+            await self.observe(event)
+        except Exception:
+            # LangChain logs callback exceptions even when raise_error is set.
+            raise AgentRunError("tool lifecycle observer failed") from None
+
+    async def on_tool_start(
+        self, serialized: dict[str, Any], input_str: str, *, run_id: UUID, **kwargs: Any
+    ) -> None:
+        name = serialized.get("name") or "Tool call"
+        self.names[run_id] = name
+        await self._emit(ToolCallEvent(str(run_id), name, "in_progress"))
+
+    async def on_tool_end(self, output: Any, *, run_id: UUID, **kwargs: Any) -> None:
+        name = self.names.pop(run_id)
+        # Handled MCP failures arrive as ToolMessage(status="error"), without
+        # invoking on_tool_error, so a completed callback is not always success.
+        failed = isinstance(output, ToolMessage) and output.status == "error"
+        await self._emit(ToolCallEvent(str(run_id), name, "failed" if failed else "completed"))
+
+    async def on_tool_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
+        name = self.names.pop(run_id)
+        await self._emit(ToolCallEvent(str(run_id), name, "failed"))
+
+
 async def run_agent(agent: LangGraphRuntime, request: RunRequest) -> RunResult:
     """Run the compiled LangGraph once and return a neutral ``RunResult``."""
     if agent.graph is None:
         raise AgentRunError("agent graph is not initialized", status=500, code="AgentNotInitialized")
 
+    kwargs = {}
+    if request.on_tool_event is not None:
+        kwargs["config"] = {"callbacks": [_ToolEventCallback(request.on_tool_event)]}
     try:
-        state = await agent.graph.ainvoke({"messages": _to_messages(request)})
+        state = await agent.graph.ainvoke({"messages": _to_messages(request)}, **kwargs)
     except AgentRunError:
         raise
     except Exception as exc:  # noqa: BLE001 — normalized for the façade
