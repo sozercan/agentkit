@@ -74,9 +74,15 @@ _DEFAULT_SEARCH_AUDIENCE = "https://search.azure.com/.default"
 _DEFAULT_FOUNDRY_AUDIENCE = "https://ai.azure.com/.default"
 _DEFAULT_MCP_REQUEST_TIMEOUT = 120
 _DEFAULT_SESSION_CACHE_MAX = 256
-# Invocation tasks inherit the same mutable marker for this run. Separate runs,
-# including concurrent Sessions on one Agent, receive independent markers.
-_mcp_failures: ContextVar[list[bool] | None] = ContextVar("agentkit_maf_mcp_failures", default=None)
+# Invocation tasks share a fatal-error signal with their run owner. Concurrent
+# Sessions on the same Agent have independent signals.
+_run_failure: ContextVar[asyncio.Future[str] | None] = ContextVar("agentkit_maf_run_failure", default=None)
+
+
+def _fail_run(message: str) -> None:
+    failure = _run_failure.get()
+    if failure is not None and not failure.done():
+        failure.set_result(message)
 
 
 def _mcp_request_timeout() -> int:
@@ -374,14 +380,13 @@ class _MCPFailureMiddleware(FunctionMiddleware):
     async def process(
         self, context: FunctionInvocationContext, call_next: Callable[[], Awaitable[None]]
     ) -> None:
-        failures = _mcp_failures.get()
-        if failures:
-            raise MiddlewareTermination("MCP tool protocol failed")
+        failure = _run_failure.get()
+        if failure is not None and failure.done():
+            raise MiddlewareTermination(failure.result())
         try:
             await call_next()
         except _MCPProtocolError:
-            if failures is not None:
-                failures.append(True)
+            _fail_run("MCP tool protocol failed")
             # MiddlewareTermination stops the model loop even on MAF 1.9,
             # which predates MiddlewareFailure. run_agent makes it a failure.
             raise MiddlewareTermination("MCP tool protocol failed") from None
@@ -779,7 +784,6 @@ class _ToolEventMiddleware(FunctionMiddleware):
 
     def __init__(self, observe: Callable[[ToolCallEvent], Awaitable[None]]) -> None:
         self.observe = observe
-        self.failed = False
 
     async def _emit(self, event: ToolCallEvent) -> None:
         try:
@@ -788,7 +792,7 @@ class _ToolEventMiddleware(FunctionMiddleware):
             # MAF absorbs ordinary function exceptions and continues the model
             # loop. Stop it, then fail run_agent, even on supported versions
             # predating MiddlewareFailure.
-            self.failed = True
+            _fail_run("tool lifecycle observer failed")
             raise MiddlewareTermination("tool lifecycle observer failed") from None
 
     async def process(
@@ -815,21 +819,32 @@ async def run_agent(
     """Run the MAF agent and return the neutral result shape."""
     messages = _to_messages(request, include_history=include_history)
     kwargs = {}
-    observer = None
     if request.on_tool_event is not None:
-        observer = _ToolEventMiddleware(request.on_tool_event)
-        kwargs["middleware"] = [observer]
-    failures: list[bool] = []
-    token = _mcp_failures.set(failures)
+        kwargs["middleware"] = [_ToolEventMiddleware(request.on_tool_event)]
+    failure: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+    token = _run_failure.set(failure)
+
+    async def execute():
+        return await agent.run(messages, session=session, **kwargs)
+
+    running = asyncio.create_task(execute())
     try:
         try:
-            result = await agent.run(messages, session=session, **kwargs)
-        except Exception as exc:  # noqa: BLE001 — normalized for the façade
-            raise normalize_agent_run_error(exc) from exc
+            # MiddlewareTermination stops the next model step, but supported
+            # MAF versions first join all calls in the current batch. Cancel
+            # and join the SDK run so a fatal call also stops pending siblings.
+            await asyncio.wait((running, failure), return_when=asyncio.FIRST_COMPLETED)
+            if not failure.done():
+                try:
+                    result = await running
+                except Exception as exc:  # noqa: BLE001 — normalized for the façade
+                    raise normalize_agent_run_error(exc) from exc
+        finally:
+            running.cancel()
+            await asyncio.gather(running, return_exceptions=True)
+        if failure.done():
+            raise AgentRunError(failure.result())
+        return RunResult(text=_result_text(result), usage=_result_usage(result))
     finally:
-        _mcp_failures.reset(token)
-    if failures:
-        raise AgentRunError("MCP tool protocol failed")
-    if observer is not None and observer.failed:
-        raise AgentRunError("tool lifecycle observer failed")
-    return RunResult(text=_result_text(result), usage=_result_usage(result))
+        failure.cancel()
+        _run_failure.reset(token)

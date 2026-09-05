@@ -260,6 +260,8 @@ class RecordingWriter:
         self.frames: list[bytes] = []
         self.parsed_messages: list[dict[str, Any]] = []
         self.lock = threading.Lock()
+        self.loop = asyncio.get_running_loop()
+        self.updated = asyncio.Event()
 
     def write(self, frame: bytes) -> int:
         message = json.loads(frame)
@@ -274,6 +276,7 @@ class RecordingWriter:
         with self.lock:
             self.frames.append(bytes(frame))
             self.parsed_messages.append(message)
+        self.loop.call_soon_threadsafe(self.updated.set)
         return len(frame)
 
     def flush(self) -> None:
@@ -287,11 +290,14 @@ class RecordingWriter:
 async def _wait_for_stdio_response(writer: RecordingWriter, request_id: int) -> dict[str, Any]:
     async def wait() -> dict[str, Any]:
         while True:
+            # Sleeping until a write avoids starving the writer thread with
+            # repeated list scans. Clear before reading to retain racing writes.
+            writer.updated.clear()
             matches = [message for message in writer.messages() if message.get("id") == request_id]
             if matches:
                 assert len(matches) == 1
                 return matches[0]
-            await asyncio.sleep(0)
+            await writer.updated.wait()
 
     return await asyncio.wait_for(wait(), timeout=5)
 

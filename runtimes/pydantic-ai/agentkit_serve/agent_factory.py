@@ -23,10 +23,11 @@ error normalization live in ``agentkit_serve_common.adapter_support``.
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from types import TracebackType
-from typing import Any, AsyncIterable
+from typing import Any, AsyncIterable, AsyncIterator
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, ModelRetry
 
 try:  # pydantic-ai 1.x
     from pydantic_ai.mcp import MCPServerStdio
@@ -41,9 +42,11 @@ except ImportError:  # pragma: no cover - older pydantic-ai without MCPToolset
 try:
     from fastmcp.client.transports.stdio import StdioTransport
     from fastmcp.client.transports.http import StreamableHttpTransport
+    from fastmcp.exceptions import ToolError
 except ImportError:  # pragma: no cover - older dependency set without FastMCP transports
     StdioTransport = None  # type: ignore[assignment]
     StreamableHttpTransport = None  # type: ignore[assignment]
+from pydantic_ai.models import StreamedResponse
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
@@ -61,6 +64,7 @@ from agentkit_serve_common.adapter_support import (
 from agentkit_serve_common.config import AgentSpec, ToolSpec
 from agentkit_serve_common.conversation import RunRequest, ToolCallEvent
 from agentkit_serve_common.runtime import (
+    AgentRunError,
     OfflineEchoRuntimeFactory,
     RunResult,
     RuntimeSession,
@@ -86,13 +90,46 @@ def validate_supported_spec(spec: AgentSpec) -> None:
         raise AgentBuildError("pydantic-ai runtime does not support context providers")
 
 
+class _OpenAIChatModel(OpenAIChatModel):
+    @asynccontextmanager
+    async def request_stream(self, *args: Any, **kwargs: Any) -> AsyncIterator[StreamedResponse]:
+        async with super().request_stream(*args, **kwargs) as response:
+            yield response
+            # EOF alone must not commit partial text or execute partial tool
+            # calls. Check each model response before the agent advances.
+            if not response.cancelled and not (
+                response.finish_reason or (response.provider_details or {}).get("finish_reason")
+            ):
+                raise AgentRunError("Model stream ended before completion")
+
+
 def build_model(spec: AgentSpec) -> OpenAIChatModel:
     """Construct the OpenAI-compatible chat model pointed at ``model.baseURL``."""
     provider = OpenAIProvider(
         base_url=spec.model.base_url,
         api_key=resolve_api_key(spec),
     )
-    return OpenAIChatModel(spec.model.name, provider=provider)
+    return _OpenAIChatModel(spec.model.name, provider=provider)
+
+
+async def _process_mcp_tool_call(ctx: Any, call_tool: Any, name: str, args: dict[str, Any]) -> Any:
+    try:
+        return await call_tool(name, args)
+    except ToolError:
+        # FastMCP raises ToolError only for an admitted isError result. Preserve
+        # model recovery for that case, without forwarding upstream diagnostics.
+        raise ModelRetry("MCP tool execution failed") from None
+    except ExceptionGroup as exc:
+        # FastMCP can group completed tool errors during session teardown.
+        # Mixed protocol/transport failures must still stop the run.
+        _, remaining = exc.split(ToolError)
+        if remaining is None:
+            raise ModelRetry("MCP tool execution failed") from None
+        raise AgentRunError("MCP tool protocol failed") from None
+    except Exception:
+        # Recent Pydantic AI versions also retry JSON-RPC errors by default.
+        # Authorization, protocol and transport failures must end this run.
+        raise AgentRunError("MCP tool protocol failed") from None
 
 
 def build_tool_server(tool: ToolSpec) -> Any:
@@ -110,7 +147,13 @@ def build_tool_server(tool: ToolSpec) -> Any:
             url,
             httpx_client_factory=same_origin_mcp_httpx_client_factory(tool, url, timeout=timeout),
         )
-        return MCPToolset(transport, init_timeout=timeout, read_timeout=timeout).prefixed(tool.name)
+        return MCPToolset(
+            transport,
+            init_timeout=timeout,
+            read_timeout=timeout,
+            tool_error_behavior="error",
+            process_tool_call=_process_mcp_tool_call,
+        ).prefixed(tool.name)
 
     command, args = split_tool_command(tool, example='["npx", "-y", "..."]')
 
@@ -143,7 +186,13 @@ def build_tool_server(tool: ToolSpec) -> Any:
         # the stdio subprocess should be torn down instead of kept alive.
         keep_alive=False,
     )
-    return MCPToolset(transport, init_timeout=timeout, read_timeout=timeout).prefixed(tool.name)
+    return MCPToolset(
+        transport,
+        init_timeout=timeout,
+        read_timeout=timeout,
+        tool_error_behavior="error",
+        process_tool_call=_process_mcp_tool_call,
+    ).prefixed(tool.name)
 
 
 def build_agent(spec: AgentSpec) -> Agent:
