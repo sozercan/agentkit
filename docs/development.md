@@ -122,7 +122,7 @@ live model provider.
 
 The optional live job runs `scripts/live-copilot-agent-e2e.sh` when
 `COPILOT_GITHUB_TOKEN` is available and the run is allowed to access repository
-secrets. It uses the pinned `ghcr.io/sozercan/vekil` image to provide an
+secrets. It uses `ghcr.io/sozercan/vekil:latest` to provide an
 OpenAI-compatible endpoint and validates a real built AgentKit container through
 `/v1/chat/completions`.
 
