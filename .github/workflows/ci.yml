@@ -408,7 +408,7 @@ jobs:
     timeout-minutes: 75
     env:
       COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
-      VEKIL_IMAGE: ghcr.io/sozercan/vekil:latest
+      VEKIL_IMAGE: ghcr.io/sozercan/vekil:v0.14.1@sha256:2fa0558f6304cc6ed1fb5b0135f62f12f28f1cdd0a8c057c4283414bceac1362
     steps:
       - name: Decide whether live Vekil/Copilot E2E can run
         id: gate
