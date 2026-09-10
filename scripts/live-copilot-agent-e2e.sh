@@ -126,6 +126,7 @@ wait_for_vekil_ready() {
     sleep 2
   done
 
+  log "Vekil readiness response: $(curl -sS --max-time 10 "${url}" 2>&1 | redact || true)"
   die "Vekil /readyz never became available at ${url}"
 }
 
