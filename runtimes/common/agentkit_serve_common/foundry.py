@@ -40,6 +40,7 @@ from fastapi.responses import JSONResponse, Response
 from .brokered import brokered_tool_definitions
 from .config import AgentSpec, _unsafe_brokered_key, _unsafe_brokered_text
 from .foundry_model_loop import BrokeredChatModelLoop, ModelLoopFinal, ModelLoopToolRequest
+from .foundry_streaming import BrokeredResponseStream, brokered_stream_response
 from .conversation import FORWARDED_ROLES, ConversationTurn, RunRequest
 from .runtime import AgentRunError, BrokeredToolDefinition, RunResult, RuntimeFactory
 from .server import make_auth_dependency
@@ -364,8 +365,14 @@ def _responses_input_to_run_request(value: Any, *, session_id: str | None) -> Ru
     return RunRequest(prompt=json.dumps(value, separators=(",", ":"), sort_keys=True), session_id=session_id)
 
 
-def _responses_payload(spec: AgentSpec, result: RunResult, *, previous_response_id: str | None = None) -> dict[str, Any]:
-    response_id = _new_response_id(previous_response_id)
+def _responses_payload(
+    spec: AgentSpec,
+    result: RunResult,
+    *,
+    previous_response_id: str | None = None,
+    response_id: str | None = None,
+) -> dict[str, Any]:
+    response_id = response_id or _new_response_id(previous_response_id)
     message_id = _new_message_id(response_id)
     payload: dict[str, Any] = {
         "id": response_id,
@@ -2355,6 +2362,7 @@ async def _handle_brokered_continuation(
     session_id: str | None,
     max_output_bytes: int,
     model_loop: BrokeredChatModelLoop | None = None,
+    stream: BrokeredResponseStream | None = None,
 ) -> JSONResponse:
     if not continuation_proof:
         return _error(
@@ -2546,6 +2554,8 @@ async def _handle_brokered_continuation(
             try:
                 next_response_id = _new_response_id(str(previous_response_id))
                 next_call_id = f"call_{next_response_id}_1"
+                if stream is not None:
+                    await stream.accept(next_response_id)
                 model_result = await model_loop.resume(state.model_messages, call_id=call_id, output=output_json, next_call_id=next_call_id)
             except AgentRunError as exc:
                 if not _reset_unfinalized_continuation(store, state, call_id=call_id):
@@ -2586,7 +2596,12 @@ async def _handle_brokered_continuation(
     resume_initial_usage = dict(state.initial_usage)
     has_resume_transcript = resume_model_messages is not None
     used_model_resume = has_resume_transcript and model_loop is not None
-    final_payload = _responses_payload(spec, result, previous_response_id=str(previous_response_id))
+    final_payload = _responses_payload(
+        spec,
+        result,
+        previous_response_id=str(previous_response_id),
+        response_id=stream.created.result()["id"] if stream is not None and stream.created.done() else None,
+    )
     state.accepted_output_digests[call_id] = output_digest
     state.accepted_output_sizes[call_id] = accepted_output_size
     state.status = "completed"
@@ -2775,11 +2790,22 @@ def create_foundry_app(
         except (UnicodeDecodeError, RecursionError, ValueError):
             return _error("Request body must be JSON", status=400, code="invalid_json")
 
+        if brokered_tools and isinstance(data, dict) and data.get("stream") is True:
+            return await brokered_stream_response(
+                spec.model.name,
+                lambda stream: execute_responses(request, data, request_body_size, stream),
+            )
+        return await execute_responses(request, data, request_body_size)
+
+    async def execute_responses(
+        request: Request,
+        data: Any,
+        request_body_size: int,
+        stream: BrokeredResponseStream | None = None,
+    ) -> JSONResponse:
         if not isinstance(data, dict):
             return _error("Request body must be a JSON object", status=400, code="invalid_request")
-        # Foundry/azd clients may include stream=true by default. The adapter is
-        # intentionally non-streaming, so tolerate the flag and return a normal
-        # completed response instead of failing readiness/e2e checks.
+        # Non-brokered adapters retain their existing buffered response behavior.
         if data.get("tools"):
             return _error(
                 "request-supplied Responses tools are not allowed; hosted brokered mode uses static safe schemas",
@@ -2808,6 +2834,8 @@ def create_foundry_app(
                 status=409,
                 code="response_session_mismatch",
             )
+        if stream is not None:
+            stream.session_id = session_id
         previous_response_id = data.get("previous_response_id")
         function_outputs = _function_call_outputs_from_input(data["input"])
         if brokered_tools and not function_outputs and request_body_size > request_body_limit:
@@ -2828,6 +2856,7 @@ def create_foundry_app(
                 session_id=session_id,
                 max_output_bytes=max_output_bytes,
                 model_loop=model_loop,
+                stream=stream,
             )
         previous_state = None
         if brokered_tools and isinstance(previous_response_id, str) and previous_response_id:
@@ -2901,6 +2930,8 @@ def create_foundry_app(
                     return _state_storage_error()
                 try:
                     try:
+                        if stream is not None:
+                            await stream.accept(response_id)
                         model_result = await model_loop.start(run_request, call_id=call_id)
                     except AgentRunError as exc:
                         if exc.code == "ModelResponseTooLarge":
@@ -2911,6 +2942,7 @@ def create_foundry_app(
                             spec,
                             RunResult(text=model_result.text, usage=model_result.usage),
                             previous_response_id=previous_response_id_for_output,
+                            response_id=response_id if stream is not None else None,
                         )
                         if run_request.session_id:
                             completed = _HostedResponseState(

@@ -234,9 +234,18 @@ operations.
 
 ## Streaming
 
-The current route is non-streaming. If clients send `stream: true`, AgentKit
-returns the same normal JSON response rather than SSE. This keeps azd/direct curl
-smokes deterministic while making streaming support an explicit future step.
+In brokered mode, `/responses` honors `stream: true` with server-sent events.
+AgentKit sends `response.created` before starting model work, then sends
+`response.completed` or `response.failed` with the same response ID. These events
+include the effective `agent_session_id` when one is present. This lets Orka
+record which hosted response it accepted before waiting for the model.
+
+The stream contains acknowledgement and completion events, without token deltas.
+Validation errors before acknowledgement keep their normal HTTP error status.
+Disconnecting the stream cancels the active model request and releases its
+in-progress state. Orka still uses authenticated session stop and idle checks to
+confirm hosted cleanup. Requests without `stream: true` keep the JSON response
+format.
 
 ## Troubleshooting
 

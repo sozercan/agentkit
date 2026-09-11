@@ -1,0 +1,388 @@
+"""Hosted Responses acknowledgements, identity, and disconnect regressions."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from contextlib import asynccontextmanager
+
+import httpx
+import pytest
+
+from test_foundry_brokered_protocol import (
+    CONTINUATION_AUTH,
+    _app,
+    _call,
+    _chat_response,
+    _continuation,
+    _spec,
+)
+
+
+def _tool_response():
+    return _chat_response(
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "model-call",
+                    "type": "function",
+                    "function": {
+                        "name": "conformance_read",
+                        "arguments": '{"probe":true}',
+                    },
+                }
+            ],
+        }
+    )
+
+
+class HeldModel(httpx.AsyncBaseTransport):
+    def __init__(self, result="text", *, continuation=False):
+        self.result = result
+        self.held_call = 2 if continuation else 1
+        self.calls = 0
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def handle_async_request(self, request):
+        self.calls += 1
+        if self.calls < self.held_call:
+            return httpx.Response(200, request=request, json=_tool_response())
+        if self.calls == self.held_call:
+            self.started.set()
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+        if self.result == "error":
+            return httpx.Response(
+                401, request=request, json={"error": "private-upstream-detail"}
+            )
+        payload = (
+            _tool_response()
+            if self.result == "tool"
+            else _chat_response({"role": "assistant", "content": "Verified response."})
+        )
+        return httpx.Response(200, request=request, json=payload)
+
+
+@asynccontextmanager
+async def _exchange(app, payload, *, hold_created=None):
+    incoming, outgoing = asyncio.Queue(), asyncio.Queue()
+    await incoming.put(
+        {
+            "type": "http.request",
+            "body": json.dumps(payload).encode(),
+            "more_body": False,
+        }
+    )
+
+    async def send(message):
+        await outgoing.put(message)
+        if (
+            hold_created is not None
+            and message["type"] == "http.response.body"
+            and message.get("more_body")
+        ):
+            await hold_created.wait()
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.4"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/responses",
+        "raw_path": b"/responses",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (b"content-type", b"application/json"),
+            *[
+                (key.encode(), value.encode())
+                for key, value in CONTINUATION_AUTH.items()
+            ],
+        ],
+        "client": ("127.0.0.1", 1234),
+        "server": ("testserver", 80),
+    }
+    task = asyncio.create_task(app(scope, incoming.get, send))
+    try:
+        yield incoming, outgoing, task
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def _created(outgoing):
+    headers = await asyncio.wait_for(outgoing.get(), 2)
+    assert headers["type"] == "http.response.start" and headers["status"] == 200
+    assert dict(headers["headers"])[b"content-type"].startswith(b"text/event-stream")
+    assert b"content-length" not in dict(headers["headers"])
+    return await _event(outgoing)
+
+
+async def _event(outgoing):
+    message = await asyncio.wait_for(outgoing.get(), 2)
+    assert message["type"] == "http.response.body"
+    assert message["body"].endswith(b"\n\n")
+    data = next(
+        line.removeprefix(b"data: ")
+        for line in message["body"].splitlines()
+        if line.startswith(b"data: ")
+    )
+    return json.loads(data)
+
+
+@pytest.mark.parametrize("continuation", [False, True])
+@pytest.mark.parametrize("result", ["text", "tool"])
+def test_brokered_stream_ack_precedes_model_and_matches_completion_and_replay(
+    continuation, result
+):
+    async def exercise():
+        model = HeldModel(result, continuation=continuation)
+        async with httpx.AsyncClient(transport=model) as upstream:
+            app = _app(
+                _spec(),
+                brokered_model_loop_enabled=True,
+                brokered_model_http_client=upstream,
+            )
+            payload = {
+                "input": "Read the synthetic data",
+                "agent_session_id": "session-a",
+                "stream": True,
+            }
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+            ) as client:
+                if continuation:
+                    initial = (
+                        await client.post(
+                            "/responses",
+                            json={
+                                "input": "Read data",
+                                "agent_session_id": "session-a",
+                            },
+                        )
+                    ).json()
+                    payload = {
+                        **_continuation(
+                            initial["id"],
+                            _call(initial)["call_id"],
+                            {"approved": True, "output": {"ok": True}},
+                        ),
+                        "agent_session_id": "session-a",
+                        "stream": True,
+                    }
+                delivered = asyncio.Event()
+                async with _exchange(app, payload, hold_created=delivered) as (
+                    _,
+                    outgoing,
+                    request,
+                ):
+                    created = await _created(outgoing)
+                    assert created["type"] == "response.created"
+                    assert created["response"]["status"] == "in_progress"
+                    assert created["response"]["agent_session_id"] == "session-a"
+                    assert created["response"]["output"] == []
+                    assert not model.started.is_set()
+                    delivered.set()
+                    await asyncio.wait_for(model.started.wait(), 2)
+                    assert outgoing.empty() and not request.done()
+                    model.release.set()
+                    completed = await _event(outgoing)
+                    await asyncio.wait_for(request, 2)
+                assert completed["type"] == "response.completed"
+                response = completed["response"]
+                assert response["id"] == created["response"]["id"]
+                assert response["agent_session_id"] == "session-a"
+                assert response["output"][0]["response_id"] == response["id"]
+                assert response["output"][0]["type"] == (
+                    "function_call" if result == "tool" else "message"
+                )
+                if continuation:
+                    async with _exchange(app, payload) as (_, outgoing, replay_request):
+                        replay_created = await _created(outgoing)
+                        replay_completed = await _event(outgoing)
+                        await asyncio.wait_for(replay_request, 2)
+                    assert replay_created["response"]["id"] == response["id"]
+                    assert replay_completed == completed
+                    buffered = await client.post(
+                        "/responses",
+                        json={**payload, "stream": False},
+                        headers=CONTINUATION_AUTH,
+                    )
+                    assert buffered.status_code == 200
+                    assert buffered.json() == {
+                        key: value
+                        for key, value in response.items()
+                        if key != "agent_session_id"
+                    }
+                    assert model.calls == 2
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("continuation", [False, True])
+def test_brokered_stream_error_retains_acknowledged_identity(continuation):
+    async def exercise():
+        model = HeldModel("error", continuation=continuation)
+        async with httpx.AsyncClient(transport=model) as upstream:
+            app = _app(
+                _spec(),
+                brokered_model_loop_enabled=True,
+                brokered_model_http_client=upstream,
+            )
+            payload = {
+                "input": "Read data",
+                "agent_session_id": "session-a",
+                "stream": True,
+            }
+            if continuation:
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+                ) as client:
+                    initial = (
+                        await client.post(
+                            "/responses",
+                            json={
+                                "input": "Read data",
+                                "agent_session_id": "session-a",
+                            },
+                        )
+                    ).json()
+                payload = {
+                    **_continuation(
+                        initial["id"],
+                        _call(initial)["call_id"],
+                        {"approved": True, "output": {"ok": True}},
+                    ),
+                    "agent_session_id": "session-a",
+                    "stream": True,
+                }
+            async with _exchange(app, payload) as (_, outgoing, request):
+                created = await _created(outgoing)
+                await asyncio.wait_for(model.started.wait(), 2)
+                model.release.set()
+                failed = await _event(outgoing)
+                await asyncio.wait_for(request, 2)
+            assert failed["type"] == "response.failed" and "error" not in failed
+            assert failed["response"]["id"] == created["response"]["id"]
+            assert failed["response"]["agent_session_id"] == "session-a"
+            assert failed["response"]["status"] == "failed"
+            assert failed["response"]["error"]["code"]
+            assert "private-upstream-detail" not in json.dumps(failed)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("continuation", [False, True])
+def test_brokered_stream_disconnect_cancels_model_and_releases_initial_or_resume_state(
+    continuation,
+):
+    async def exercise():
+        model = HeldModel(continuation=continuation)
+        async with httpx.AsyncClient(transport=model) as upstream:
+            app = _app(
+                _spec(),
+                brokered_model_loop_enabled=True,
+                brokered_model_http_client=upstream,
+                max_pending_responses=1,
+            )
+            payload = {"input": "Read data", "stream": True}
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+            ) as client:
+                if continuation:
+                    initial = (
+                        await client.post("/responses", json={"input": "Read data"})
+                    ).json()
+                    payload = {
+                        **_continuation(
+                            initial["id"],
+                            _call(initial)["call_id"],
+                            {"approved": True, "output": {"ok": True}},
+                        ),
+                        "stream": True,
+                    }
+                async with _exchange(app, payload) as (incoming, outgoing, request):
+                    await _created(outgoing)
+                    await asyncio.wait_for(model.started.wait(), 2)
+                    await incoming.put({"type": "http.disconnect"})
+                    await asyncio.wait_for(request, 2)
+                    assert model.cancelled.is_set()
+                    assert outgoing.empty()
+                retry = await client.post(
+                    "/responses",
+                    json={**payload, "stream": False},
+                    headers=CONTINUATION_AUTH,
+                )
+                assert retry.status_code == 200, retry.text
+                assert (
+                    retry.json()["output"][0]["content"][0]["text"]
+                    == "Verified response."
+                )
+                assert model.calls == (3 if continuation else 2)
+
+    asyncio.run(exercise())
+
+
+def test_brokered_stream_disconnect_before_created_is_delivered_starts_no_model_work():
+    async def exercise():
+        model = HeldModel()
+        async with httpx.AsyncClient(transport=model) as upstream:
+            app = _app(
+                _spec(),
+                brokered_model_loop_enabled=True,
+                brokered_model_http_client=upstream,
+                max_pending_responses=1,
+            )
+            async with _exchange(
+                app,
+                {"input": "Read data", "stream": True},
+                hold_created=asyncio.Event(),
+            ) as (incoming, outgoing, request):
+                await _created(outgoing)
+                await incoming.put({"type": "http.disconnect"})
+                await asyncio.wait_for(request, 2)
+            assert model.calls == 0
+            model.release.set()
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+            ) as client:
+                retry = await client.post("/responses", json={"input": "Read data"})
+            assert retry.status_code == 200, retry.text
+
+    asyncio.run(exercise())
+
+
+def test_brokered_stream_validation_failure_keeps_http_error_without_ack():
+    async def exercise():
+        model = HeldModel()
+        async with httpx.AsyncClient(transport=model) as upstream:
+            app = _app(
+                _spec(),
+                brokered_model_loop_enabled=True,
+                brokered_model_http_client=upstream,
+            )
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+            ) as client:
+                response = await client.post(
+                    "/responses",
+                    json={
+                        "input": "Read data",
+                        "stream": True,
+                        "tools": [{"type": "function"}],
+                    },
+                )
+            assert response.status_code == 400
+            assert response.json()["error"]["code"] == "tools_unsupported"
+            assert model.calls == 0
+
+    asyncio.run(exercise())
