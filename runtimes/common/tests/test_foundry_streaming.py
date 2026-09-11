@@ -149,8 +149,12 @@ async def _event(outgoing):
 @pytest.mark.parametrize("continuation", [False, True])
 @pytest.mark.parametrize("result", ["text", "tool"])
 def test_brokered_stream_ack_precedes_model_and_matches_completion_and_replay(
-    continuation, result
+    continuation, result, monkeypatch, tmp_path
 ):
+    clock = [1_700_000_000]
+    monkeypatch.setattr("agentkit_serve_common.foundry.time.time", lambda: clock[0])
+    state_file = tmp_path / "responses.json"
+
     async def exercise():
         model = HeldModel(result, continuation=continuation)
         async with httpx.AsyncClient(transport=model) as upstream:
@@ -158,6 +162,7 @@ def test_brokered_stream_ack_precedes_model_and_matches_completion_and_replay(
                 _spec(),
                 brokered_model_loop_enabled=True,
                 brokered_model_http_client=upstream,
+                response_state_file=state_file,
             )
             payload = {
                 "input": "Read the synthetic data",
@@ -195,29 +200,47 @@ def test_brokered_stream_ack_precedes_model_and_matches_completion_and_replay(
                     created = await _created(outgoing)
                     assert created["type"] == "response.created"
                     assert created["response"]["status"] == "in_progress"
+                    assert created["response"]["created_at"] == clock[0]
                     assert created["response"]["agent_session_id"] == "session-a"
                     assert created["response"]["output"] == []
                     assert not model.started.is_set()
                     delivered.set()
                     await asyncio.wait_for(model.started.wait(), 2)
                     assert outgoing.empty() and not request.done()
+                    clock[0] += 10
                     model.release.set()
                     completed = await _event(outgoing)
                     await asyncio.wait_for(request, 2)
                 assert completed["type"] == "response.completed"
                 response = completed["response"]
                 assert response["id"] == created["response"]["id"]
+                assert response["created_at"] == created["response"]["created_at"]
                 assert response["agent_session_id"] == "session-a"
                 assert response["output"][0]["response_id"] == response["id"]
                 assert response["output"][0]["type"] == (
                     "function_call" if result == "tool" else "message"
                 )
                 if continuation:
-                    async with _exchange(app, payload) as (_, outgoing, replay_request):
+                    clock[0] += 10
+                    restarted_app = _app(
+                        _spec(),
+                        brokered_model_loop_enabled=True,
+                        brokered_model_http_client=upstream,
+                        response_state_file=state_file,
+                    )
+                    async with _exchange(restarted_app, payload) as (
+                        _,
+                        outgoing,
+                        replay_request,
+                    ):
                         replay_created = await _created(outgoing)
                         replay_completed = await _event(outgoing)
                         await asyncio.wait_for(replay_request, 2)
                     assert replay_created["response"]["id"] == response["id"]
+                    assert (
+                        replay_created["response"]["created_at"]
+                        == response["created_at"]
+                    )
                     assert replay_completed == completed
                     buffered = await client.post(
                         "/responses",
@@ -420,7 +443,12 @@ def _native_app(client, *, url="http://model/v1/chat/completions", **options):
 
 
 @pytest.mark.parametrize("session_id", [None, "native-session"])
-def test_native_stream_ack_precedes_runtime_and_keeps_completion_identity(session_id):
+def test_native_stream_ack_precedes_runtime_and_keeps_completion_identity(
+    session_id, monkeypatch
+):
+    clock = [1_700_000_000]
+    monkeypatch.setattr("agentkit_serve_common.foundry.time.time", lambda: clock[0])
+
     async def exercise():
         model = HeldModel()
         async with httpx.AsyncClient(transport=model) as upstream:
@@ -439,18 +467,21 @@ def test_native_stream_ack_precedes_runtime_and_keeps_completion_identity(sessio
             ):
                 created = await _created(outgoing)
                 assert created["response"]["status"] == "in_progress"
+                assert created["response"]["created_at"] == clock[0]
                 assert created["response"].get("agent_session_id") == session_id
                 assert created["response"]["output"] == []
                 assert runtime.requests == [] and model.calls == 0
                 delivered.set()
                 await asyncio.wait_for(model.started.wait(), 2)
                 assert not request.done() and outgoing.empty()
+                clock[0] += 10
                 model.release.set()
                 completed = await _event(outgoing)
                 await asyncio.wait_for(request, 2)
             assert completed["type"] == "response.completed"
             response = completed["response"]
             assert response["id"] == created["response"]["id"]
+            assert response["created_at"] == created["response"]["created_at"]
             assert response.get("agent_session_id") == session_id
             assert response["output"][0]["response_id"] == response["id"]
             assert response["output"][0]["content"][0]["text"] == "Verified response."

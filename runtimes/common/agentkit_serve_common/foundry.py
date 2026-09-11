@@ -371,13 +371,14 @@ def _responses_payload(
     *,
     previous_response_id: str | None = None,
     response_id: str | None = None,
+    created_at: int | None = None,
 ) -> dict[str, Any]:
     response_id = response_id or _new_response_id(previous_response_id)
     message_id = _new_message_id(response_id)
     payload: dict[str, Any] = {
         "id": response_id,
         "object": "response",
-        "created_at": int(time.time()),
+        "created_at": int(time.time()) if created_at is None else created_at,
         "status": "completed",
         "model": spec.model.name,
         "output": [
@@ -2163,11 +2164,12 @@ def _function_call_response_payload(
     call: _PendingCall,
     previous_response_id: str | None = None,
     usage: Mapping[str, int] | None = None,
+    created_at: int | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "id": response_id,
         "object": "response",
-        "created_at": int(time.time()),
+        "created_at": int(time.time()) if created_at is None else created_at,
         "status": "completed",
         "model": spec.model.name,
         "output": [
@@ -2244,6 +2246,7 @@ def _advance_brokered_state(
     model_loop: BrokeredChatModelLoop,
     response_id: str,
     next_call_id: str,
+    created_at: int | None = None,
 ) -> JSONResponse:
     try:
         call = _model_pending_call(
@@ -2258,7 +2261,7 @@ def _advance_brokered_state(
         if not _reset_unfinalized_continuation(store, state, call_id=call_id):
             return _state_storage_error()
         return _error(str(exc), status=exc.status, code=exc.code)
-    payload = _function_call_response_payload(spec, response_id=response_id, call=call, previous_response_id=previous_response_id, usage=result.usage)
+    payload = _function_call_response_payload(spec, response_id=response_id, call=call, previous_response_id=previous_response_id, usage=result.usage, created_at=created_at)
     following = deepcopy(state)
     if not following.response_calls:
         following.response_calls[state.response_id] = call_id
@@ -2531,6 +2534,7 @@ async def _handle_brokered_continuation(
     if state.status != "pending":
         return _error("previous response is not pending a tool result", status=409, code="response_not_pending")
 
+    created_at = None
     if state.model_messages is not None and model_loop is not None:
         try:
             model_loop.validate_static_credentials()
@@ -2555,7 +2559,7 @@ async def _handle_brokered_continuation(
                 next_response_id = _new_response_id(str(previous_response_id))
                 next_call_id = f"call_{next_response_id}_1"
                 if stream is not None:
-                    await stream.accept(next_response_id)
+                    created_at = await stream.accept(next_response_id)
                 model_result = await model_loop.resume(state.model_messages, call_id=call_id, output=output_json, next_call_id=next_call_id)
             except AgentRunError as exc:
                 if not _reset_unfinalized_continuation(store, state, call_id=call_id):
@@ -2586,6 +2590,7 @@ async def _handle_brokered_continuation(
                     model_loop=model_loop,
                     response_id=next_response_id,
                     next_call_id=next_call_id,
+                    created_at=created_at,
                 )
             result = RunResult(text=model_result.text, usage=_combine_usage(state.initial_usage, model_result.usage))
         finally:
@@ -2601,6 +2606,7 @@ async def _handle_brokered_continuation(
         result,
         previous_response_id=str(previous_response_id),
         response_id=stream.created.result()["id"] if stream is not None and stream.created.done() else None,
+        created_at=created_at,
     )
     state.accepted_output_digests[call_id] = output_digest
     state.accepted_output_sizes[call_id] = accepted_output_size
@@ -2929,8 +2935,7 @@ def create_foundry_app(
                     return _state_storage_error()
                 try:
                     try:
-                        if stream is not None:
-                            await stream.accept(response_id)
+                        created_at = await stream.accept(response_id) if stream is not None else None
                         model_result = await model_loop.start(run_request, call_id=call_id)
                     except AgentRunError as exc:
                         if exc.code == "ModelResponseTooLarge":
@@ -2942,6 +2947,7 @@ def create_foundry_app(
                             RunResult(text=model_result.text, usage=model_result.usage),
                             previous_response_id=previous_response_id_for_output,
                             response_id=response_id if stream is not None else None,
+                            created_at=created_at,
                         )
                         if run_request.session_id:
                             completed = _HostedResponseState(
@@ -3026,6 +3032,7 @@ def create_foundry_app(
                             call=call,
                             previous_response_id=previous_response_id_for_output,
                             usage=model_result.usage,
+                            created_at=created_at,
                         )
                     )
                 finally:
@@ -3087,14 +3094,13 @@ def create_foundry_app(
 
         response_id = _new_response_id() if stream is not None else None
         try:
-            if stream is not None:
-                await stream.accept(response_id)
+            created_at = await stream.accept(response_id) if stream is not None else None
             result = await request.app.state.runtime.run(run_request)
         except AgentRunError as exc:
             return _non_brokered_agent_run_error(exc)
         except Exception:  # noqa: BLE001 - deterministic protocol envelope.
             return _non_brokered_unexpected_runtime_error()
 
-        return JSONResponse(_responses_payload(spec, result, response_id=response_id))
+        return JSONResponse(_responses_payload(spec, result, response_id=response_id, created_at=created_at))
 
     return app

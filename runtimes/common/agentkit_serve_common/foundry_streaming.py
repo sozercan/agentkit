@@ -20,13 +20,13 @@ class BrokeredResponseStream:
         )
         self.delivered = asyncio.Event()
 
-    def prepare(self, response_id: str) -> None:
+    def prepare(self, response_id: str, *, created_at: int | None = None) -> None:
         if self.created.done():
             raise RuntimeError("hosted response was already acknowledged")
         payload: dict[str, Any] = {
             "id": response_id,
             "object": "response",
-            "created_at": int(time.time()),
+            "created_at": int(time.time()) if created_at is None else created_at,
             "status": "in_progress",
             "model": self.model,
             "output": [],
@@ -35,10 +35,11 @@ class BrokeredResponseStream:
             payload["agent_session_id"] = self.session_id
         self.created.set_result(payload)
 
-    async def accept(self, response_id: str) -> None:
+    async def accept(self, response_id: str) -> int:
         self.prepare(response_id)
         # Model work starts only after the response.created frame has been sent.
         await self.delivered.wait()
+        return self.created.result()["created_at"]
 
     def terminal(self, result: JSONResponse | None) -> dict[str, Any]:
         created = self.created.result()
@@ -66,7 +67,7 @@ class BrokeredResponseStream:
 
 def _frame(event: dict[str, Any]) -> bytes:
     data = json.dumps(event, separators=(",", ":"), ensure_ascii=True)
-    return f"event: {event['type']}\ndata: {data}\n\n".encode("utf-8")
+    return f"event: {event['type']}\ndata: {data}\n\n".encode()
 
 
 class _BrokeredStreamingResponse(Response):
@@ -108,7 +109,7 @@ class _BrokeredStreamingResponse(Response):
             self.stream.delivered.set()
             try:
                 result = await self.operation
-            except Exception:  # Model failures must not leak exception text into SSE.
+            except Exception:  # noqa: BLE001 - never leak model exception text into SSE.
                 result = None
             await send(
                 {
@@ -154,7 +155,8 @@ async def brokered_stream_response(
             result = await task
             if result.status_code >= 400:
                 return result
-            stream.prepare(json.loads(result.body)["id"])
+            payload = json.loads(result.body)
+            stream.prepare(payload["id"], created_at=payload["created_at"])
         return _BrokeredStreamingResponse(stream, task)
     except BaseException:
         task.cancel()
