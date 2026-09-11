@@ -81,7 +81,7 @@ func exercise(ctx context.Context, cfg settings, runtimeURL, upstream, results s
 		s.report.Passed = runErr == nil
 		data, err := json.MarshalIndent(s.report, "", "  ")
 		if err == nil {
-			err = os.WriteFile(results, append(data, '\n'), 0644)
+			err = os.WriteFile(results, append(data, '\n'), 0o644)
 		}
 		runErr = errors.Join(runErr, err)
 	}()
@@ -145,8 +145,10 @@ func (s *suite) check(name string, run func() error) error {
 	}
 	s.report.Scenarios = append(s.report.Scenarios, item)
 	// These records deliberately omit wire payloads, provider output, and keys.
-	_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"adapter": s.cfg.Adapter, "mode": s.cfg.Mode,
-		"scenario": name, "status": item.Status, "error": item.Error})
+	_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
+		"adapter": s.cfg.Adapter, "mode": s.cfg.Mode,
+		"scenario": name, "status": item.Status, "error": item.Error,
+	})
 	if err != nil {
 		return fmt.Errorf("adapter=%s scenario=%s: %w", s.cfg.Adapter, name, err)
 	}
@@ -194,8 +196,10 @@ func (s *suite) startup() error {
 }
 
 func metadata(fence v2.Fence, task v2.TaskUID, prompt v2.PromptID, expiry time.Time) v2.MutationMetadata {
-	m := v2.MutationMetadata{Fence: fence, TaskUID: task, PromptID: prompt, OperationID: v2.OperationID("op-" + randomID()),
-		RequestDigestSchemaVersion: v2.RequestDigestSchemaVersion, ExpiresAt: expiry}
+	m := v2.MutationMetadata{
+		Fence: fence, TaskUID: task, PromptID: prompt, OperationID: v2.OperationID("op-" + randomID()),
+		RequestDigestSchemaVersion: v2.RequestDigestSchemaVersion, ExpiresAt: expiry,
+	}
 	if task != "" {
 		m.TaskAttempt = 1
 	}
@@ -259,14 +263,18 @@ func (s *suite) promptRequest(session *runtimeSession, scenario *scenario) (v2.S
 		MCPConfigurationDigest: s.cfg.Profile.MCPConfigurationDigest, ToolPolicy: s.cfg.MCP.ToolPolicy,
 		ApprovalPolicy: s.cfg.MCP.ApprovalPolicy, ExpiresAt: lease.ExpiresAt,
 	}
-	request := v2.StartPromptRequest{Protocol: v2.ProtocolVersion, Metadata: m, Lease: lease, MCPAuthorization: auth,
-		Input: v2.PromptInput{Content: []v2.ContentBlock{{Type: v2.ContentBlockText, Text: scenario.input}}}}
+	request := v2.StartPromptRequest{
+		Protocol: v2.ProtocolVersion, Metadata: m, Lease: lease, MCPAuthorization: auth,
+		Input: v2.PromptInput{Content: []v2.ContentBlock{{Type: v2.ContentBlockText, Text: scenario.input}}},
+	}
 	return request, seal(&request, &request.Metadata)
 }
 
 func (s *suite) prompt(session *runtimeSession, kind string) error {
-	scenario := &scenario{name: kind, kind: kind, marker: "E2E_" + randomID(), receipt: "RECEIPT_" + randomID(),
-		previous: append([]historyMessage{}, session.history...), blocked: make(chan time.Time, 1), disconnected: make(chan struct{}, 1)}
+	scenario := &scenario{
+		name: kind, kind: kind, marker: "E2E_" + randomID(), receipt: "RECEIPT_" + randomID(),
+		previous: append([]historyMessage{}, session.history...), blocked: make(chan time.Time, 1), disconnected: make(chan struct{}, 1),
+	}
 	scenario.input = "Reply with exactly this marker: " + scenario.marker + ". Do not call tools."
 	if kind == "tool" || kind == "tool-failure" || kind == "cancel" || kind == "deadline" {
 		scenario.input = "Call " + modelToolName + " exactly once with value \"" + scenario.marker + "\". Wait for its result, then include its exact receipt and the value in your answer."
@@ -444,8 +452,10 @@ func (s *suite) cancelPrompt(ctx context.Context, session *runtimeSession, promp
 }
 
 func (s *suite) validateWorkspace(ctx context.Context, session *runtimeSession, prompt v2.StartPromptRequest, terminal v2.Event) error {
-	settlement := v2.PromptSettlement{TerminalEvent: v2.EventCompleted, Outcome: v2.PromptOutcomeSucceeded,
-		StopReason: terminal.Completed.StopReason, SettledAt: terminal.Identity.Timestamp}
+	settlement := v2.PromptSettlement{
+		TerminalEvent: v2.EventCompleted, Outcome: v2.PromptOutcomeSucceeded,
+		StopReason: terminal.Completed.StopReason, SettledAt: terminal.Identity.Timestamp,
+	}
 	digest, err := v2.CanonicalPromptSettlementDigest(settlement)
 	if err != nil {
 		return err
@@ -503,8 +513,10 @@ func validateToolEvents(events []v2.Event, kind string) error {
 }
 
 func (s *suite) deleteSession(ctx context.Context, session *runtimeSession) error {
-	request := v2.DeleteRuntimeSessionRequest{Protocol: v2.ProtocolVersion,
-		Metadata: metadata(session.fence, "", "", time.Now().UTC().Add(30*time.Second)), Reason: "E2E complete"}
+	request := v2.DeleteRuntimeSessionRequest{
+		Protocol: v2.ProtocolVersion,
+		Metadata: metadata(session.fence, "", "", time.Now().UTC().Add(30*time.Second)), Reason: "E2E complete",
+	}
 	if err := seal(&request, &request.Metadata); err != nil {
 		return err
 	}

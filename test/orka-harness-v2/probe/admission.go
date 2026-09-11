@@ -125,8 +125,10 @@ func (s *suite) rejectRawPrompt(path string, request v2.StartPromptRequest) erro
 	httpRequest.Header.Set("Accept", v2.NDJSONMediaType+", application/json")
 	httpRequest.Header.Set("Authorization", "Bearer "+s.cfg.ControllerToken)
 	httpRequest.Header.Set(v2.OperationCapabilityHeader, capability)
-	client := &http.Client{Transport: v2.NewProxylessTransport(), Timeout: 15 * time.Second,
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	client := &http.Client{
+		Transport: v2.NewProxylessTransport(), Timeout: 15 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 	defer client.CloseIdleConnections()
 	response, err := client.Do(httpRequest)
 	if err != nil {

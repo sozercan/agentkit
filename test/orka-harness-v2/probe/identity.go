@@ -113,7 +113,7 @@ func verifyPrivateDirectory(root string, uid int) error {
 			return err
 		}
 		stat, ok := info.Sys().(*syscall.Stat_t)
-		if !ok || !info.IsDir() || info.Mode().Perm() != 0700 || stat.Uid != uint32(uid) || stat.Gid != uint32(uid) {
+		if !ok || !info.IsDir() || info.Mode().Perm() != 0o700 || stat.Uid != uint32(uid) || stat.Gid != uint32(uid) {
 			return errors.New("session tree is not private to the ACP child's UID/GID")
 		}
 	}

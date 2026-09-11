@@ -161,11 +161,11 @@ func prepare(dir, adapter, adapterDigest, model, mode string) error {
 		},
 	}
 	secretDir := filepath.Join(dir, "secrets")
-	if err := os.MkdirAll(secretDir, 0700); err != nil {
+	if err := os.MkdirAll(secretDir, 0o700); err != nil {
 		return err
 	}
 	for name, value := range map[string]string{"controller": cfg.ControllerToken, "capability": cfg.CapabilityKey, "provider": cfg.ProviderToken} {
-		if err := os.WriteFile(filepath.Join(secretDir, name), []byte(value), 0600); err != nil {
+		if err := os.WriteFile(filepath.Join(secretDir, name), []byte(value), 0o600); err != nil {
 			return err
 		}
 	}
@@ -173,7 +173,7 @@ func prepare(dir, adapter, adapterDigest, model, mode string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(dir, "settings.json"), data, 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "settings.json"), data, 0o600); err != nil {
 		return err
 	}
 	env := map[string]string{
@@ -198,5 +198,5 @@ func prepare(dir, adapter, adapterDigest, model, mode string) error {
 		lines = append(lines, name+"="+value)
 	}
 	sort.Strings(lines)
-	return os.WriteFile(filepath.Join(dir, "runtime.env"), []byte(strings.Join(lines, "\n")+"\n"), 0644)
+	return os.WriteFile(filepath.Join(dir, "runtime.env"), []byte(strings.Join(lines, "\n")+"\n"), 0o644)
 }
