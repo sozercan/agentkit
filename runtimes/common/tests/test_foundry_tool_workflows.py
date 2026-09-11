@@ -310,3 +310,21 @@ def test_hosted_followup_with_unknown_history_fails_closed():
         assert response.status_code == 404
         assert response.json()["error"]["code"] == "unknown_previous_response_id"
         assert not fake.requests
+
+
+@pytest.mark.parametrize("session_id", [None, "session-a", "session-b"])
+def test_expired_hosted_history_rejects_followup_even_without_session_id(session_id):
+    fake = _FakeChatTransport([
+        _chat_response({"role": "assistant", "content": "Your site is site-a."}),
+        _chat_response({"role": "assistant", "content": "Must not run without the expired context."}),
+    ])
+    with TestClient(_model_loop_app(_spec(), fake, state_ttl_seconds=0)) as client:
+        first = client.post("/responses", json={"input": "My site is site-a", "agent_session_id": "session-a"})
+        assert first.status_code == 200, first.text
+        payload = {"input": "Which site was that?", "previous_response_id": first.json()["id"]}
+        if session_id is not None:
+            payload["agent_session_id"] = session_id
+        followup = client.post("/responses", json=payload)
+        assert followup.status_code == 410, followup.text
+        assert followup.json()["error"]["code"] == "response_state_expired"
+        assert len(fake.requests) == 1

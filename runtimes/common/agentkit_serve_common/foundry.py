@@ -2837,7 +2837,9 @@ def create_foundry_app(
                 logger.warning("failed to access Foundry brokered response state: %s", exc)
                 return _state_storage_error()
             except _StateExpired as exc:
-                if exc.state.status in {"pending", "resuming"} or (model_loop is not None and session_id):
+                if exc.state.status in {"pending", "resuming"} or (
+                    model_loop is not None and (session_id or exc.state.session_id)
+                ):
                     return _error("previous_response_id state has expired", status=410, code="response_state_expired")
                 previous_state = None
             except KeyError:
