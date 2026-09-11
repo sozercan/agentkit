@@ -2542,6 +2542,7 @@ def test_foundry_brokered_model_loop_sanitizes_upstream_auth_failures():
         assert response.json()["error"] == {
             "message": "model service rejected configured credentials",
             "code": "ModelAuthRejected",
+            "upstream_status": upstream_status,
         }
         assert internal_url not in response.text
         assert "/chat/completions" not in response.text
@@ -2597,7 +2598,7 @@ def test_foundry_brokered_model_loop_normalizes_non_object_json_response():
 
     assert response.status_code == 502
     assert response.json()["error"] == {
-        "message": "model response must be a JSON object",
+        "message": "model service returned an invalid response",
         "code": "InvalidModelResponse",
     }
 
@@ -2707,7 +2708,7 @@ def test_foundry_brokered_model_loop_rejects_decoded_lone_surrogate():
 
     assert response.status_code == 502
     assert response.json()["error"] == {
-        "message": "model service returned an invalid JSON response",
+        "message": "model service returned an invalid response",
         "code": "InvalidModelResponse",
     }
 
@@ -2763,7 +2764,11 @@ def test_foundry_brokered_model_loop_sanitizes_upstream_auth_failure_on_resume()
         retried = client.post("/responses", headers=CONTINUATION_AUTH, json=payload)
 
     assert failed.status_code == 503
-    assert failed.json()["error"] == {"message": "model resume failed", "code": "ModelResumeError"}
+    assert failed.json()["error"] == {
+        "message": "model service rejected configured credentials",
+        "code": "ModelAuthRejected",
+        "upstream_status": 401,
+    }
     assert internal_url not in failed.text
     assert retried.status_code == 200, retried.text
     assert _message_text(retried.json()) == "Retry after auth recovery."
@@ -3166,7 +3171,7 @@ def test_foundry_brokered_model_loop_unexpected_resume_failure_can_be_retried():
         retried = client.post("/responses", headers=CONTINUATION_AUTH, json=payload)
 
     assert failed.status_code == 502
-    assert failed.json()["error"] == {"message": "model resume failed", "code": "ModelResumeError"}
+    assert failed.json()["error"] == {"message": "model service request failed", "code": "ModelUpstreamError"}
     assert retried.status_code == 200, retried.text
     assert _message_text(retried.json()) == "Recovered after retry."
 

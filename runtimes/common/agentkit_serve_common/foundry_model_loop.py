@@ -28,6 +28,38 @@ from .skills import SkillCatalog
 
 _MAX_ARGUMENT_DEPTH = 128
 
+_NORMALIZED_MODEL_ERRORS = {
+    "ModelAuthMissing": (503, "model authentication is not configured"),
+    "ModelAuthRejected": (503, "model service rejected configured credentials"),
+    "ModelUnavailable": (503, "model service is unavailable"),
+    "ModelUpstreamError": (502, "model service request failed"),
+    "InvalidModelResponse": (502, "model service returned an invalid response"),
+    "ModelResponseTooLarge": (502, "model response is too large to retain safely"),
+}
+
+
+class _ModelHTTPError(AgentRunError):
+    def __init__(self, message: str, *, status: int, code: str, upstream_status: int) -> None:
+        super().__init__(message, status=status, code=code)
+        self.upstream_status = upstream_status
+
+
+def normalized_model_error_details(exc: AgentRunError) -> tuple[int, dict[str, Any]] | None:
+    """Project only runtime-owned model error definitions and bounded HTTP metadata."""
+    definition = _NORMALIZED_MODEL_ERRORS.get(exc.code) if type(exc.code) is str else None
+    if definition is None:
+        return None
+    status, message = definition
+    error: dict[str, Any] = {"message": message, "code": exc.code}
+    # A similarly named attribute on a framework exception is not HTTP evidence.
+    if (
+        isinstance(exc, _ModelHTTPError)
+        and type(exc.upstream_status) is int
+        and 400 <= exc.upstream_status <= 599
+    ):
+        error["upstream_status"] = exc.upstream_status
+    return status, error
+
 
 @dataclass(frozen=True)
 class ModelLoopFinal:
@@ -319,22 +351,31 @@ def _chat_completions_url(base_url: str) -> str:
 
 
 def _normalized_model_http_error(status_code: int) -> AgentRunError:
-    if status_code in {401, 403}:
+    if type(status_code) is not int or not 400 <= status_code <= 599:
         return AgentRunError(
+            "model service request failed",
+            status=502,
+            code="ModelUpstreamError",
+        )
+    if status_code in {401, 403}:
+        return _ModelHTTPError(
             "model service rejected configured credentials",
             status=503,
             code="ModelAuthRejected",
+            upstream_status=status_code,
         )
     if status_code == 429 or status_code >= 500:
-        return AgentRunError(
+        return _ModelHTTPError(
             "model service is unavailable",
             status=503,
             code="ModelUnavailable",
+            upstream_status=status_code,
         )
-    return AgentRunError(
+    return _ModelHTTPError(
         "model service request failed",
         status=502,
         code="ModelUpstreamError",
+        upstream_status=status_code,
     )
 
 

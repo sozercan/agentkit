@@ -39,7 +39,12 @@ from fastapi.responses import JSONResponse, Response
 
 from .brokered import brokered_tool_definitions
 from .config import AgentSpec, _unsafe_brokered_key, _unsafe_brokered_text
-from .foundry_model_loop import BrokeredChatModelLoop, ModelLoopFinal, ModelLoopToolRequest
+from .foundry_model_loop import (
+    BrokeredChatModelLoop,
+    ModelLoopFinal,
+    ModelLoopToolRequest,
+    normalized_model_error_details,
+)
 from .foundry_streaming import BrokeredResponseStream, brokered_stream_response
 from .conversation import FORWARDED_ROLES, ConversationTurn, RunRequest
 from .runtime import AgentRunError, BrokeredToolDefinition, RunResult, RuntimeFactory
@@ -191,6 +196,21 @@ def _model_response_too_large_error() -> JSONResponse:
         status=502,
         code="ModelResponseTooLarge",
     )
+
+
+def _brokered_model_run_error(exc: Exception) -> JSONResponse:
+    status = 502
+    if isinstance(exc, AgentRunError):
+        normalized = normalized_model_error_details(exc)
+        if normalized is not None:
+            status, error = normalized
+            return JSONResponse({"error": error}, status_code=status)
+        if type(exc.status) is int:
+            if 400 <= exc.status < 500:
+                return _error(str(exc), status=exc.status, code=exc.code)
+            if 500 <= exc.status <= 599:
+                status = exc.status
+    return _error("model resume failed", status=status, code="ModelResumeError")
 
 
 def _non_brokered_agent_run_error(exc: AgentRunError) -> JSONResponse:
@@ -2539,7 +2559,7 @@ async def _handle_brokered_continuation(
         try:
             model_loop.validate_static_credentials()
         except AgentRunError as exc:
-            return _error(str(exc), status=exc.status, code=exc.code)
+            return _brokered_model_run_error(exc)
         state.accepted_output_digests[call_id] = output_digest
         state.accepted_output_sizes[call_id] = accepted_output_size
         state.status = "resuming"
@@ -2564,21 +2584,16 @@ async def _handle_brokered_continuation(
             except AgentRunError as exc:
                 if not _reset_unfinalized_continuation(store, state, call_id=call_id):
                     return _state_storage_error()
-                if exc.code == "ModelResponseTooLarge":
-                    logger.warning("brokered model-loop response exceeded configured limits")
-                    return _model_response_too_large_error()
-                if exc.status >= 500:
-                    logger.warning("brokered model-loop resume failed: %s", exc)
-                    return _error("model resume failed", status=exc.status, code="ModelResumeError")
-                return _error(str(exc), status=exc.status, code=exc.code)
+                logger.warning("brokered model-loop resume failed")
+                return _brokered_model_run_error(exc)
             except asyncio.CancelledError:
                 _reset_unfinalized_continuation(store, state, call_id=call_id)
                 raise
             except Exception as exc:  # noqa: BLE001 - reset continuation state before surfacing unexpected model failures.
-                logger.exception("brokered model-loop resume failed unexpectedly")
+                logger.warning("brokered model-loop resume failed unexpectedly")
                 if not _reset_unfinalized_continuation(store, state, call_id=call_id):
                     return _state_storage_error()
-                return _error("model resume failed", status=502, code="ModelResumeError")
+                return _brokered_model_run_error(exc)
             if isinstance(model_result, ModelLoopToolRequest):
                 return _advance_brokered_state(
                     spec=spec,
@@ -2919,7 +2934,7 @@ def create_foundry_app(
                 try:
                     model_loop.validate_static_credentials()
                 except AgentRunError as exc:
-                    return _error(str(exc), status=exc.status, code=exc.code)
+                    return _brokered_model_run_error(exc)
                 response_id = _new_response_id(previous_response_id_for_output)
                 call_id = f"call_{response_id}_1"
                 try:
@@ -2938,9 +2953,9 @@ def create_foundry_app(
                         created_at = await stream.accept(response_id) if stream is not None else None
                         model_result = await model_loop.start(run_request, call_id=call_id)
                     except AgentRunError as exc:
-                        if exc.code == "ModelResponseTooLarge":
-                            return _model_response_too_large_error()
-                        return _error(str(exc), status=exc.status, code=exc.code)
+                        return _brokered_model_run_error(exc)
+                    except Exception as exc:  # noqa: BLE001 - unknown model failures have no public diagnostic payload.
+                        return _brokered_model_run_error(exc)
                     if isinstance(model_result, ModelLoopFinal):
                         payload = _responses_payload(
                             spec,
