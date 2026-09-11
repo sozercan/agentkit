@@ -65,8 +65,12 @@ class BrokeredResponseStream:
         }
 
 
-def _frame(event: dict[str, Any]) -> bytes:
-    data = json.dumps(event, separators=(",", ":"), ensure_ascii=True)
+def _frame(event: dict[str, Any], *, sequence_number: int) -> bytes:
+    data = json.dumps(
+        {**event, "sequence_number": sequence_number},
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
     return f"event: {event['type']}\ndata: {data}\n\n".encode()
 
 
@@ -101,7 +105,8 @@ class _BrokeredStreamingResponse(Response):
                         {
                             "type": "response.created",
                             "response": self.stream.created.result(),
-                        }
+                        },
+                        sequence_number=0,
                     ),
                     "more_body": True,
                 }
@@ -114,7 +119,7 @@ class _BrokeredStreamingResponse(Response):
             await send(
                 {
                     "type": "http.response.body",
-                    "body": _frame(self.stream.terminal(result)),
+                    "body": _frame(self.stream.terminal(result), sequence_number=1),
                     "more_body": False,
                 }
             )

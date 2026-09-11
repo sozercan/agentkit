@@ -13,9 +13,12 @@ import asyncio
 import json
 import math
 import os
+import random
+import time
 import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
+from email.utils import mktime_tz, parsedate_tz
 from typing import Any, Mapping, Sequence
 
 import httpx
@@ -27,6 +30,8 @@ from .runtime import AgentRunError, BrokeredToolDefinition
 from .skills import SkillCatalog
 
 _MAX_ARGUMENT_DEPTH = 128
+_MAX_RATE_LIMIT_RETRIES = 2
+_MAX_RETRY_AFTER_SECONDS = 60
 
 _NORMALIZED_MODEL_ERRORS = {
     "ModelAuthMissing": (503, "model authentication is not configured"),
@@ -259,20 +264,32 @@ class BrokeredChatModelLoop:
         client = self.http_client
         close_client = False
         if client is None:
-            client = httpx.AsyncClient(headers=headers, timeout=60)
+            client = httpx.AsyncClient(timeout=60)
             close_client = True
         try:
-            async with client.stream(
-                "POST",
-                _chat_completions_url(self.spec.model.base_url),
-                json=payload,
-                headers=headers or None,
-            ) as response:
-                response.raise_for_status()
-                response_body = await _read_response_body_bounded(
-                    response,
-                    max_bytes=self.max_response_bytes,
-                )
+            for retry in range(_MAX_RATE_LIMIT_RETRIES + 1):
+                retry_delay = None
+                async with client.stream(
+                    "POST",
+                    _chat_completions_url(self.spec.model.base_url),
+                    json=payload,
+                    headers=headers or None,
+                ) as response:
+                    # Only an explicit rate-limit rejection is safe to retry.
+                    # Transport failures or accepted responses may have done work.
+                    if response.status_code == 429 and retry < _MAX_RATE_LIMIT_RETRIES:
+                        retry_delay = _rate_limit_retry_delay(response.headers, retry=retry)
+                    if retry_delay is None:
+                        response.raise_for_status()
+                        response_body = await _read_response_body_bounded(
+                            response,
+                            max_bytes=self.max_response_bytes,
+                        )
+                        break
+                # Release the HTTP response before waiting. Disconnect cancellation
+                # must stop this wait before another model request can be submitted.
+                await asyncio.sleep(retry_delay)
+                headers = await self._auth_headers()
         except httpx.HTTPStatusError as exc:
             raise _normalized_model_http_error(exc.response.status_code) from exc
         except AgentRunError:
@@ -315,6 +332,36 @@ class BrokeredChatModelLoop:
         except AgentBuildError as exc:
             raise _model_auth_missing_error() from exc
         return headers
+
+
+def _rate_limit_retry_delay(headers: httpx.Headers, *, retry: int) -> float | None:
+    delay = _retry_after_seconds(headers)
+    if delay is None:
+        return (2.0 ** retry) * random.uniform(0.75, 1.0)
+    # Never shorten a longer server delay and retry before the requested window.
+    return delay if delay <= _MAX_RETRY_AFTER_SECONDS else None
+
+
+def _retry_after_seconds(headers: httpx.Headers) -> float | None:
+    for name, divisor in (("retry-after-ms", 1000), ("retry-after", 1)):
+        value = headers.get(name)
+        if value is None:
+            continue
+        try:
+            delay = float(value)
+        except ValueError:
+            continue
+        if math.isfinite(delay) and delay >= 0:
+            return delay / divisor
+    value = headers.get("retry-after")
+    if value is not None:
+        try:
+            date = parsedate_tz(value)
+            if date is not None:
+                return max(0.0, mktime_tz(date) - time.time())
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return None
 
 
 async def _read_response_body_bounded(response: httpx.Response, *, max_bytes: int) -> bytearray:

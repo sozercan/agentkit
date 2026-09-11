@@ -4603,13 +4603,14 @@ def test_foundry_brokered_model_loop_omits_authorization_when_auth_is_omitted(mo
             return None
 
     class FakeClient:
-        def __init__(self, *, headers: dict[str, str], timeout: int) -> None:
+        def __init__(self, *, headers: dict[str, str] | None = None, timeout: int) -> None:
             assert timeout == 60
-            captured_headers.update(headers)
+            captured_headers.update(headers or {})
 
         def stream(self, method: str, url: str, **kwargs: Any) -> FakeStream:
             assert method == "POST"
             assert url.endswith("/chat/completions")
+            captured_headers.update(kwargs.get("headers") or {})
             return FakeStream()
 
         async def aclose(self) -> None:

@@ -396,8 +396,19 @@ state preserves these completed rounds across restarts.
 
 The model can make up to 16 sequential tool calls per user turn. At the limit,
 AgentKit asks for a final answer without tools and rejects any further tool
-call. Parallel tool batches are unsupported. AgentKit-owned MCP and direct
-operational tools remain disabled.
+call. The model endpoint must support `parallel_tool_calls: false`, which asks
+for one tool call at a time. AgentKit also rejects parallel tool batches if a
+model ignores that setting. AgentKit-owned MCP and direct operational tools
+remain disabled.
+
+An HTTP 429 from the model service is retried up to twice within the same
+hosted response. AgentKit honors `retry-after-ms` or `Retry-After` delays of
+up to 60 seconds each. A longer server delay ends the response with
+`ModelUnavailable` and `upstream_status: 429`. Missing or malformed delay
+headers use short exponential backoff with jitter. Disconnecting the hosted
+stream cancels the wait. Other HTTP errors, transport failures, and invalid
+model responses are not retried. These model retries do not repeat Orka tool
+operations or submit a new hosted response.
 
 Agents can also use [bundled instruction skills](instruction-skills.md). With
 filesystem skills configured under `/agent/skills`, AgentKit advertises the

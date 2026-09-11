@@ -143,7 +143,10 @@ async def _event(outgoing):
         for line in message["body"].splitlines()
         if line.startswith(b"data: ")
     )
-    return json.loads(data)
+    event = json.loads(data)
+    assert type(event["sequence_number"]) is int
+    assert event["sequence_number"] == (0 if event["type"] == "response.created" else 1)
+    return event
 
 
 @pytest.mark.parametrize("continuation", [False, True])
