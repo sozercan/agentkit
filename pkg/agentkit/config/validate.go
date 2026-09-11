@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/sozercan/agentkit/pkg/agentkit/runtimes"
 	"github.com/sozercan/agentkit/pkg/utils"
@@ -69,6 +70,21 @@ const (
 )
 
 var brokeredBasicValuePattern = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9_])basic[^A-Za-z0-9_]+?([A-Za-z0-9+/]+={0,2})`)
+
+// Brokered descriptions use the Unicode 15 casing contract shared with the
+// Python ABI reader. Exclude the mappings introduced in Unicode 16 and 17;
+// the full-scalar golden test detects further drift when Go is upgraded.
+var brokeredUnicode15Case = unicode.SpecialCase{
+	{Lo: 0x1C89, Hi: 0x1C89},
+	{Lo: 0xA7CB, Hi: 0xA7CC},
+	{Lo: 0xA7CE, Hi: 0xA7CE},
+	{Lo: 0xA7D2, Hi: 0xA7D2},
+	{Lo: 0xA7D4, Hi: 0xA7D4},
+	{Lo: 0xA7DA, Hi: 0xA7DA},
+	{Lo: 0xA7DC, Hi: 0xA7DC},
+	{Lo: 0x10D50, Hi: 0x10D65},
+	{Lo: 0x16EA0, Hi: 0x16EB8},
+}
 
 // Validate reports every problem with the config at once via errors.Join (plan
 // §16.2 #3 — one report-all validator, not scattered first-error-wins funcs).
@@ -799,19 +815,23 @@ func isSchemaDigest(value string) bool {
 	return err == nil
 }
 
+func lowerBrokeredText(value string) string {
+	return strings.ToLowerSpecial(brokeredUnicode15Case, value)
+}
+
 func hasUnsafeBrokeredText(value string) bool {
-	lowered := strings.ToLower(value)
+	lowered := lowerBrokeredText(value)
 	return hasUnsafeBrokeredDescription(value) || containsBrokeredWord(lowered, "basic") || strings.Contains(lowered, brokeredTokenWord)
 }
 
 func hasUnsafeBrokeredDescription(value string) bool {
-	lowered := strings.ToLower(value)
+	lowered := lowerBrokeredText(value)
 	normalized := normalizeKey(lowered)
 	return containsSecretPrefix(value) || strings.Contains(value, "://") || containsBrokeredWord(lowered, "bearer") || containsBrokeredWord(lowered, brokeredSensitiveWord) || containsBrokeredWord(lowered, brokeredSensitivePluralWord) || containsBrokeredBasicAuthReference(value) || containsBrokeredCredentialAssignment(value) || containsBrokeredCredentialReference(value) || strings.Contains(lowered, authorizationKey) || strings.Contains(lowered, "secret") || strings.Contains(lowered, "password") || strings.Contains(lowered, "passphrase") || strings.Contains(lowered, "pwd") || strings.Contains(lowered, "api key") || strings.Contains(lowered, "apikey") || strings.Contains(normalized, "apikey") || strings.Contains(normalized, "xapikey") || strings.Contains(normalized, "subscriptionkey") || strings.Contains(normalized, "xfunctionskey") || strings.Contains(lowered, brokeredUnsafeCookieKey) || strings.Contains(lowered, "set-cookie") || strings.Contains(lowered, "x-api-key") || strings.Contains(lowered, credentialHeaderAPIKey) || strings.Contains(lowered, "subscription-key") || strings.Contains(lowered, "x-functions-key") || strings.Contains(lowered, "ocp-apim-subscription-key") || strings.Contains(lowered, "private key") || strings.Contains(lowered, "privatekey") || strings.Contains(lowered, "key material") || strings.Contains(lowered, ".svc") || strings.Contains(lowered, "cluster.local")
 }
 
 func containsBrokeredBasicAuthReference(value string) bool {
-	lowered := strings.ToLower(value)
+	lowered := lowerBrokeredText(value)
 	if !containsBrokeredWord(lowered, "basic") {
 		return false
 	}
@@ -831,7 +851,7 @@ func containsBrokeredBasicAuthReference(value string) bool {
 		}
 	}
 	for i, field := range fields {
-		if !containsBrokeredWord(strings.ToLower(field), "basic") {
+		if !containsBrokeredWord(lowerBrokeredText(field), "basic") {
 			continue
 		}
 		for j, candidate := range fields[i+1:] {
@@ -1022,7 +1042,7 @@ func isBrokeredNumericCount(value string) bool {
 }
 
 func hasBrokeredStructuredKeyShape(value string) bool {
-	return strings.HasPrefix(strings.TrimLeft(value, "\"'`([{<"), "-") || strings.ContainsAny(value, "_/.[]{}()<>\"'`") || value != strings.ToLower(value)
+	return strings.HasPrefix(strings.TrimLeft(value, "\"'`([{<"), "-") || strings.ContainsAny(value, "_/.[]{}()<>\"'`") || value != lowerBrokeredText(value)
 }
 
 func containsBrokeredWord(value string, word string) bool {

@@ -43,6 +43,8 @@ def test_pydantic_orka_offline_echo_bypasses_provider_runtime(monkeypatch):
     runtime = agent_factory.build_runtime(spec)
 
     assert runtime.__class__.__name__ == "OfflineEchoRuntime"
+    monkeypatch.setenv("AGENTKIT_PROTOCOL", "acp")
+    assert agent_factory.supports_acp_http_mcp() is True
 
 
 def test_pydantic_orka_offline_echo_completes_without_provider(monkeypatch):

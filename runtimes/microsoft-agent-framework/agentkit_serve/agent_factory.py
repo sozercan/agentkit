@@ -8,27 +8,37 @@ wrapper, and CLI live in ``agentkit_serve_common``.
 from __future__ import annotations
 
 import asyncio
+import copy
 import importlib
 import inspect
 import os
 import time
+from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager, AsyncExitStack
+from contextvars import ContextVar
 from datetime import timedelta
 from types import TracebackType
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 from agent_framework import (
     Agent,
     AgentSession,
+    ChatContext,
+    ChatMiddleware,
     FileSkillsSource,
+    FunctionInvocationContext,
+    FunctionMiddleware,
     MCPSkillsSource,
     MCPStdioTool,
     MCPStreamableHTTPTool,
     Message,
+    MiddlewareTermination,
     SkillsProvider,
 )
 from agent_framework.openai import OpenAIChatCompletionClient
 from httpx import AsyncClient, URL
+from mcp.types import CallToolResult
 from agentkit_serve_common.adapter_support import (
     FORWARDED_ROLES,
     AsyncExitStackLifecycle,
@@ -45,8 +55,9 @@ from agentkit_serve_common.adapter_support import (
     upstream_status_code,
 )
 from agentkit_serve_common.config import AgentSpec, ContextProviderSpec, ToolSpec
-from agentkit_serve_common.conversation import RunRequest
+from agentkit_serve_common.conversation import RunRequest, ToolCallEvent
 from agentkit_serve_common.runtime import (
+    AgentRunError,
     OfflineEchoRuntimeFactory,
     RunResult,
     RuntimeSession,
@@ -63,6 +74,15 @@ _DEFAULT_SEARCH_AUDIENCE = "https://search.azure.com/.default"
 _DEFAULT_FOUNDRY_AUDIENCE = "https://ai.azure.com/.default"
 _DEFAULT_MCP_REQUEST_TIMEOUT = 120
 _DEFAULT_SESSION_CACHE_MAX = 256
+# Invocation tasks share a fatal-error signal with their run owner. Concurrent
+# Sessions on the same Agent have independent signals.
+_run_failure: ContextVar[asyncio.Future[str] | None] = ContextVar("agentkit_maf_run_failure", default=None)
+
+
+def _fail_run(message: str) -> None:
+    failure = _run_failure.get()
+    if failure is not None and not failure.done():
+        failure.set_result(message)
 
 
 def _mcp_request_timeout() -> int:
@@ -260,6 +280,49 @@ def _tool_env(tool: ToolSpec) -> dict[str, str]:
     return declared_tool_env(tool)
 
 
+class _MCPToolError(Exception):
+    """A validated MCP result reports an admitted tool execution failure."""
+
+
+class _MCPProtocolError(Exception):
+    """An MCP call failed without an admitted tool error result."""
+
+
+class _MCPCallBoundary:
+    """Keep MCP protocol failures out of MAF's recoverable tool-error loop."""
+
+    async def call_tool(self, tool_name, **kwargs):
+        try:
+            return await super().call_tool(tool_name, **kwargs)
+        except _MCPToolError:
+            raise
+        except Exception:
+            # Do not attach upstream exceptions: framework tool logging and
+            # detailed-error options must never expose transport credentials.
+            raise _MCPProtocolError("MCP tool protocol failed") from None
+
+    async def _call_tool_with_retries(self, tool_name, filtered_kwargs, meta, parser, span):
+        # MAF 1.9+ retries tools/call after a lost connection. An attempted call
+        # may already have executed, so leave retry decisions to the caller.
+        result = await self.session.call_tool(tool_name, arguments=filtered_kwargs, meta=meta)
+        return parser(result)
+
+    def _parse_tool_result_from_mcp(self, result):
+        if not isinstance(result, CallToolResult):
+            raise _MCPProtocolError("MCP tool protocol failed")
+        if result.isError:
+            raise _MCPToolError("MCP tool execution failed")
+        return super()._parse_tool_result_from_mcp(result)
+
+
+class _MCPStreamableHTTPTool(_MCPCallBoundary, MCPStreamableHTTPTool):
+    pass
+
+
+class _MCPStdioTool(_MCPCallBoundary, MCPStdioTool):
+    pass
+
+
 def build_tool(tool: ToolSpec, *, stack: AsyncExitStack | None = None):
     """Create a stdio or Streamable HTTP MCP server for one tool spec."""
     timeout = _mcp_request_timeout()
@@ -294,7 +357,7 @@ def build_tool(tool: ToolSpec, *, stack: AsyncExitStack | None = None):
             "http_client": http_client,
         }
         kwargs["request_timeout"] = int(remote_timeout)
-        mcp_tool = MCPStreamableHTTPTool(**kwargs)
+        mcp_tool = _MCPStreamableHTTPTool(**kwargs)
         # Some Streamable HTTP MCP services, including Foundry Toolbox, do not
         # implement MCP ping. The framework handles request-time connection
         # errors separately, so skip proactive pings for remote HTTP tools.
@@ -310,7 +373,35 @@ def build_tool(tool: ToolSpec, *, stack: AsyncExitStack | None = None):
         "tool_name_prefix": tool.name,
     }
     kwargs["request_timeout"] = timeout
-    return MCPStdioTool(**kwargs)
+    return _MCPStdioTool(**kwargs)
+
+
+class _MCPFailureMiddleware(FunctionMiddleware):
+    async def process(
+        self, context: FunctionInvocationContext, call_next: Callable[[], Awaitable[None]]
+    ) -> None:
+        failure = _run_failure.get()
+        if failure is not None and failure.done():
+            raise MiddlewareTermination(failure.result())
+        try:
+            await call_next()
+        except _MCPProtocolError:
+            _fail_run("MCP tool protocol failed")
+            # MiddlewareTermination stops the model loop even on MAF 1.9,
+            # which predates MiddlewareFailure. run_agent makes it a failure.
+            raise MiddlewareTermination("MCP tool protocol failed") from None
+
+
+class _ModelMessageMiddleware(ChatMiddleware):
+    """Keep package and framework author labels out of model speaker fields."""
+
+    async def process(self, context: ChatContext, call_next: Callable[[], Awaitable[None]]) -> None:
+        # AgentKit's inputs do not define named speakers. MAF adds its agent name
+        # to history, but chat-to-Responses gateways cannot translate that field.
+        context.messages = [copy.copy(message) for message in context.messages]
+        for message in context.messages:
+            message.author_name = None
+        await call_next()
 
 
 def build_agent(
@@ -327,6 +418,7 @@ def build_agent(
         name=spec.metadata.name,
         tools=[build_tool(t, stack=stack) for t in spec.tools],
         context_providers=context_providers,
+        middleware=[_ModelMessageMiddleware(), _MCPFailureMiddleware()],
     )
 
 
@@ -390,12 +482,28 @@ class MAFRuntime:
         try:
             async with lock:
                 self._touch_session(session_id)
+                session = self.sessions[session_id]
                 include_history = session_id not in self.initialized_sessions
-                result = await run_agent(self.agent, request, session=session, include_history=include_history)
+                result = await run_agent(
+                    self.agent,
+                    request,
+                    session=session,
+                    include_history=include_history,
+                )
                 self.initialized_sessions.add(session_id)
                 return result
         finally:
             self._release_session_claim(session_id)
+
+    async def discard_session(self, session_id: str) -> None:
+        """Discard framework state for an ACP prompt that did not commit."""
+
+        lock = self.session_locks.get(session_id)
+        if lock is None:
+            return
+        async with lock:
+            if self.session_locks.get(session_id) is lock and session_id in self.sessions:
+                self._reset_session(session_id)
 
     def _session_for(self, session_id: str | None) -> tuple[AgentSession | None, asyncio.Lock | None]:
         if not session_id:
@@ -420,6 +528,10 @@ class MAFRuntime:
         self.session_locks[session_id] = lock
         self.most_recent_session_id = session_id
         self._evict_idle_sessions()
+
+    def _reset_session(self, session_id: str) -> None:
+        self.sessions[session_id] = AgentSession(session_id=session_id)
+        self.initialized_sessions.discard(session_id)
 
     def _release_session_claim(self, session_id: str) -> None:
         claims = self.session_claims.get(session_id, 0)
@@ -605,6 +717,10 @@ def supports_brokered_coordination() -> bool:
     return offline_orka_echo_enabled()
 
 
+def supports_acp_http_mcp() -> bool:
+    return True
+
+
 def build_runtime(spec: AgentSpec) -> RuntimeSession:
     """Build the runtime session consumed by the shared server."""
     if offline_orka_echo_enabled():
@@ -663,6 +779,36 @@ def _to_messages(request: RunRequest, *, include_history: bool = True) -> list[M
     return messages
 
 
+class _ToolEventMiddleware(FunctionMiddleware):
+    """Await payload-free observations around each actual tool invocation."""
+
+    def __init__(self, observe: Callable[[ToolCallEvent], Awaitable[None]]) -> None:
+        self.observe = observe
+
+    async def _emit(self, event: ToolCallEvent) -> None:
+        try:
+            await self.observe(event)
+        except Exception:
+            # MAF absorbs ordinary function exceptions and continues the model
+            # loop. Stop it, then fail run_agent, even on supported versions
+            # predating MiddlewareFailure.
+            _fail_run("tool lifecycle observer failed")
+            raise MiddlewareTermination("tool lifecycle observer failed") from None
+
+    async def process(
+        self, context: FunctionInvocationContext, call_next: Callable[[], Awaitable[None]]
+    ) -> None:
+        call_id = uuid4().hex
+        name = context.function.name
+        await self._emit(ToolCallEvent(call_id, name, "in_progress"))
+        try:
+            await call_next()
+        except Exception:
+            await self._emit(ToolCallEvent(call_id, name, "failed"))
+            raise
+        await self._emit(ToolCallEvent(call_id, name, "completed"))
+
+
 async def run_agent(
     agent: Agent,
     request: RunRequest,
@@ -672,8 +818,33 @@ async def run_agent(
 ) -> RunResult:
     """Run the MAF agent and return the neutral result shape."""
     messages = _to_messages(request, include_history=include_history)
+    kwargs = {}
+    if request.on_tool_event is not None:
+        kwargs["middleware"] = [_ToolEventMiddleware(request.on_tool_event)]
+    failure: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+    token = _run_failure.set(failure)
+
+    async def execute():
+        return await agent.run(messages, session=session, **kwargs)
+
+    running = asyncio.create_task(execute())
     try:
-        result = await agent.run(messages, session=session)
-    except Exception as exc:  # noqa: BLE001 — normalized for the façade
-        raise normalize_agent_run_error(exc) from exc
-    return RunResult(text=_result_text(result), usage=_result_usage(result))
+        try:
+            # MiddlewareTermination stops the next model step, but supported
+            # MAF versions first join all calls in the current batch. Cancel
+            # and join the SDK run so a fatal call also stops pending siblings.
+            await asyncio.wait((running, failure), return_when=asyncio.FIRST_COMPLETED)
+            if not failure.done():
+                try:
+                    result = await running
+                except Exception as exc:  # noqa: BLE001 — normalized for the façade
+                    raise normalize_agent_run_error(exc) from exc
+        finally:
+            running.cancel()
+            await asyncio.gather(running, return_exceptions=True)
+        if failure.done():
+            raise AgentRunError(failure.result())
+        return RunResult(text=_result_text(result), usage=_result_usage(result))
+    finally:
+        failure.cancel()
+        _run_failure.reset(token)

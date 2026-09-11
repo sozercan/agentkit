@@ -20,7 +20,7 @@ work_dir="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/agentkit-live-copilot.XXX
 
 copilot_token="${COPILOT_GITHUB_TOKEN:-}"
 vekil_cache_dir="${VEKIL_CACHE_DIR:-${HOME:-}/.config/vekil}"
-vekil_image="${VEKIL_IMAGE:-ghcr.io/sozercan/vekil@sha256:d13edeedf7bec319da8eb3ea4949a4d0802e244c14765a347e62e1b8b7be8e3d}"
+vekil_image="${VEKIL_IMAGE:-ghcr.io/sozercan/vekil:v0.14.3@sha256:996b628fbe8c7a35d33e9d6bb855f2613228fc5c9b09498dae6ea6b208a0071b}"
 vekil_container_name="${VEKIL_CONTAINER_NAME:-agentkit-vekil}"
 vekil_host_port="${VEKIL_HOST_PORT:-1337}"
 vekil_container_port="${VEKIL_CONTAINER_PORT:-1337}"
@@ -126,6 +126,7 @@ wait_for_vekil_ready() {
     sleep 2
   done
 
+  log "Vekil readiness response: $(curl -sS --max-time 10 "${url}" 2>&1 | redact || true)"
   die "Vekil /readyz never became available at ${url}"
 }
 

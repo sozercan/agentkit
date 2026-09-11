@@ -157,3 +157,36 @@ def test_cli_protocol_flag_sets_agentkit_protocol_for_adapter_runtime(monkeypatc
 
     assert captured["port"] == 8080
     assert os.environ["AGENTKIT_PROTOCOL"] == "orka"
+
+
+def test_cli_acp_uses_verified_stdio_entrypoint_without_uvicorn(monkeypatch):
+    captured = {}
+    spec = _spec()
+
+    def load_verified(path):  # noqa: ANN001
+        captured.update({"path": path, "verified": spec})
+        return spec
+
+    monkeypatch.setattr(cli, "load_verified_acp_runtime_binding", load_verified)
+    monkeypatch.setattr(
+        cli,
+        "run_acp_stdio",
+        lambda loaded, factory: captured.update({"served": loaded, "factory": factory}),
+    )
+    monkeypatch.setattr(
+        cli.uvicorn,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("uvicorn must not run")),
+    )
+    monkeypatch.delenv("AGENTKIT_AUTH_TOKEN", raising=False)
+    factory = Factory()
+
+    cli.run(factory, ["--config", "/agent/agent.yaml", "--protocol", "acp"])
+
+    assert captured == {
+        "path": "/agent/agent.yaml",
+        "verified": spec,
+        "served": spec,
+        "factory": factory,
+    }
+    assert os.environ["AGENTKIT_PROTOCOL"] == "acp"

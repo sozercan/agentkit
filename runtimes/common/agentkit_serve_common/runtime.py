@@ -24,9 +24,9 @@ _BROKERED_TOOL_OUTPUT_ABSENT = object()
 
 
 def offline_orka_echo_enabled() -> bool:
-    """Whether adapter factories should use the no-provider Orka echo runtime."""
+    """Whether adapter factories should use the no-provider Orka/ACP echo runtime."""
 
-    return os.environ.get("AGENTKIT_PROTOCOL", "").strip().lower() == "orka" and (
+    return os.environ.get("AGENTKIT_PROTOCOL", "").strip().lower() in {"acp", "orka"} and (
         os.environ.get(OFFLINE_ORKA_ECHO_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
     )
 
