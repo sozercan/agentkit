@@ -84,6 +84,20 @@ _MODEL_LOOP_ENV = "AGENTKIT_FOUNDRY_BROKERED_MODEL_LOOP"
 _STATE_FILE_ENV = "AGENTKIT_FOUNDRY_RESPONSE_STATE_FILE"
 _FOUNDRY_SESSION_ENV = "FOUNDRY_AGENT_SESSION_ID"
 _TERMINAL_STATE_FULL = "state_full"
+_BROKERED_MODEL_VALIDATION_ERRORS = {
+    "InvalidToolArguments": (400, "model tool arguments are invalid"),
+    "InvalidToolOutput": (400, "brokered tool output is invalid"),
+    "UnsafeBrokeredArguments": (400, "model tool arguments are unsafe"),
+    "UnsupportedBrokeredSchema": (400, "brokered tool schema is unsupported"),
+    "unknown_brokered_tool": (400, "model requested unknown brokered tool"),
+    "invalid_tool_call": (400, "model tool call is invalid"),
+    "unsupported_tool_call": (400, "model returned an unsupported tool call"),
+    "multiple_tool_calls_unsupported": (400, "brokered mode requires sequential tool calls"),
+    "tool_loop_limit_exceeded": (400, "model exceeded the tool call limit"),
+    "brokered_arguments_too_large": (413, "model tool arguments are too large"),
+    "brokered_output_too_large": (413, "brokered tool output is too large for model resume"),
+    "brokered_model_messages_too_large": (413, "model loop messages are too large"),
+}
 
 
 def _new_response_id(previous_response_id: str | None = None) -> str:
@@ -205,11 +219,13 @@ def _brokered_model_run_error(exc: Exception) -> JSONResponse:
         if normalized is not None:
             status, error = normalized
             return JSONResponse({"error": error}, status_code=status)
-        if type(exc.status) is int:
-            if 400 <= exc.status < 500:
-                return _error(str(exc), status=exc.status, code=exc.code)
-            if 500 <= exc.status <= 599:
-                status = exc.status
+        # Validation exceptions may include model-supplied names or argument paths.
+        validation = _BROKERED_MODEL_VALIDATION_ERRORS.get(exc.code) if type(exc.code) is str else None
+        if validation is not None:
+            status, message = validation
+            return _error(message, status=status, code=exc.code)
+        if type(exc.status) is int and 400 <= exc.status <= 599:
+            status = exc.status
     return _error("model resume failed", status=status, code="ModelResumeError")
 
 
@@ -2280,7 +2296,7 @@ def _advance_brokered_state(
     except AgentRunError as exc:
         if not _reset_unfinalized_continuation(store, state, call_id=call_id):
             return _state_storage_error()
-        return _error(str(exc), status=exc.status, code=exc.code)
+        return _brokered_model_run_error(exc)
     payload = _function_call_response_payload(spec, response_id=response_id, call=call, previous_response_id=previous_response_id, usage=result.usage, created_at=created_at)
     following = deepcopy(state)
     if not following.response_calls:
@@ -2992,7 +3008,7 @@ def create_foundry_app(
                         _validate_model_brokered_arguments(model_result.arguments)
                         _validate_model_arguments_for_tool(model_result.arguments, tool)
                     except AgentRunError as exc:
-                        return _error(str(exc), status=exc.status, code=exc.code)
+                        return _brokered_model_run_error(exc)
                     if len(_canonical_output_json(model_result.arguments).encode("utf-8")) > max_argument_bytes:
                         return _error(
                             "brokered function_call arguments are too large for pending state",
