@@ -78,7 +78,8 @@ class BrokeredChatModelLoop:
     async def _advance(self, messages: list[dict[str, Any]], *, call_id: str) -> ModelLoopFinal | ModelLoopToolRequest:
         usage: dict[str, int] = {}
         while True:
-            if len(json.dumps(messages, ensure_ascii=True).encode("utf-8")) > self.max_messages_bytes:
+            encoded_messages = json.dumps(messages, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+            if len(encoded_messages) > self.max_messages_bytes:
                 raise AgentRunError("model loop messages are too large", status=413, code="brokered_model_messages_too_large")
             result = await self._step(messages, call_id=call_id)
             for key, value in result.usage.items():

@@ -4820,6 +4820,25 @@ def test_foundry_brokered_model_message_size_matches_persistence_encoding():
     assert measured == persisted
     assert len(measured) > len(utf8_compact)
 
+
+def test_foundry_brokered_model_loop_accepts_exact_compact_message_limit():
+    spec = _spec().model_copy(update={"instructions": ""})
+    fake = _FakeChatTransport([
+        _chat_response({"role": "assistant", "content": "Within the limit."}),
+    ])
+    app = _model_loop_app(spec, fake, max_model_messages_bytes=512)
+    # A compact user message record adds 30 bytes around its ASCII content.
+    with TestClient(app) as client:
+        accepted = client.post("/responses", json={"input": "x" * 482})
+        rejected = client.post("/responses", json={"input": "x" * 483})
+
+    assert accepted.status_code == 200, accepted.text
+    assert _message_text(accepted.json()) == "Within the limit."
+    assert rejected.status_code == 413
+    assert rejected.json()["error"]["code"] == "brokered_model_messages_too_large"
+    assert len(fake.requests) == 1
+
+
 def test_foundry_brokered_bounds_persisted_model_messages_and_releases_reservation():
     tool_response = _chat_response(
         {
