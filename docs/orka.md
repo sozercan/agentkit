@@ -27,8 +27,10 @@ supervisor starts this child under a private UID/GID and session tree:
 
 The v2 path is strict:
 
-- `/agent/agent.yaml` must not contain direct `tools`, `brokeredTools`, or
-  context providers;
+- `/agent/agent.yaml` must not contain direct `tools` or `brokeredTools`;
+- the Microsoft Agent Framework runtime also supports bundled, instruction-only
+  filesystem skills; other context providers remain prohibited. See
+  [Bundled skills in governed mode](instruction-skills.md);
 - the registered model must equal `model.name` in the baked config;
 - `agentConfigurationDigest` is `sha256:` plus the SHA-256 of the exact
   `/agent/agent.yaml` bytes;

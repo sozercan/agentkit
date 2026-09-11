@@ -2258,7 +2258,7 @@ def test_foundry_brokered_active_resume_survives_ttl_and_completed_state_retains
         async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
             payload = json.loads(request.content.decode("utf-8"))
             self.requests.append(payload)
-            if "tools" in payload:
+            if not any(message.get("role") == "tool" for message in payload["messages"]):
                 self.initial_calls += 1
                 return httpx.Response(
                     200,
@@ -2390,7 +2390,8 @@ def test_foundry_brokered_model_loop_emits_model_requested_tool_and_resumes_to_f
     assert fake.requests[0]["tools"][0]["function"]["description"].startswith("Brokered class: read.")
     assert fake.requests[1]["messages"][-1]["role"] == "tool"
     assert fake.requests[1]["messages"][-1]["tool_call_id"] == call["call_id"]
-    assert "tools" not in fake.requests[1]
+    assert fake.requests[1]["tools"] == fake.requests[0]["tools"]
+    assert fake.requests[1]["parallel_tool_calls"] is False
     assert CONTINUATION_PROOF not in json.dumps(fake.requests, sort_keys=True)
 
 
@@ -4853,7 +4854,7 @@ def test_foundry_brokered_bounds_persisted_model_messages_and_releases_reservati
     assert oversized.json()["error"]["code"] == "brokered_model_messages_too_large"
     assert accepted.status_code == 200, accepted.text
     assert _call(accepted.json())
-    assert len(fake.requests) == 2
+    assert len(fake.requests) == 1  # Oversized model input is rejected before inference.
 
 def test_foundry_brokered_model_loop_reserves_capacity_before_model_call():
     fake = _FakeChatTransport(

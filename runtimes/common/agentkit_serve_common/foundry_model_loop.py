@@ -3,8 +3,8 @@
 This is the Phase A4 fallback path: when high-level frameworks cannot suspend and
 resume externally brokered tool calls, AgentKit can drive a minimal model loop
 itself. The loop exposes only static safe brokered schemas to the model, converts
-one model tool request into a hosted Responses function_call, and later resumes
-with Orka's function_call_output to obtain the final assistant message.
+one model tool request at a time into a hosted Responses function_call, and
+resumes with Orka's function_call_output until the assistant finishes.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import asyncio
 import json
 import math
 import os
+import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Sequence
@@ -23,6 +24,7 @@ from .adapter_support import AgentBuildError, NO_AUTH_API_KEY, resolve_api_key, 
 from .config import AgentSpec
 from .conversation import FORWARDED_ROLES, RunRequest
 from .runtime import AgentRunError, BrokeredToolDefinition
+from .skills import SkillCatalog
 
 _MAX_ARGUMENT_DEPTH = 128
 
@@ -31,6 +33,7 @@ _MAX_ARGUMENT_DEPTH = 128
 class ModelLoopFinal:
     text: str
     usage: dict[str, int] = field(default_factory=dict)
+    messages: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -42,7 +45,7 @@ class ModelLoopToolRequest:
 
 
 class BrokeredChatModelLoop:
-    """Explicit one-tool brokered model loop over OpenAI Chat Completions."""
+    """Bounded sequential tool loop over OpenAI Chat Completions."""
 
     def __init__(
         self,
@@ -53,6 +56,8 @@ class BrokeredChatModelLoop:
         max_argument_bytes: int = 8192,
         max_output_bytes: int = 64 * 1024,
         max_response_bytes: int = 4 * 1024 * 1024,
+        max_messages_bytes: int = 1024 * 1024,
+        max_tool_calls: int = 16,
     ) -> None:
         self.spec = spec
         self.tools = list(tools)
@@ -60,19 +65,55 @@ class BrokeredChatModelLoop:
         self.max_argument_bytes = max_argument_bytes
         self.max_output_bytes = max_output_bytes
         self.max_response_bytes = max_response_bytes
+        self.max_messages_bytes = max_messages_bytes
+        self.max_tool_calls = max_tool_calls
         self.tools_by_name = {tool.name: tool for tool in self.tools}
+        self.skills = SkillCatalog.from_spec(spec)
+        if self.skills and "load_skill" in self.tools_by_name:
+            raise AgentBuildError("load_skill is reserved for packaged skills")
 
     async def start(self, request: RunRequest, *, call_id: str) -> ModelLoopFinal | ModelLoopToolRequest:
-        messages = self._initial_messages(request)
-        data = await self._chat(messages, tools=self._tool_payloads())
+        return await self._advance(self._initial_messages(request), call_id=call_id)
+
+    async def _advance(self, messages: list[dict[str, Any]], *, call_id: str) -> ModelLoopFinal | ModelLoopToolRequest:
+        usage: dict[str, int] = {}
+        while True:
+            if len(json.dumps(messages, ensure_ascii=True).encode("utf-8")) > self.max_messages_bytes:
+                raise AgentRunError("model loop messages are too large", status=413, code="brokered_model_messages_too_large")
+            result = await self._step(messages, call_id=call_id)
+            for key, value in result.usage.items():
+                usage[key] = usage.get(key, 0) + value
+            if isinstance(result, ModelLoopFinal):
+                return ModelLoopFinal(text=result.text, usage=usage, messages=result.messages)
+            if not self.skills or result.name != "load_skill":
+                return ModelLoopToolRequest(name=result.name, arguments=result.arguments, messages=result.messages, usage=usage)
+            if set(result.arguments) != {"skill_name"} or not isinstance(result.arguments["skill_name"], str):
+                raise AgentRunError("load_skill requires a skill_name string", status=400, code="InvalidToolArguments")
+            try:
+                content = self.skills.load_skill(result.arguments["skill_name"])
+            except (KeyError, ValueError) as exc:
+                raise AgentRunError("unknown packaged skill", status=400, code="InvalidToolArguments") from exc
+            messages = result.messages
+            skill_call_id = f"skill_{uuid.uuid4().hex}"
+            messages[-1]["tool_calls"][0]["id"] = skill_call_id
+            messages.append({"role": "tool", "tool_call_id": skill_call_id, "content": content})
+
+    async def _step(self, messages: list[dict[str, Any]], *, call_id: str) -> ModelLoopFinal | ModelLoopToolRequest:
+        current_turn = next((i for i in range(len(messages) - 1, -1, -1) if messages[i].get("role") == "user"), 0)
+        tool_count = sum(len(message.get("tool_calls") or []) for message in messages[current_turn:])
+        exhausted = tool_count >= self.max_tool_calls
+        data = await self._chat(messages, tools=[] if exhausted else self._tool_payloads())
         message = _choice_message(data)
         usage = _usage(data)
         tool_calls = message.get("tool_calls")
         if not tool_calls:
-            return ModelLoopFinal(text=_message_text(message, max_bytes=self.max_output_bytes), usage=usage)
+            text = _message_text(message, max_bytes=self.max_output_bytes)
+            return ModelLoopFinal(text=text, usage=usage, messages=[*messages, {"role": "assistant", "content": text}])
+        if exhausted:
+            raise AgentRunError("model exceeded the tool call limit", status=400, code="tool_loop_limit_exceeded")
         if not isinstance(tool_calls, list) or len(tool_calls) != 1:
             raise AgentRunError(
-                "model requested multiple brokered tools; deterministic brokered mode supports one call per turn",
+                "model requested multiple tools at once; brokered mode requires sequential calls",
                 status=400,
                 code="multiple_tool_calls_unsupported",
             )
@@ -83,7 +124,7 @@ class BrokeredChatModelLoop:
         if not isinstance(function, Mapping):
             raise AgentRunError("model tool call is missing function payload", status=400, code="invalid_tool_call")
         name = function.get("name")
-        if not isinstance(name, str) or name not in self.tools_by_name:
+        if not isinstance(name, str) or (name not in self.tools_by_name and not (self.skills and name == "load_skill")):
             raise AgentRunError(f"model requested unknown brokered tool {name!r}", status=400, code="unknown_brokered_tool")
         raw_arguments = function.get("arguments", "{}")
         if isinstance(raw_arguments, str):
@@ -112,7 +153,14 @@ class BrokeredChatModelLoop:
         }
         return ModelLoopToolRequest(name=name, arguments=arguments, messages=[*messages, assistant_message], usage=usage)
 
-    async def resume(self, messages: Sequence[Mapping[str, Any]], *, call_id: str, output: str) -> ModelLoopFinal:
+    async def resume(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        call_id: str,
+        output: str,
+        next_call_id: str | None = None,
+    ) -> ModelLoopFinal | ModelLoopToolRequest:
         if len(output) > self.max_output_bytes:
             raise AgentRunError("brokered tool output is too large for model resume", status=413, code="brokered_output_too_large")
         try:
@@ -127,11 +175,7 @@ class BrokeredChatModelLoop:
             raise AgentRunError("brokered tool output is too large for model resume", status=413, code="brokered_output_too_large")
         resumed = [dict(message) for message in messages]
         resumed.append({"role": "tool", "tool_call_id": call_id, "content": output})
-        data = await self._chat(resumed, tools=[])
-        message = _choice_message(data)
-        if message.get("tool_calls"):
-            raise AgentRunError("model requested another brokered tool after resume", status=400, code="tool_loop_limit_exceeded")
-        return ModelLoopFinal(text=_message_text(message, max_bytes=self.max_output_bytes), usage=_usage(data))
+        return await self._advance(resumed, call_id=next_call_id or f"call_{uuid.uuid4().hex}")
 
     async def validate_credentials(self) -> None:
         await self._auth_headers()
@@ -148,6 +192,8 @@ class BrokeredChatModelLoop:
         messages: list[dict[str, Any]] = []
         if self.spec.instructions:
             messages.append({"role": "system", "content": self.spec.instructions})
+        if self.skills:
+            messages.append({"role": "system", "content": self.skills.instructions})
         for turn in request.history:
             if turn.role in FORWARDED_ROLES and turn.text:
                 messages.append({"role": turn.role, "content": turn.text})
@@ -155,7 +201,7 @@ class BrokeredChatModelLoop:
         return messages
 
     def _tool_payloads(self) -> list[dict[str, Any]]:
-        payloads: list[dict[str, Any]] = []
+        payloads: list[dict[str, Any]] = [self.skills.tool_schema()] if self.skills else []
         for tool in self.tools:
             description = f"Brokered class: {tool.brokered_class}. {tool.description}".strip()
             payloads.append(
@@ -175,6 +221,7 @@ class BrokeredChatModelLoop:
         if tools:
             payload["tools"] = list(tools)
             payload["tool_choice"] = "auto"
+            payload["parallel_tool_calls"] = False
         headers = await self._auth_headers()
         client = self.http_client
         close_client = False
