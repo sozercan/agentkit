@@ -20,7 +20,7 @@ work_dir="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/agentkit-live-copilot.XXX
 
 copilot_token="${COPILOT_GITHUB_TOKEN:-}"
 vekil_cache_dir="${VEKIL_CACHE_DIR:-${HOME:-}/.config/vekil}"
-vekil_image="${VEKIL_IMAGE:-ghcr.io/sozercan/vekil:v0.14.1@sha256:2fa0558f6304cc6ed1fb5b0135f62f12f28f1cdd0a8c057c4283414bceac1362}"
+vekil_image="${VEKIL_IMAGE:-ghcr.io/sozercan/vekil:v0.14.3@sha256:996b628fbe8c7a35d33e9d6bb855f2613228fc5c9b09498dae6ea6b208a0071b}"
 vekil_container_name="${VEKIL_CONTAINER_NAME:-agentkit-vekil}"
 vekil_host_port="${VEKIL_HOST_PORT:-1337}"
 vekil_container_port="${VEKIL_CONTAINER_PORT:-1337}"
