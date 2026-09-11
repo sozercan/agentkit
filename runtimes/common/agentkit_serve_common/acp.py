@@ -546,7 +546,8 @@ class ACPStdioServer:
 
     def _initialize(self, params: Any) -> dict[str, Any]:
         request = _required_object(params)
-        if request.get("protocolVersion") != ACP_PROTOCOL_VERSION:
+        version = request.get("protocolVersion")
+        if type(version) is not int or version != ACP_PROTOCOL_VERSION:
             raise ACPProtocolError(
                 _INVALID_PARAMS,
                 f"protocolVersion must be {ACP_PROTOCOL_VERSION}",
@@ -883,6 +884,9 @@ class ACPStdioServer:
         message: str,
         data: Mapping[str, Any] | None = None,
     ) -> None:
+        # Invalid request IDs cannot be correlated by the JSON-RPC client.
+        if isinstance(response_id, bool) or not isinstance(response_id, (int, str)):
+            response_id = None
         error: dict[str, Any] = {"code": code, "message": message}
         if data is not None:
             error["data"] = dict(data)

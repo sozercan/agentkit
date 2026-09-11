@@ -40,6 +40,9 @@ jobs:
         run: |
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/*.yml
           bash -n scripts/live-copilot-agent-e2e.sh
+          bash -n scripts/orka-harness-v2-e2e.sh
+          shellcheck scripts/orka-harness-v2-e2e.sh
+          test -z "$(gofmt -l test/orka-harness-v2/probe/*.go)"
           for script in \
             deploy/foundry/doctor.sh \
             deploy/foundry/toolbox/setup.sh \
@@ -494,3 +497,125 @@ jobs:
       - name: Run live Vekil-backed AgentKit E2E
         if: steps.gate.outputs.run == 'true'
         run: bash scripts/live-copilot-agent-e2e.sh
+
+  orka-v2-offline:
+    name: Harness v2 E2E (${{ matrix.adapter }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        adapter: [pydantic-ai, microsoft-agent-framework, langgraph]
+    env:
+      PLATFORM: linux/amd64
+      BUILDER: ""
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Setup Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Setup Docker daemon with containerd image store
+        uses: docker/setup-docker-action@e61617a16c407a86262fb923c35a616ddbe070b3 # v4.6.0
+        with:
+          daemon-config: |
+            {
+              "features": {
+                "containerd-snapshotter": true
+              }
+            }
+
+      - name: Run deterministic composed harness v2 E2E
+        timeout-minutes: 65
+        env:
+          ADAPTER: ${{ matrix.adapter }}
+          ARTIFACT_DIR: ${{ runner.temp }}/agentkit-orka-v2-offline
+        run: bash scripts/orka-harness-v2-e2e.sh offline "$ADAPTER"
+
+      - name: Upload safe harness v2 results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: orka-v2-offline-${{ matrix.adapter }}
+          path: ${{ runner.temp }}/agentkit-orka-v2-offline
+          if-no-files-found: warn
+          retention-days: 7
+
+  orka-v2-live:
+    name: Live harness v2 E2E (microsoft-agent-framework)
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      PLATFORM: linux/amd64
+      BUILDER: ""
+    steps:
+      - name: Decide whether live harness v2 E2E can run
+        id: gate
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+          IS_FORK: ${{ github.event.pull_request.head.repo.fork || false }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = pull_request ] && [ "$IS_FORK" = true ]; then
+            echo 'run=false' >> "$GITHUB_OUTPUT"
+            echo 'reason=Skipped live harness v2 E2E for a fork pull request; repository secrets are unavailable. No live scenarios executed.' >> "$GITHUB_OUTPUT"
+          elif [ "$ACTOR" = 'dependabot[bot]' ] && [ -z "$COPILOT_GITHUB_TOKEN" ]; then
+            echo 'run=false' >> "$GITHUB_OUTPUT"
+            echo 'reason=Skipped live harness v2 E2E for Dependabot; repository secrets are unavailable. No live scenarios executed.' >> "$GITHUB_OUTPUT"
+          elif [ -z "$COPILOT_GITHUB_TOKEN" ]; then
+            echo 'run=false' >> "$GITHUB_OUTPUT"
+            echo 'reason=Skipped live harness v2 E2E because COPILOT_GITHUB_TOKEN is not configured. No live scenarios executed.' >> "$GITHUB_OUTPUT"
+          else
+            echo 'run=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Explain skipped live harness v2 coverage
+        if: steps.gate.outputs.run != 'true'
+        env:
+          SKIP_REASON: ${{ steps.gate.outputs.reason }}
+        run: |
+          printf '%s\n' "$SKIP_REASON"
+          printf '%s\n' "$SKIP_REASON" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Checkout
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Setup Go
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Setup Docker daemon with containerd image store
+        if: steps.gate.outputs.run == 'true'
+        uses: docker/setup-docker-action@e61617a16c407a86262fb923c35a616ddbe070b3 # v4.6.0
+        with:
+          daemon-config: |
+            {
+              "features": {
+                "containerd-snapshotter": true
+              }
+            }
+
+      - name: Run live composed harness v2 E2E
+        if: steps.gate.outputs.run == 'true'
+        timeout-minutes: 65
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+          ARTIFACT_DIR: ${{ runner.temp }}/agentkit-orka-v2-live
+        run: bash scripts/orka-harness-v2-e2e.sh live
+
+      - name: Upload safe live harness v2 results
+        if: always() && steps.gate.outputs.run == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: orka-v2-live-microsoft-agent-framework
+          path: ${{ runner.temp }}/agentkit-orka-v2-live
+          if-no-files-found: warn
+          retention-days: 7
