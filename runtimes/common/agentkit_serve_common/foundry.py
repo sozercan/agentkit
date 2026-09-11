@@ -2790,7 +2790,7 @@ def create_foundry_app(
         except (UnicodeDecodeError, RecursionError, ValueError):
             return _error("Request body must be JSON", status=400, code="invalid_json")
 
-        if brokered_tools and isinstance(data, dict) and data.get("stream") is True:
+        if isinstance(data, dict) and data.get("stream") is True:
             return await brokered_stream_response(
                 spec.model.name,
                 lambda stream: execute_responses(request, data, request_body_size, stream),
@@ -2805,7 +2805,6 @@ def create_foundry_app(
     ) -> JSONResponse:
         if not isinstance(data, dict):
             return _error("Request body must be a JSON object", status=400, code="invalid_request")
-        # Non-brokered adapters retain their existing buffered response behavior.
         if data.get("tools"):
             return _error(
                 "request-supplied Responses tools are not allowed; hosted brokered mode uses static safe schemas",
@@ -3086,13 +3085,16 @@ def create_foundry_app(
                 )
             )
 
+        response_id = _new_response_id() if stream is not None else None
         try:
+            if stream is not None:
+                await stream.accept(response_id)
             result = await request.app.state.runtime.run(run_request)
         except AgentRunError as exc:
             return _non_brokered_agent_run_error(exc)
         except Exception:  # noqa: BLE001 - deterministic protocol envelope.
             return _non_brokered_unexpected_runtime_error()
 
-        return JSONResponse(_responses_payload(spec, result))
+        return JSONResponse(_responses_payload(spec, result, response_id=response_id))
 
     return app

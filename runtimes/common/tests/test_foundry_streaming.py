@@ -8,7 +8,8 @@ from contextlib import asynccontextmanager
 
 import httpx
 import pytest
-
+from agentkit_serve_common.foundry import create_foundry_app
+from agentkit_serve_common.runtime import AgentRunError, RunResult
 from test_foundry_brokered_protocol import (
     CONTINUATION_AUTH,
     _app,
@@ -17,6 +18,8 @@ from test_foundry_brokered_protocol import (
     _continuation,
     _spec,
 )
+from test_foundry_protocol import EchoFactory, EchoRuntime
+from test_foundry_protocol import _spec as native_spec
 
 
 def _tool_response():
@@ -62,6 +65,8 @@ class HeldModel(httpx.AsyncBaseTransport):
             return httpx.Response(
                 401, request=request, json={"error": "private-upstream-detail"}
             )
+        if self.result == "exception":
+            raise RuntimeError("private-upstream-detail")
         payload = (
             _tool_response()
             if self.result == "tool"
@@ -71,7 +76,7 @@ class HeldModel(httpx.AsyncBaseTransport):
 
 
 @asynccontextmanager
-async def _exchange(app, payload, *, hold_created=None):
+async def _exchange(app, payload, *, hold_created=None, headers=None):
     incoming, outgoing = asyncio.Queue(), asyncio.Queue()
     await incoming.put(
         {
@@ -104,7 +109,9 @@ async def _exchange(app, payload, *, hold_created=None):
             (b"content-type", b"application/json"),
             *[
                 (key.encode(), value.encode())
-                for key, value in CONTINUATION_AUTH.items()
+                for key, value in (
+                    CONTINUATION_AUTH if headers is None else headers
+                ).items()
             ],
         ],
         "client": ("127.0.0.1", 1234),
@@ -384,5 +391,247 @@ def test_brokered_stream_validation_failure_keeps_http_error_without_ack():
             assert response.status_code == 400
             assert response.json()["error"]["code"] == "tools_unsupported"
             assert model.calls == 0
+
+    asyncio.run(exercise())
+
+
+class NativeModelRuntime(EchoRuntime):
+    def __init__(self, client, url):
+        super().__init__()
+        self.client = client
+        self.url = url
+
+    async def run(self, request):
+        self.requests.append(request)
+        response = await self.client.post(
+            self.url,
+            json={"messages": [{"role": "user", "content": request.prompt}]},
+        )
+        if response.status_code >= 400:
+            raise AgentRunError(response.text, status=502, code="UpstreamFailure")
+        body = response.json()
+        return RunResult(text=body["choices"][0]["message"]["content"])
+
+
+def _native_app(client, *, url="http://model/v1/chat/completions", **options):
+    factory = EchoFactory()
+    factory.runtime = NativeModelRuntime(client, url)
+    return create_foundry_app(native_spec(), factory, **options), factory.runtime
+
+
+@pytest.mark.parametrize("session_id", [None, "native-session"])
+def test_native_stream_ack_precedes_runtime_and_keeps_completion_identity(session_id):
+    async def exercise():
+        model = HeldModel()
+        async with httpx.AsyncClient(transport=model) as upstream:
+            app, runtime = _native_app(upstream)
+            payload = {"input": "Summarize the evidence", "stream": True}
+            if session_id:
+                payload["agent_session_id"] = session_id
+            delivered = asyncio.Event()
+            async with (
+                app.router.lifespan_context(app),
+                _exchange(app, payload, hold_created=delivered, headers={}) as (
+                    _,
+                    outgoing,
+                    request,
+                ),
+            ):
+                created = await _created(outgoing)
+                assert created["response"]["status"] == "in_progress"
+                assert created["response"].get("agent_session_id") == session_id
+                assert created["response"]["output"] == []
+                assert runtime.requests == [] and model.calls == 0
+                delivered.set()
+                await asyncio.wait_for(model.started.wait(), 2)
+                assert not request.done() and outgoing.empty()
+                model.release.set()
+                completed = await _event(outgoing)
+                await asyncio.wait_for(request, 2)
+            assert completed["type"] == "response.completed"
+            response = completed["response"]
+            assert response["id"] == created["response"]["id"]
+            assert response.get("agent_session_id") == session_id
+            assert response["output"][0]["response_id"] == response["id"]
+            assert response["output"][0]["content"][0]["text"] == "Verified response."
+            assert runtime.requests[0].session_id == session_id
+            assert model.calls == 1
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("result", ["error", "exception"])
+def test_native_stream_error_keeps_identity_and_sanitizes_runtime_details(result):
+    async def exercise():
+        model = HeldModel(result)
+        async with httpx.AsyncClient(transport=model) as upstream:
+            app, _ = _native_app(upstream)
+            async with (
+                app.router.lifespan_context(app),
+                _exchange(
+                    app,
+                    {
+                        "input": "Summarize the evidence",
+                        "agent_session_id": "native-session",
+                        "stream": True,
+                    },
+                    headers={},
+                ) as (_, outgoing, request),
+            ):
+                created = await _created(outgoing)
+                await asyncio.wait_for(model.started.wait(), 2)
+                model.release.set()
+                failed = await _event(outgoing)
+                await asyncio.wait_for(request, 2)
+            assert failed["type"] == "response.failed" and "error" not in failed
+            assert failed["response"]["id"] == created["response"]["id"]
+            assert failed["response"]["agent_session_id"] == "native-session"
+            assert failed["response"]["status"] == "failed"
+            assert failed["response"]["error"]["code"] == "RuntimeFailure"
+            assert "private-upstream-detail" not in json.dumps(failed)
+
+    asyncio.run(exercise())
+
+
+def test_native_stream_disconnect_before_ack_delivery_starts_no_runtime():
+    async def exercise():
+        model = HeldModel()
+        async with httpx.AsyncClient(transport=model) as upstream:
+            app, runtime = _native_app(upstream)
+            async with (
+                app.router.lifespan_context(app),
+                _exchange(
+                    app,
+                    {"input": "Summarize the evidence", "stream": True},
+                    hold_created=asyncio.Event(),
+                    headers={},
+                ) as (incoming, outgoing, request),
+            ):
+                await _created(outgoing)
+                await incoming.put({"type": "http.disconnect"})
+                await asyncio.wait_for(request, 2)
+            assert runtime.requests == [] and model.calls == 0
+
+    asyncio.run(exercise())
+
+
+def test_native_stream_disconnect_closes_model_http_socket_and_allows_next_request():
+    async def exercise():
+        model_started, model_disconnected = asyncio.Event(), asyncio.Event()
+        model_requests, handlers = [], set()
+
+        async def serve_model(reader, writer):
+            handler = asyncio.current_task()
+            handlers.add(handler)
+            try:
+                headers = await reader.readuntil(b"\r\n\r\n")
+                length = next(
+                    int(line.split(b":", 1)[1])
+                    for line in headers.splitlines()
+                    if line.lower().startswith(b"content-length:")
+                )
+                model_requests.append(await reader.readexactly(length))
+                if len(model_requests) == 1:
+                    model_started.set()
+                    assert await reader.read(1) == b""
+                    model_disconnected.set()
+                else:
+                    body = json.dumps(
+                        _chat_response({"role": "assistant", "content": "Recovered."})
+                    ).encode()
+                    writer.write(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                        + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+                        + body
+                    )
+                    await writer.drain()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+                handlers.remove(handler)
+
+        server = await asyncio.start_server(serve_model, "127.0.0.1", 0)
+        url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}/chat/completions"
+        try:
+            async with (
+                server,
+                httpx.AsyncClient(trust_env=False, timeout=5) as upstream,
+            ):
+                app, runtime = _native_app(upstream, url=url)
+                async with app.router.lifespan_context(app):
+                    async with _exchange(
+                        app,
+                        {"input": "Wait for cancellation", "stream": True},
+                        headers={},
+                    ) as (incoming, outgoing, request):
+                        await _created(outgoing)
+                        await asyncio.wait_for(model_started.wait(), 2)
+                        await incoming.put({"type": "http.disconnect"})
+                        await asyncio.wait_for(request, 2)
+                        await asyncio.wait_for(model_disconnected.wait(), 2)
+                        assert outgoing.empty()
+                    async with httpx.AsyncClient(
+                        transport=httpx.ASGITransport(app=app), base_url="http://hosted"
+                    ) as client:
+                        response = await client.post(
+                            "/responses",
+                            json={"input": "Next request", "stream": False},
+                        )
+                    assert response.status_code == 200
+                    assert (
+                        response.json()["output"][0]["content"][0]["text"]
+                        == "Recovered."
+                    )
+                    assert len(runtime.requests) == len(model_requests) == 2
+        finally:
+            for handler in tuple(handlers):
+                handler.cancel()
+            await asyncio.gather(*handlers, return_exceptions=True)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("payload", "authorized", "status", "code"),
+    [
+        ({"input": "Read data", "stream": True}, False, 401, None),
+        ({"stream": True}, True, 400, "missing_input"),
+        ({"input": "x", "stream": True, "tools": [{}]}, True, 400, "tools_unsupported"),
+        (
+            {"input": [{"role": "assistant", "content": "x"}], "stream": True},
+            True,
+            400,
+            "invalid_input",
+        ),
+        ({"input": "x" * 300, "stream": True}, True, 413, "request_too_large"),
+    ],
+)
+def test_native_stream_rejection_keeps_http_error_before_runtime(
+    payload, authorized, status, code
+):
+    async def exercise():
+        model = HeldModel()
+        async with httpx.AsyncClient(transport=model) as upstream:
+            app, runtime = _native_app(
+                upstream, auth_token="local-test", max_request_body_bytes=256
+            )
+            async with (
+                app.router.lifespan_context(app),
+                httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url="http://hosted"
+                ) as client,
+            ):
+                response = await client.post(
+                    "/responses",
+                    json=payload,
+                    headers={"authorization": "Bearer local-test"}
+                    if authorized
+                    else {},
+                )
+            assert response.status_code == status
+            assert response.headers["content-type"] == "application/json"
+            if code:
+                assert response.json()["error"]["code"] == code
+            assert runtime.requests == [] and model.calls == 0
 
     asyncio.run(exercise())

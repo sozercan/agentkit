@@ -1,4 +1,4 @@
-"""Early Responses acknowledgements for the hosted brokered model loop."""
+"""Early Responses acknowledgements for hosted AgentKit runtimes."""
 
 from __future__ import annotations
 
