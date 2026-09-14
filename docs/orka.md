@@ -55,10 +55,17 @@ config. The registration's `adapterName` must be `agentkit-serve-acp`. Its
 `adapterDigest` and the composition build's `AGENTKIT_ADAPTER_DIGEST` must both
 equal the `sha256:` digest from `AGENTKIT_RUNTIME_IMAGE`. Set the profile's
 `providerKind` to `agentkit` and advertise
-`supportsAgentSessionConfiguration: false`. `approvalRequiredTools` must stay
-empty because the AgentKit ACP child does not implement permission callbacks.
+`supportsAgentSessionConfiguration: false` and `supportsPermissions: false`.
+Orka-managed MCP tool approval uses the existing waiting call, without a local
+ACP permission callback. A qualified Microsoft Agent Framework composition can
+advertise `supportsBrokeredToolApprovals: true` and configure Orka's
+`approvalRequiredTools`. The controller, supervisor, and AgentKit image must all
+support that contract. Older images and unqualified adapters remain unsupported.
 If the registration allows brokered tools, the Task must submit that exact
 `allowedTools` list.
+
+See [Human approval for Orka tools](orka-human-approval.md) for wait limits,
+result handling, and acceptance checks through Orka's approval API.
 
 Set `ORKA_ACP_CONTROLLER_EPOCH` from Orka's current `ControllerEpoch` record.
 Select by `spec.name` because the resource name is hashed. This lookup requires

@@ -28,6 +28,7 @@ from .config import AgentSpec
 from .conversation import FORWARDED_ROLES, RunRequest
 from .runtime import AgentRunError, BrokeredToolDefinition
 from .skills import SkillCatalog
+from .tool_errors import orka_tool_error_details
 
 _MAX_ARGUMENT_DEPTH = 128
 _MAX_RATE_LIMIT_RETRIES = 2
@@ -211,8 +212,27 @@ class BrokeredChatModelLoop:
             ) from exc
         if len(output_bytes) > self.max_output_bytes:
             raise AgentRunError("brokered tool output is too large for model resume", status=413, code="brokered_output_too_large")
+        try:
+            payload = json.loads(output)
+        except (ValueError, RecursionError):
+            payload = None
+        details = (
+            orka_tool_error_details(payload.get("error"))
+            if isinstance(payload, dict) and payload.get("approved") is False
+            else None
+        )
+        if details is not None:
+            code, message = details
+            output = json.dumps({"approved": False, "error": {"code": code, "message": message}}, separators=(",", ":"))
+            if len(output.encode("utf-8")) > self.max_output_bytes:
+                raise AgentRunError("brokered tool output is too large for model resume", status=413, code="brokered_output_too_large")
         resumed = [dict(message) for message in messages]
         resumed.append({"role": "tool", "tool_call_id": call_id, "content": output})
+        if details is not None and details[0] == "tool_outcome_unknown":
+            # Another model round could repeat an action whose effect is unknown.
+            # Finish this continuation and let Orka retain the execution evidence.
+            text = f"{details[0]}: {details[1]}"
+            return ModelLoopFinal(text=text, messages=[*resumed, {"role": "assistant", "content": text}])
         return await self._advance(resumed, call_id=next_call_id or f"call_{uuid.uuid4().hex}")
 
     async def validate_credentials(self) -> None:

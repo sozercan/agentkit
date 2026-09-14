@@ -152,6 +152,15 @@ Canonical denied/error payload:
 }
 ```
 
+Both `approved` values describe final results. Neither value represents a
+pending human review. Orka holds its original tool call while the review is
+pending, then sends exactly one final result for that call. The hosted adapter
+uses fixed messages for Orka's `approval_declined`, `approval_expired`,
+`approval_cancelled`, `approval_stale`, `tool_execution_failed`, and
+`tool_outcome_unknown` codes. A tool failure remains distinct from a declined
+review. An unknown outcome finishes the continuation without another model
+request, preventing an automatic retry of an uncertain action.
+
 `function_call_output` is privileged continuation input. It is rejected unless a
 known `previous_response_id` has a pending matching `call_id` **and** the request
 uses the Orka-only continuation path. Configure
@@ -205,9 +214,11 @@ construction. The public continuation must still carry the same
 `agent_session_id` so Foundry routes it to that sandbox.
 
 An immediate initial/continuation pair proves routing affinity, not file recovery.
-To prove persistence, stop the Foundry session between the two requests and show
-that a new process reloads the pending state. Configure the state TTL and Orka
-approval timeout longer than that test. Deployments without a session-persisted
+To prove persistence, restart the AgentKit process between the two requests in
+the same hosted session and show that it reloads the pending state. Preserve the
+state file and keep the test inside the configured state TTL and Orka task/session
+limits. This does not establish recovery of a lost Foundry runtime session.
+Deployments without a session-persisted
 file, shared file, or platform-managed store must pin one replica or use sticky
 routing; otherwise a continuation that lands on a different/restarted container
 fails safely with `unknown_previous_response_id`. Pending state expires after
@@ -220,6 +231,14 @@ bounded by `AGENTKIT_FOUNDRY_BROKERED_MAX_OUTPUT_BYTES` (default: 65536) before
 they are persisted, replayed, embedded in deterministic responses, or sent back
 through the model loop. A platform-managed state backend is still required
 before treating multi-replica production as fully supported.
+
+For Orka-managed human approval, configure
+`AGENTKIT_FOUNDRY_RESPONSE_STATE_TTL_SECONDS=1800` and a hosted-session idle
+timeout of at least 1800 seconds. The review can consume 600 seconds and tool
+execution another 240 seconds, followed by result delivery and model continuation.
+The default 900-second state lifetime leaves too little margin at that limit.
+Task deadlines, active leases, and platform session limits still apply. See
+[Human approval for Orka tools](orka-human-approval.md) for the full wait budget.
 
 The file is sensitive runtime state, not harmless metadata. In model-loop mode
 it includes model messages such as system instructions, conversation history,
@@ -426,8 +445,10 @@ checking ownership, the active lease, and the expected response and call. It
 also translates MCP results into AgentKit's approved/error envelope. Keep the
 proof out of the ACP child configuration. The gateway must forward the proof
 field; local tests cannot establish that a public Foundry deployment does so.
-See the shared-proof limitations above. Human tool approvals for external v2
-runtimes remain unsupported by Orka.
+See the shared-proof limitations above. Human tool approvals require a qualified
+Orka controller, supervisor, Foundry broker, and AgentKit image that support
+`supportsBrokeredToolApprovals`. Older combinations remain unsupported. Review
+policy, reviewer permissions, cancellation, and execution decisions stay in Orka.
 
 ## Hosted follow-up questions
 

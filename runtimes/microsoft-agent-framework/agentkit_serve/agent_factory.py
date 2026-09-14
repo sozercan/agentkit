@@ -64,6 +64,7 @@ from agentkit_serve_common.runtime import (
     RuntimeSession,
     offline_orka_echo_enabled,
 )
+from agentkit_serve_common.tool_errors import orka_tool_error_details
 
 _AUTH_WORKLOAD_IDENTITY = "workload-identity-token"
 _CONTEXT_TYPE_SEARCH = "search"
@@ -77,13 +78,14 @@ _DEFAULT_MCP_REQUEST_TIMEOUT = 120
 _DEFAULT_SESSION_CACHE_MAX = 256
 # Invocation tasks share a fatal-error signal with their run owner. Concurrent
 # Sessions on the same Agent have independent signals.
-_run_failure: ContextVar[asyncio.Future[str] | None] = ContextVar("agentkit_maf_run_failure", default=None)
+_run_failure: ContextVar[asyncio.Future[AgentRunError] | None] = ContextVar("agentkit_maf_run_failure", default=None)
+_ORKA_TOOL_ERROR_CONTEXT_KEY = "agentkit_orka_tool_error"
 
 
-def _fail_run(message: str) -> None:
+def _fail_run(message: str, *, code: str | None = None) -> None:
     failure = _run_failure.get()
     if failure is not None and not failure.done():
-        failure.set_result(message)
+        failure.set_result(AgentRunError(message, code=code))
 
 
 def _mcp_request_timeout() -> int:
@@ -285,6 +287,15 @@ class _MCPToolError(Exception):
     """A validated MCP result reports an admitted tool execution failure."""
 
 
+class _OrkaToolError(_MCPToolError):
+    """A broker result whose code and message come from the fixed allowlist."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(f"{code}: {message}")
+        self.code = code
+        self.message = message
+
+
 class _MCPProtocolError(Exception):
     """An MCP call failed without an admitted tool error result."""
 
@@ -312,6 +323,9 @@ class _MCPCallBoundary:
         if not isinstance(result, CallToolResult):
             raise _MCPProtocolError("MCP tool protocol failed")
         if result.isError:
+            details = orka_tool_error_details(result.structuredContent)
+            if details is not None:
+                raise _OrkaToolError(*details)
             raise _MCPToolError("MCP tool execution failed")
         return super()._parse_tool_result_from_mcp(result)
 
@@ -383,9 +397,17 @@ class _MCPFailureMiddleware(FunctionMiddleware):
     ) -> None:
         failure = _run_failure.get()
         if failure is not None and failure.done():
-            raise MiddlewareTermination(failure.result())
+            raise MiddlewareTermination(str(failure.result()))
         try:
             await call_next()
+        except _OrkaToolError as exc:
+            context.metadata[_ORKA_TOOL_ERROR_CONTEXT_KEY] = exc
+            if exc.code == "tool_outcome_unknown":
+                _fail_run(str(exc), code=exc.code)
+                raise MiddlewareTermination(str(exc)) from None
+            # The SDK hides ordinary exception messages from the model. Project
+            # only these fixed broker outcomes through its normal tool result.
+            context.result = {"isError": True, "code": exc.code, "message": exc.message}
         except _MCPProtocolError:
             _fail_run("MCP tool protocol failed")
             # MiddlewareTermination stops the model loop even on MAF 1.9,
@@ -825,7 +847,8 @@ class _ToolEventMiddleware(FunctionMiddleware):
         except Exception:
             await self._emit(ToolCallEvent(call_id, name, "failed"))
             raise
-        await self._emit(ToolCallEvent(call_id, name, "completed"))
+        status = "failed" if isinstance(context.metadata.get(_ORKA_TOOL_ERROR_CONTEXT_KEY), _OrkaToolError) else "completed"
+        await self._emit(ToolCallEvent(call_id, name, status))
 
 
 async def run_agent(
@@ -840,7 +863,7 @@ async def run_agent(
     kwargs = {}
     if request.on_tool_event is not None:
         kwargs["middleware"] = [_ToolEventMiddleware(request.on_tool_event)]
-    failure: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+    failure: asyncio.Future[AgentRunError] = asyncio.get_running_loop().create_future()
     token = _run_failure.set(failure)
 
     async def execute():
@@ -862,7 +885,7 @@ async def run_agent(
             running.cancel()
             await asyncio.gather(running, return_exceptions=True)
         if failure.done():
-            raise AgentRunError(failure.result())
+            raise failure.result()
         return RunResult(text=_result_text(result), usage=_result_usage(result))
     finally:
         failure.cancel()

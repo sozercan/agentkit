@@ -49,6 +49,7 @@ from .foundry_streaming import BrokeredResponseStream, brokered_stream_response
 from .conversation import FORWARDED_ROLES, ConversationTurn, RunRequest
 from .runtime import AgentRunError, BrokeredToolDefinition, RunResult, RuntimeFactory
 from .server import make_auth_dependency
+from .tool_errors import orka_tool_error_details
 
 logger = logging.getLogger(__name__)
 
@@ -2324,6 +2325,10 @@ def _advance_brokered_state(
 def _final_text_from_tool_output(call: _PendingCall, output: dict[str, Any]) -> str:
     if not output.get("approved"):
         error = output.get("error") if isinstance(output.get("error"), dict) else {}
+        details = orka_tool_error_details(error)
+        if details is not None:
+            code, message = details
+            return f"Brokered tool {call.tool.name}: {code}: {message}"
         code = str(error.get("code") or "brokered_tool_denied")
         message = str(error.get("message") or "brokered tool was not performed")
         return f"Brokered tool {call.tool.name} was not performed: {code}: {message}"
