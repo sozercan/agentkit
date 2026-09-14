@@ -57,8 +57,10 @@ The child accepts one ACP session, text and resource-link prompt blocks,
 cancellation, and at most one loopback HTTP MCP server carrying a bearer
 Authorization header. Resource links are added to the model prompt as labeled
 text and are never fetched by the child. The runtime keeps successful user and
-assistant turns for later prompts. It rejects baked `tools`, `brokeredTools`,
-and context providers. Orka owns process and workspace isolation, prompt-scoped
+assistant turns for later prompts. It rejects baked `tools` and `brokeredTools`.
+The Microsoft Agent Framework adapter accepts
+[packaged skill instructions](../../docs/instruction-skills.md); other context
+providers remain prohibited. Orka owns process and workspace isolation, prompt-scoped
 MCP authority, provider proxying, and cleanup proof.
 
 ## Adding a runtime adapter

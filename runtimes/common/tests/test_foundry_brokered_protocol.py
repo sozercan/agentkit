@@ -2258,7 +2258,7 @@ def test_foundry_brokered_active_resume_survives_ttl_and_completed_state_retains
         async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
             payload = json.loads(request.content.decode("utf-8"))
             self.requests.append(payload)
-            if "tools" in payload:
+            if not any(message.get("role") == "tool" for message in payload["messages"]):
                 self.initial_calls += 1
                 return httpx.Response(
                     200,
@@ -2390,7 +2390,8 @@ def test_foundry_brokered_model_loop_emits_model_requested_tool_and_resumes_to_f
     assert fake.requests[0]["tools"][0]["function"]["description"].startswith("Brokered class: read.")
     assert fake.requests[1]["messages"][-1]["role"] == "tool"
     assert fake.requests[1]["messages"][-1]["tool_call_id"] == call["call_id"]
-    assert "tools" not in fake.requests[1]
+    assert fake.requests[1]["tools"] == fake.requests[0]["tools"]
+    assert fake.requests[1]["parallel_tool_calls"] is False
     assert CONTINUATION_PROOF not in json.dumps(fake.requests, sort_keys=True)
 
 
@@ -2541,6 +2542,7 @@ def test_foundry_brokered_model_loop_sanitizes_upstream_auth_failures():
         assert response.json()["error"] == {
             "message": "model service rejected configured credentials",
             "code": "ModelAuthRejected",
+            "upstream_status": upstream_status,
         }
         assert internal_url not in response.text
         assert "/chat/completions" not in response.text
@@ -2596,7 +2598,7 @@ def test_foundry_brokered_model_loop_normalizes_non_object_json_response():
 
     assert response.status_code == 502
     assert response.json()["error"] == {
-        "message": "model response must be a JSON object",
+        "message": "model service returned an invalid response",
         "code": "InvalidModelResponse",
     }
 
@@ -2706,7 +2708,7 @@ def test_foundry_brokered_model_loop_rejects_decoded_lone_surrogate():
 
     assert response.status_code == 502
     assert response.json()["error"] == {
-        "message": "model service returned an invalid JSON response",
+        "message": "model service returned an invalid response",
         "code": "InvalidModelResponse",
     }
 
@@ -2762,7 +2764,11 @@ def test_foundry_brokered_model_loop_sanitizes_upstream_auth_failure_on_resume()
         retried = client.post("/responses", headers=CONTINUATION_AUTH, json=payload)
 
     assert failed.status_code == 503
-    assert failed.json()["error"] == {"message": "model resume failed", "code": "ModelResumeError"}
+    assert failed.json()["error"] == {
+        "message": "model service rejected configured credentials",
+        "code": "ModelAuthRejected",
+        "upstream_status": 401,
+    }
     assert internal_url not in failed.text
     assert retried.status_code == 200, retried.text
     assert _message_text(retried.json()) == "Retry after auth recovery."
@@ -3165,7 +3171,7 @@ def test_foundry_brokered_model_loop_unexpected_resume_failure_can_be_retried():
         retried = client.post("/responses", headers=CONTINUATION_AUTH, json=payload)
 
     assert failed.status_code == 502
-    assert failed.json()["error"] == {"message": "model resume failed", "code": "ModelResumeError"}
+    assert failed.json()["error"] == {"message": "model service request failed", "code": "ModelUpstreamError"}
     assert retried.status_code == 200, retried.text
     assert _message_text(retried.json()) == "Recovered after retry."
 
@@ -4597,13 +4603,14 @@ def test_foundry_brokered_model_loop_omits_authorization_when_auth_is_omitted(mo
             return None
 
     class FakeClient:
-        def __init__(self, *, headers: dict[str, str], timeout: int) -> None:
+        def __init__(self, *, headers: dict[str, str] | None = None, timeout: int) -> None:
             assert timeout == 60
-            captured_headers.update(headers)
+            captured_headers.update(headers or {})
 
         def stream(self, method: str, url: str, **kwargs: Any) -> FakeStream:
             assert method == "POST"
             assert url.endswith("/chat/completions")
+            captured_headers.update(kwargs.get("headers") or {})
             return FakeStream()
 
         async def aclose(self) -> None:
@@ -4819,6 +4826,25 @@ def test_foundry_brokered_model_message_size_matches_persistence_encoding():
     assert measured == persisted
     assert len(measured) > len(utf8_compact)
 
+
+def test_foundry_brokered_model_loop_accepts_exact_compact_message_limit():
+    spec = _spec().model_copy(update={"instructions": ""})
+    fake = _FakeChatTransport([
+        _chat_response({"role": "assistant", "content": "Within the limit."}),
+    ])
+    app = _model_loop_app(spec, fake, max_model_messages_bytes=512)
+    # A compact user message record adds 30 bytes around its ASCII content.
+    with TestClient(app) as client:
+        accepted = client.post("/responses", json={"input": "x" * 482})
+        rejected = client.post("/responses", json={"input": "x" * 483})
+
+    assert accepted.status_code == 200, accepted.text
+    assert _message_text(accepted.json()) == "Within the limit."
+    assert rejected.status_code == 413
+    assert rejected.json()["error"]["code"] == "brokered_model_messages_too_large"
+    assert len(fake.requests) == 1
+
+
 def test_foundry_brokered_bounds_persisted_model_messages_and_releases_reservation():
     tool_response = _chat_response(
         {
@@ -4853,7 +4879,7 @@ def test_foundry_brokered_bounds_persisted_model_messages_and_releases_reservati
     assert oversized.json()["error"]["code"] == "brokered_model_messages_too_large"
     assert accepted.status_code == 200, accepted.text
     assert _call(accepted.json())
-    assert len(fake.requests) == 2
+    assert len(fake.requests) == 1  # Oversized model input is rejected before inference.
 
 def test_foundry_brokered_model_loop_reserves_capacity_before_model_call():
     fake = _FakeChatTransport(

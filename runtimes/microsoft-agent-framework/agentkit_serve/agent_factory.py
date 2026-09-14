@@ -29,6 +29,7 @@ from agent_framework import (
     FileSkillsSource,
     FunctionInvocationContext,
     FunctionMiddleware,
+    FunctionTool,
     MCPSkillsSource,
     MCPStdioTool,
     MCPStreamableHTTPTool,
@@ -412,11 +413,24 @@ def build_agent(
     client=None,
 ) -> Agent:
     """Assemble the MAF agent: client + system prompt + tools + context."""
+    instructions = spec.instructions
+    tools = [build_tool(t, stack=stack) for t in spec.tools]
+    if spec._packaged_skill_catalog:
+        skills = spec._packaged_skill_catalog
+        instructions += "\n\n" + skills.instructions
+        definition = skills.tool_schema()["function"]
+        tools.append(FunctionTool(
+            name=definition["name"],
+            description=definition["description"],
+            input_model=definition["parameters"],
+            func=skills.load_skill,
+            approval_mode="never_require",
+        ))
     return Agent(
         client=client if client is not None else build_client(spec),
-        instructions=spec.instructions,
+        instructions=instructions,
         name=spec.metadata.name,
-        tools=[build_tool(t, stack=stack) for t in spec.tools],
+        tools=tools,
         context_providers=context_providers,
         middleware=[_ModelMessageMiddleware(), _MCPFailureMiddleware()],
     )
@@ -611,7 +625,8 @@ class MAFRuntime:
                 providers.append(await self._build_search_provider(provider))
             elif provider.type == _CONTEXT_TYPE_SKILLS:
                 if provider.source == _CONTEXT_SOURCE_FILESYSTEM:
-                    providers.append(SkillsProvider(FileSkillsSource(provider.path)))
+                    if self.spec._packaged_skill_catalog is None:
+                        providers.append(SkillsProvider(FileSkillsSource(provider.path)))
                 elif provider.source == _CONTEXT_SOURCE_MCP:
                     providers.append(await self._build_mcp_skills_provider(provider))
             elif provider.type == _CONTEXT_TYPE_MEMORY:
@@ -718,6 +733,10 @@ def supports_brokered_coordination() -> bool:
 
 
 def supports_acp_http_mcp() -> bool:
+    return True
+
+
+def supports_acp_packaged_skills() -> bool:
     return True
 
 

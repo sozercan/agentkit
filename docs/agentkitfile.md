@@ -237,6 +237,12 @@ use filesystem skills, stage them under `/agent/skills` in the runtime/deploymen
 image or prefer MCP-backed skills. Memory providers require an explicit
 `AGENTKIT_MEMORY_SCOPE` runtime env var; choose a per-user/session-safe scope.
 
+Orka harness v2 and the hosted brokered model loop support the narrower
+[bundled instruction-only skills](instruction-skills.md) mode. It exposes
+`load_skill` over a startup snapshot of `SKILL.md` documents. Resources, scripts,
+remote skill sources, search providers, and memory providers are not available
+through that mode.
+
 ### `expose`
 
 ```yaml

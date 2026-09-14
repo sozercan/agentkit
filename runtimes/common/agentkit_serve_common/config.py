@@ -19,12 +19,15 @@ import posixpath
 import re
 import sys
 from pathlib import Path
-from typing import Any, Literal, Mapping
+from typing import TYPE_CHECKING, Any, Literal, Mapping
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError, field_validator, model_validator
 
 from .yaml_support import safe_load_lossless
+
+if TYPE_CHECKING:
+    from .skills import SkillCatalog
 
 # The ABI schema version this reader understands (agent-abi.md: ``abiVersion: v0``).
 ABI_VERSION = "v0"
@@ -1162,6 +1165,10 @@ class ExposeSpec(_Strict):
 
 class AgentSpec(_Strict):
     """The whole baked ``agent.yaml``."""
+
+    # Resolved by the ACP adapter after binding the exact config bytes. This is
+    # process-local data, never an ABI field or request-controlled configuration.
+    _packaged_skill_catalog: SkillCatalog | None = PrivateAttr(default=None)
 
     abi_version: str = Field(alias="abiVersion")
     metadata: Metadata

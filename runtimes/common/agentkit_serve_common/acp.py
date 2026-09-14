@@ -27,6 +27,11 @@ from .adapter_support import _attach_secondary_error, _wait_for_owner_task
 from .config import AgentSpec, load_with_bytes
 from .conversation import ConversationTurn, RunRequest, ToolCallEvent
 from .runtime import AgentRunError, RuntimeFactory, RuntimeSession
+from .skills import (
+    SkillCatalog,
+    SkillConfigurationError,
+    validate_packaged_skill_providers,
+)
 
 ACP_PROTOCOL_VERSION = 1
 ACP_AGENT_CONFIGURATION_DIGEST_ENV = "AGENTKIT_ACP_AGENT_CONFIGURATION_DIGEST"
@@ -223,6 +228,19 @@ def _factory_supports_http_mcp(factory: RuntimeFactory) -> bool:
     return bool(capability()) if callable(capability) else False
 
 
+def _factory_supports_packaged_skills(factory: RuntimeFactory) -> bool:
+    capability = getattr(factory, "supports_acp_packaged_skills", None)
+    return bool(capability()) if callable(capability) else False
+
+
+def _only_packaged_skill_providers(spec: AgentSpec) -> bool:
+    try:
+        validate_packaged_skill_providers(spec)
+    except SkillConfigurationError:
+        return False
+    return True
+
+
 def _request_key(value: Any) -> str:
     if isinstance(value, bool) or not isinstance(value, (int, str)):
         raise ACPProtocolError(_INVALID_REQUEST, "JSON-RPC id must be a string or integer")
@@ -327,8 +345,10 @@ def validate_acp_runtime_binding(config_bytes: bytes, spec: AgentSpec) -> None:
         raise ACPConfigurationError("ACP strict mode rejects baked direct tools")
     if spec.brokered_tools:
         raise ACPConfigurationError("ACP strict mode rejects baked brokeredTools")
-    if spec.context.providers:
-        raise ACPConfigurationError("ACP strict mode rejects baked context providers")
+    try:
+        validate_packaged_skill_providers(spec)
+    except SkillConfigurationError as exc:
+        raise ACPConfigurationError(str(exc)) from exc
 
     expected_digest = _required_environment(ACP_AGENT_CONFIGURATION_DIGEST_ENV)
     prefix = "sha256:"
@@ -364,6 +384,10 @@ def validate_acp_runtime_binding(config_bytes: bytes, spec: AgentSpec) -> None:
     except ACPProtocolError as exc:
         raise ACPConfigurationError(exc.message) from exc
     _required_environment(ACP_PROVIDER_TOKEN_ENV)
+    try:
+        spec._packaged_skill_catalog = SkillCatalog.from_spec(spec)
+    except SkillConfigurationError as exc:
+        raise ACPConfigurationError(str(exc)) from exc
 
 
 class ACPStdioServer:
@@ -378,7 +402,10 @@ class ACPStdioServer:
             _factory_supports_http_mcp(factory)
             and not spec.tools
             and not spec.brokered_tools
-            and not spec.context.providers
+            and (
+                not spec.context.providers
+                or (_factory_supports_packaged_skills(factory) and _only_packaged_skill_providers(spec))
+            )
         )
         self.sessions: dict[str, _SessionState] = {}
         self.requests: dict[str, asyncio.Task[None]] = {}
@@ -597,8 +624,15 @@ class ACPStdioServer:
             raise ACPProtocolError(_INVALID_PARAMS, "ACP strict mode rejects baked direct tools")
         if self.spec.brokered_tools:
             raise ACPProtocolError(_INVALID_PARAMS, "ACP strict mode rejects baked brokeredTools")
-        if self.spec.context.providers:
-            raise ACPProtocolError(_INVALID_PARAMS, "ACP strict mode rejects baked context providers")
+        try:
+            validate_packaged_skill_providers(self.spec)
+            if self.spec.context.providers:
+                if not _factory_supports_packaged_skills(self.factory):
+                    raise SkillConfigurationError("this runtime does not support ACP packaged skills")
+                if self.spec._packaged_skill_catalog is None:
+                    self.spec._packaged_skill_catalog = SkillCatalog.from_spec(self.spec)
+        except SkillConfigurationError as exc:
+            raise ACPProtocolError(_INVALID_PARAMS, str(exc)) from exc
 
         mcp_servers = request.get("mcpServers", [])
         if not isinstance(mcp_servers, list):
@@ -721,6 +755,7 @@ class ACPStdioServer:
             projected = AgentSpec.model_validate(data)
         except ValueError as exc:
             raise ACPProtocolError(_INVALID_PARAMS, "ACP MCP server configuration is invalid") from exc
+        projected._packaged_skill_catalog = self.spec._packaged_skill_catalog
         return projected, environment
 
     async def _prompt(self, request_key: str, params: Any) -> dict[str, str]:

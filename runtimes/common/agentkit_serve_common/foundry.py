@@ -31,7 +31,7 @@ from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 from pathlib import Path
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 
 from fastapi import Depends, FastAPI, Request
@@ -39,7 +39,13 @@ from fastapi.responses import JSONResponse, Response
 
 from .brokered import brokered_tool_definitions
 from .config import AgentSpec, _unsafe_brokered_key, _unsafe_brokered_text
-from .foundry_model_loop import BrokeredChatModelLoop, ModelLoopFinal, ModelLoopToolRequest
+from .foundry_model_loop import (
+    BrokeredChatModelLoop,
+    ModelLoopFinal,
+    ModelLoopToolRequest,
+    normalized_model_error_details,
+)
+from .foundry_streaming import BrokeredResponseStream, brokered_stream_response
 from .conversation import FORWARDED_ROLES, ConversationTurn, RunRequest
 from .runtime import AgentRunError, BrokeredToolDefinition, RunResult, RuntimeFactory
 from .server import make_auth_dependency
@@ -78,6 +84,20 @@ _MODEL_LOOP_ENV = "AGENTKIT_FOUNDRY_BROKERED_MODEL_LOOP"
 _STATE_FILE_ENV = "AGENTKIT_FOUNDRY_RESPONSE_STATE_FILE"
 _FOUNDRY_SESSION_ENV = "FOUNDRY_AGENT_SESSION_ID"
 _TERMINAL_STATE_FULL = "state_full"
+_BROKERED_MODEL_VALIDATION_ERRORS = {
+    "InvalidToolArguments": (400, "model tool arguments are invalid"),
+    "InvalidToolOutput": (400, "brokered tool output is invalid"),
+    "UnsafeBrokeredArguments": (400, "model tool arguments are unsafe"),
+    "UnsupportedBrokeredSchema": (400, "brokered tool schema is unsupported"),
+    "unknown_brokered_tool": (400, "model requested unknown brokered tool"),
+    "invalid_tool_call": (400, "model tool call is invalid"),
+    "unsupported_tool_call": (400, "model returned an unsupported tool call"),
+    "multiple_tool_calls_unsupported": (400, "brokered mode requires sequential tool calls"),
+    "tool_loop_limit_exceeded": (400, "model exceeded the tool call limit"),
+    "brokered_arguments_too_large": (413, "model tool arguments are too large"),
+    "brokered_output_too_large": (413, "brokered tool output is too large for model resume"),
+    "brokered_model_messages_too_large": (413, "model loop messages are too large"),
+}
 
 
 def _new_response_id(previous_response_id: str | None = None) -> str:
@@ -190,6 +210,23 @@ def _model_response_too_large_error() -> JSONResponse:
         status=502,
         code="ModelResponseTooLarge",
     )
+
+
+def _brokered_model_run_error(exc: Exception) -> JSONResponse:
+    status = 502
+    if isinstance(exc, AgentRunError):
+        normalized = normalized_model_error_details(exc)
+        if normalized is not None:
+            status, error = normalized
+            return JSONResponse({"error": error}, status_code=status)
+        # Validation exceptions may include model-supplied names or argument paths.
+        validation = _BROKERED_MODEL_VALIDATION_ERRORS.get(exc.code) if type(exc.code) is str else None
+        if validation is not None:
+            status, message = validation
+            return _error(message, status=status, code=exc.code)
+        if type(exc.status) is int and 400 <= exc.status <= 599:
+            status = exc.status
+    return _error("model resume failed", status=status, code="ModelResumeError")
 
 
 def _non_brokered_agent_run_error(exc: AgentRunError) -> JSONResponse:
@@ -364,13 +401,20 @@ def _responses_input_to_run_request(value: Any, *, session_id: str | None) -> Ru
     return RunRequest(prompt=json.dumps(value, separators=(",", ":"), sort_keys=True), session_id=session_id)
 
 
-def _responses_payload(spec: AgentSpec, result: RunResult, *, previous_response_id: str | None = None) -> dict[str, Any]:
-    response_id = _new_response_id(previous_response_id)
+def _responses_payload(
+    spec: AgentSpec,
+    result: RunResult,
+    *,
+    previous_response_id: str | None = None,
+    response_id: str | None = None,
+    created_at: int | None = None,
+) -> dict[str, Any]:
+    response_id = response_id or _new_response_id(previous_response_id)
     message_id = _new_message_id(response_id)
     payload: dict[str, Any] = {
         "id": response_id,
         "object": "response",
-        "created_at": int(time.time()),
+        "created_at": int(time.time()) if created_at is None else created_at,
         "status": "completed",
         "model": spec.model.name,
         "output": [
@@ -418,6 +462,11 @@ class _HostedResponseState:
     model_messages: list[dict[str, Any]] | None = None
     initial_usage: dict[str, int] = field(default_factory=dict)
     final_persistence_pending: bool = False
+    # All rounds share one bounded store entry. A completed round retains its
+    # response/call pairing and exact reply so retries cannot repeat model work.
+    response_calls: dict[str, str] = field(default_factory=dict)
+    continuation_payloads: dict[str, dict[str, Any]] = field(default_factory=dict)
+    conversation_history: list[dict[str, str]] = field(default_factory=list)
 
 
 class _StateExpired(KeyError):
@@ -525,6 +574,12 @@ def _state_to_payload(state: _HostedResponseState) -> dict[str, Any]:
     }
     if state.terminal_error is not None:
         payload["terminalError"] = state.terminal_error
+    if state.response_calls:
+        payload["responseCalls"] = dict(state.response_calls)
+    if state.continuation_payloads:
+        payload["continuationPayloads"] = dict(state.continuation_payloads)
+    if state.conversation_history:
+        payload["conversationHistory"] = list(state.conversation_history)
     return payload
 
 
@@ -554,6 +609,19 @@ def _state_from_payload(data: Mapping[str, Any]) -> _HostedResponseState:
     terminal_error = data.get("terminalError")
     model_messages = data.get("modelMessages")
     initial_usage = data.get("initialUsage", {})
+    response_calls = data.get("responseCalls", {})
+    continuation_payloads = data.get("continuationPayloads", {})
+    conversation_history = data.get("conversationHistory", [])
+    if not isinstance(response_calls, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in response_calls.items()):
+        raise ValueError("stored responseCalls must map response IDs to call IDs")
+    if not isinstance(continuation_payloads, dict) or not all(isinstance(k, str) and isinstance(v, dict) for k, v in continuation_payloads.items()):
+        raise ValueError("stored continuationPayloads must map call IDs to response objects")
+    if not isinstance(conversation_history, list) or not all(
+        isinstance(turn, dict) and set(turn) == {"role", "content"}
+        and turn["role"] in {"user", "assistant"} and isinstance(turn["content"], str)
+        for turn in conversation_history
+    ):
+        raise ValueError("stored conversationHistory must contain user and assistant text")
     if final_payload is not None and not isinstance(final_payload, dict):
         raise ValueError("stored finalPayload must be an object")
     if terminal_error is not None and not isinstance(terminal_error, str):
@@ -582,8 +650,8 @@ def _state_from_payload(data: Mapping[str, Any]) -> _HostedResponseState:
         # Clear it on load so Orka can retry instead of being stuck behind
         # duplicate_continuation_in_progress until TTL expiry.
         status = "pending"
-        accepted = {}
-        accepted_sizes = {}
+        accepted = {key: value for key, value in accepted.items() if key in continuation_payloads}
+        accepted_sizes = {key: value for key, value in accepted_sizes.items() if key in accepted}
     return _HostedResponseState(
         response_id=str(data.get("responseID") or ""),
         session_id=str(data["sessionID"]) if data.get("sessionID") is not None else None,
@@ -596,11 +664,14 @@ def _state_from_payload(data: Mapping[str, Any]) -> _HostedResponseState:
         terminal_error=terminal_error,
         model_messages=model_messages,
         initial_usage={str(key): int(value or 0) for key, value in initial_usage.items()},
+        response_calls=response_calls,
+        continuation_payloads=continuation_payloads,
+        conversation_history=conversation_history,
     )
 
 
 def _state_has_replay(state: _HostedResponseState) -> bool:
-    return state.final_payload is not None or state.terminal_error is not None
+    return state.final_payload is not None or state.terminal_error is not None or bool(state.continuation_payloads)
 
 
 class _FoundryResponseStateStore:
@@ -764,7 +835,7 @@ class _FoundryResponseStateStore:
         pending_finals = [
             response_id
             for response_id, state in states.items()
-            if state.final_persistence_pending and state.status == "completed" and _state_has_replay(state)
+            if state.final_persistence_pending and _state_has_replay(state)
         ]
         if pending_finals:
             installed = dict(states)
@@ -1009,19 +1080,24 @@ class _FoundryResponseStateStore:
         with self._lock:
             state = self._states.get(response_id)
             if state is None:
+                state = next((entry for entry in self._states.values() if response_id in entry.response_calls or (
+                    entry.session_id and entry.final_payload and entry.final_payload.get("id") == response_id
+                )), None)
+            if state is None:
                 raise KeyError(response_id)
+            root_id = state.response_id
             states = dict(self._states)
             now = time.time()
             active_resume_ids = self._active_resume_ids()
             target_expired = state.expires_at <= now and not (
-                state.status == "resuming" and response_id in active_resume_ids
+                state.status == "resuming" and root_id in active_resume_ids
             )
             changed = self._purge_expired_from(states, now=now, active_resume_ids=active_resume_ids)
             if changed:
                 self._commit(states)
             if target_expired:
                 raise _StateExpired(response_id, deepcopy(state))
-            current = self._states.get(response_id)
+            current = self._states.get(root_id)
             if current is None:
                 raise KeyError(response_id)
             return deepcopy(current)
@@ -2124,11 +2200,12 @@ def _function_call_response_payload(
     call: _PendingCall,
     previous_response_id: str | None = None,
     usage: Mapping[str, int] | None = None,
+    created_at: int | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "id": response_id,
         "object": "response",
-        "created_at": int(time.time()),
+        "created_at": int(time.time()) if created_at is None else created_at,
         "status": "completed",
         "model": spec.model.name,
         "output": [
@@ -2147,6 +2224,101 @@ def _function_call_response_payload(
     if previous_response_id:
         payload["previous_response_id"] = previous_response_id
     return payload
+
+
+def _model_pending_call(
+    result: ModelLoopToolRequest,
+    *,
+    model_loop: BrokeredChatModelLoop,
+    response_id: str,
+    call_id: str,
+    max_argument_bytes: int,
+    max_messages_bytes: int,
+) -> _PendingCall:
+    tool = model_loop.tools_by_name.get(result.name)
+    if tool is None:
+        raise AgentRunError("model requested unknown brokered tool", status=400, code="unknown_brokered_tool")
+    _validate_model_brokered_arguments(result.arguments)
+    _validate_model_arguments_for_tool(result.arguments, tool)
+    if len(_canonical_output_json(result.arguments).encode("utf-8")) > max_argument_bytes:
+        raise AgentRunError("brokered function_call arguments are too large for pending state", status=413, code="brokered_arguments_too_large")
+    try:
+        _bounded_json_bytes(result.messages, max_bytes=max_messages_bytes)
+    except _SerializedPayloadTooLarge as exc:
+        raise AgentRunError("model loop messages are too large for pending state", status=413, code="brokered_model_messages_too_large") from exc
+    except (_InvalidUnicodeValue, TypeError, ValueError) as exc:
+        raise AgentRunError("model loop messages are invalid", status=502, code="InvalidModelResponse") from exc
+    return _PendingCall(call_id=call_id, item_id=_new_function_call_id(response_id), tool=tool, arguments=result.arguments)
+
+
+def _bounded_conversation_history(messages: list[dict[str, Any]], *, max_bytes: int) -> list[dict[str, str]]:
+    """Retain complete recent exchanges, without system prompts or tool data."""
+    turns = [
+        {"role": message["role"], "content": message["content"]}
+        for message in messages
+        if message.get("role") in {"user", "assistant"}
+        and isinstance(message.get("content"), str) and message["content"]
+        and not message.get("tool_calls")
+    ]
+    while turns:
+        try:
+            _bounded_json_bytes(turns, max_bytes=max_bytes)
+            return turns
+        except _SerializedPayloadTooLarge:
+            # Drop an entire exchange rather than leave an orphan answer.
+            next_user = next((i for i in range(1, len(turns)) if turns[i]["role"] == "user"), len(turns))
+            turns = turns[next_user:]
+    return []
+
+
+def _advance_brokered_state(
+    *,
+    spec: AgentSpec,
+    store: _FoundryResponseStateStore,
+    state: _HostedResponseState,
+    previous_response_id: str,
+    call_id: str,
+    result: ModelLoopToolRequest,
+    model_loop: BrokeredChatModelLoop,
+    response_id: str,
+    next_call_id: str,
+    created_at: int | None = None,
+) -> JSONResponse:
+    try:
+        call = _model_pending_call(
+            result,
+            model_loop=model_loop,
+            response_id=response_id,
+            call_id=next_call_id,
+            max_argument_bytes=model_loop.max_argument_bytes,
+            max_messages_bytes=model_loop.max_messages_bytes,
+        )
+    except AgentRunError as exc:
+        if not _reset_unfinalized_continuation(store, state, call_id=call_id):
+            return _state_storage_error()
+        return _brokered_model_run_error(exc)
+    payload = _function_call_response_payload(spec, response_id=response_id, call=call, previous_response_id=previous_response_id, usage=result.usage, created_at=created_at)
+    following = deepcopy(state)
+    if not following.response_calls:
+        following.response_calls[state.response_id] = call_id
+    following.response_calls[response_id] = next_call_id
+    following.pending_calls[next_call_id] = call
+    following.continuation_payloads[call_id] = payload
+    following.model_messages = result.messages
+    following.initial_usage = _combine_usage(state.initial_usage, result.usage)
+    following.status = "pending"
+    following.expires_at = time.time() + store.ttl_seconds
+    try:
+        store.save(following)
+    except (_StateStoreFull, _StateSizeLimitExceeded) as exc:
+        if not _reset_unfinalized_continuation(store, state, call_id=call_id):
+            return _state_storage_error()
+        return _state_full_error() if isinstance(exc, _StateStoreFull) else _model_response_too_large_error()
+    except _StatePersistenceError:
+        following.final_persistence_pending = True
+        store.cache_in_memory(following)
+        return _state_storage_error()
+    return JSONResponse(payload)
 
 
 def _final_text_from_tool_output(call: _PendingCall, output: dict[str, Any]) -> str:
@@ -2171,6 +2343,7 @@ def _reset_unfinalized_continuation(
     state.final_payload = None
     state.terminal_error = None
     state.final_persistence_pending = False
+    state.conversation_history = []
     state.expires_at = time.time() + store.ttl_seconds
     try:
         store.save(state)
@@ -2194,6 +2367,7 @@ def _complete_with_state_full(
     state.terminal_error = _TERMINAL_STATE_FULL
     state.model_messages = None
     state.initial_usage = {}
+    state.conversation_history = []
     state.final_persistence_pending = False
     state.expires_at = time.time() + store.ttl_seconds
     try:
@@ -2227,6 +2401,7 @@ async def _handle_brokered_continuation(
     session_id: str | None,
     max_output_bytes: int,
     model_loop: BrokeredChatModelLoop | None = None,
+    stream: BrokeredResponseStream | None = None,
 ) -> JSONResponse:
     if not continuation_proof:
         return _error(
@@ -2292,6 +2467,10 @@ async def _handle_brokered_continuation(
     call_id = item.get("call_id")
     if not isinstance(call_id, str) or not call_id:
         return _error("function_call_output.call_id is required", status=400, code="missing_call_id")
+    if state.response_calls and state.response_calls.get(str(previous_response_id)) != call_id:
+        return _error("function_call_output does not match previous_response_id", status=400, code="unknown_call_id")
+    if not state.response_calls and previous_response_id != state.response_id:
+        return _error("function_call_output does not match previous_response_id", status=400, code="unknown_call_id")
     call = state.pending_calls.get(call_id)
     if call is None:
         return _error("unknown function_call_output call_id", status=400, code="unknown_call_id")
@@ -2343,7 +2522,8 @@ async def _handle_brokered_continuation(
     output_digest = _output_digest(output_json)
 
     if existing_output_digest is not None:
-        if existing_output_digest == output_digest and _state_has_replay(state):
+        replay_payload = state.continuation_payloads.get(call_id, state.final_payload)
+        if existing_output_digest == output_digest and (replay_payload is not None or state.terminal_error is not None):
             if state.final_persistence_pending:
                 state.final_persistence_pending = False
                 try:
@@ -2359,10 +2539,11 @@ async def _handle_brokered_continuation(
                     state.final_persistence_pending = True
                     store.cache_in_memory(state)
                     return _state_storage_error()
-            if state.terminal_error == _TERMINAL_STATE_FULL:
+            # A later workflow failure must not replace an earlier round's reply.
+            if replay_payload is None and state.terminal_error == _TERMINAL_STATE_FULL:
                 return _state_full_error()
-            assert state.final_payload is not None
-            return JSONResponse(state.final_payload)
+            assert replay_payload is not None
+            return JSONResponse(replay_payload)
         if existing_output_digest == output_digest:
             return _error(
                 "matching function_call_output is already being processed",
@@ -2389,11 +2570,12 @@ async def _handle_brokered_continuation(
     if state.status != "pending":
         return _error("previous response is not pending a tool result", status=409, code="response_not_pending")
 
+    created_at = None
     if state.model_messages is not None and model_loop is not None:
         try:
             model_loop.validate_static_credentials()
         except AgentRunError as exc:
-            return _error(str(exc), status=exc.status, code=exc.code)
+            return _brokered_model_run_error(exc)
         state.accepted_output_digests[call_id] = output_digest
         state.accepted_output_sizes[call_id] = accepted_output_size
         state.status = "resuming"
@@ -2410,32 +2592,36 @@ async def _handle_brokered_continuation(
         store.mark_resume_active(state.response_id)
         try:
             try:
-                model_result = await model_loop.resume(state.model_messages, call_id=call_id, output=output_json)
+                next_response_id = _new_response_id(str(previous_response_id))
+                next_call_id = f"call_{next_response_id}_1"
+                if stream is not None:
+                    created_at = await stream.accept(next_response_id)
+                model_result = await model_loop.resume(state.model_messages, call_id=call_id, output=output_json, next_call_id=next_call_id)
             except AgentRunError as exc:
                 if not _reset_unfinalized_continuation(store, state, call_id=call_id):
                     return _state_storage_error()
-                if exc.code == "ModelResponseTooLarge":
-                    logger.warning("brokered model-loop response exceeded configured limits")
-                    return _model_response_too_large_error()
-                if exc.status >= 500:
-                    logger.warning("brokered model-loop resume failed: %s", exc)
-                    return _error("model resume failed", status=exc.status, code="ModelResumeError")
-                return _error(str(exc), status=exc.status, code=exc.code)
+                logger.warning("brokered model-loop resume failed")
+                return _brokered_model_run_error(exc)
             except asyncio.CancelledError:
                 _reset_unfinalized_continuation(store, state, call_id=call_id)
                 raise
             except Exception as exc:  # noqa: BLE001 - reset continuation state before surfacing unexpected model failures.
-                logger.exception("brokered model-loop resume failed unexpectedly")
+                logger.warning("brokered model-loop resume failed unexpectedly")
                 if not _reset_unfinalized_continuation(store, state, call_id=call_id):
                     return _state_storage_error()
-                return _error("model resume failed", status=502, code="ModelResumeError")
-            if not isinstance(model_result, ModelLoopFinal):
-                if not _reset_unfinalized_continuation(store, state, call_id=call_id):
-                    return _state_storage_error()
-                return _error(
-                    "model requested another brokered tool after resume",
-                    status=400,
-                    code="tool_loop_limit_exceeded",
+                return _brokered_model_run_error(exc)
+            if isinstance(model_result, ModelLoopToolRequest):
+                return _advance_brokered_state(
+                    spec=spec,
+                    store=store,
+                    state=state,
+                    previous_response_id=str(previous_response_id),
+                    call_id=call_id,
+                    result=model_result,
+                    model_loop=model_loop,
+                    response_id=next_response_id,
+                    next_call_id=next_call_id,
+                    created_at=created_at,
                 )
             result = RunResult(text=model_result.text, usage=_combine_usage(state.initial_usage, model_result.usage))
         finally:
@@ -2446,7 +2632,13 @@ async def _handle_brokered_continuation(
     resume_initial_usage = dict(state.initial_usage)
     has_resume_transcript = resume_model_messages is not None
     used_model_resume = has_resume_transcript and model_loop is not None
-    final_payload = _responses_payload(spec, result, previous_response_id=state.response_id)
+    final_payload = _responses_payload(
+        spec,
+        result,
+        previous_response_id=str(previous_response_id),
+        response_id=stream.created.result()["id"] if stream is not None and stream.created.done() else None,
+        created_at=created_at,
+    )
     state.accepted_output_digests[call_id] = output_digest
     state.accepted_output_sizes[call_id] = accepted_output_size
     state.status = "completed"
@@ -2455,6 +2647,10 @@ async def _handle_brokered_continuation(
     if has_resume_transcript:
         state.model_messages = None
         state.initial_usage = {}
+        if state.session_id and isinstance(model_result, ModelLoopFinal):
+            state.conversation_history = _bounded_conversation_history(
+                model_result.messages, max_bytes=min(model_loop.max_messages_bytes // 2, store.max_bytes // 8),
+            )
     state.final_persistence_pending = False
     state.expires_at = time.time() + store.ttl_seconds
     try:
@@ -2537,6 +2733,7 @@ def create_foundry_app(
             max_argument_bytes=max_argument_bytes,
             max_output_bytes=max_output_bytes,
             max_response_bytes=response_states.max_bytes,
+            max_messages_bytes=model_messages_limit,
         )
         if brokered_tools and _brokered_model_loop_enabled(brokered_model_loop_enabled)
         else None
@@ -2630,11 +2827,21 @@ def create_foundry_app(
         except (UnicodeDecodeError, RecursionError, ValueError):
             return _error("Request body must be JSON", status=400, code="invalid_json")
 
+        if isinstance(data, dict) and data.get("stream") is True:
+            return await brokered_stream_response(
+                spec.model.name,
+                lambda stream: execute_responses(request, data, request_body_size, stream),
+            )
+        return await execute_responses(request, data, request_body_size)
+
+    async def execute_responses(
+        request: Request,
+        data: Any,
+        request_body_size: int,
+        stream: BrokeredResponseStream | None = None,
+    ) -> JSONResponse:
         if not isinstance(data, dict):
             return _error("Request body must be a JSON object", status=400, code="invalid_request")
-        # Foundry/azd clients may include stream=true by default. The adapter is
-        # intentionally non-streaming, so tolerate the flag and return a normal
-        # completed response instead of failing readiness/e2e checks.
         if data.get("tools"):
             return _error(
                 "request-supplied Responses tools are not allowed; hosted brokered mode uses static safe schemas",
@@ -2663,6 +2870,8 @@ def create_foundry_app(
                 status=409,
                 code="response_session_mismatch",
             )
+        if stream is not None:
+            stream.session_id = session_id
         previous_response_id = data.get("previous_response_id")
         function_outputs = _function_call_outputs_from_input(data["input"])
         if brokered_tools and not function_outputs and request_body_size > request_body_limit:
@@ -2683,7 +2892,9 @@ def create_foundry_app(
                 session_id=session_id,
                 max_output_bytes=max_output_bytes,
                 model_loop=model_loop,
+                stream=stream,
             )
+        previous_state = None
         if brokered_tools and isinstance(previous_response_id, str) and previous_response_id:
             try:
                 previous_state = response_states.get(previous_response_id)
@@ -2691,7 +2902,9 @@ def create_foundry_app(
                 logger.warning("failed to access Foundry brokered response state: %s", exc)
                 return _state_storage_error()
             except _StateExpired as exc:
-                if exc.state.status in {"pending", "resuming"}:
+                if exc.state.status in {"pending", "resuming"} or (
+                    model_loop is not None and (session_id or exc.state.session_id)
+                ):
                     return _error("previous_response_id state has expired", status=410, code="response_state_expired")
                 previous_state = None
             except KeyError:
@@ -2702,6 +2915,15 @@ def create_foundry_app(
                     status=409,
                     code="response_pending_function_call_output",
                 )
+            if model_loop is not None and (session_id or (previous_state is not None and previous_state.session_id)):
+                if previous_state is None:
+                    return _error("unknown previous_response_id", status=404, code="unknown_previous_response_id")
+                if previous_state.session_id != session_id:
+                    return _error("previous_response_id requires the same effective Foundry session", status=409, code="response_session_mismatch")
+                if not previous_state.final_payload or previous_state.final_payload.get("id") != previous_response_id:
+                    return _error("follow-up requires the completed response ID", status=409, code="response_not_completed")
+                if not previous_state.conversation_history:
+                    return _error("previous conversation no longer fits retained history", status=409, code="response_history_unavailable")
 
         try:
             run_request = _responses_input_to_run_request(
@@ -2710,6 +2932,11 @@ def create_foundry_app(
             )
         except ValueError as exc:
             return _error(str(exc), status=400, code="invalid_input")
+        if model_loop is not None and session_id and previous_state is not None:
+            run_request = replace(run_request, history=(
+                *(ConversationTurn(role=turn["role"], text=turn["content"]) for turn in previous_state.conversation_history),
+                *run_request.history,
+            ))
 
         if brokered_tools:
             if not continuation_proof:
@@ -2723,7 +2950,7 @@ def create_foundry_app(
                 try:
                     model_loop.validate_static_credentials()
                 except AgentRunError as exc:
-                    return _error(str(exc), status=exc.status, code=exc.code)
+                    return _brokered_model_run_error(exc)
                 response_id = _new_response_id(previous_response_id_for_output)
                 call_id = f"call_{response_id}_1"
                 try:
@@ -2739,19 +2966,41 @@ def create_foundry_app(
                     return _state_storage_error()
                 try:
                     try:
+                        created_at = await stream.accept(response_id) if stream is not None else None
                         model_result = await model_loop.start(run_request, call_id=call_id)
                     except AgentRunError as exc:
-                        if exc.code == "ModelResponseTooLarge":
-                            return _model_response_too_large_error()
-                        return _error(str(exc), status=exc.status, code=exc.code)
+                        return _brokered_model_run_error(exc)
+                    except Exception as exc:  # noqa: BLE001 - unknown model failures have no public diagnostic payload.
+                        return _brokered_model_run_error(exc)
                     if isinstance(model_result, ModelLoopFinal):
-                        return JSONResponse(
-                            _responses_payload(
-                                spec,
-                                RunResult(text=model_result.text, usage=model_result.usage),
-                                previous_response_id=previous_response_id_for_output,
-                            )
+                        payload = _responses_payload(
+                            spec,
+                            RunResult(text=model_result.text, usage=model_result.usage),
+                            previous_response_id=previous_response_id_for_output,
+                            response_id=response_id if stream is not None else None,
+                            created_at=created_at,
                         )
+                        if run_request.session_id:
+                            completed = _HostedResponseState(
+                                response_id=response_id,
+                                session_id=run_request.session_id,
+                                pending_calls={},
+                                expires_at=time.time() + response_states.ttl_seconds,
+                                status="completed",
+                                final_payload=payload,
+                                conversation_history=_bounded_conversation_history(
+                                    model_result.messages, max_bytes=min(model_messages_limit // 2, response_states.max_bytes // 8),
+                                ),
+                            )
+                            try:
+                                response_states.add_reserved(completed)
+                            except _StateStoreFull:
+                                return _state_full_error()
+                            except _StateSizeLimitExceeded:
+                                return _model_response_too_large_error()
+                            except _StatePersistenceError:
+                                return _state_storage_error()
+                        return JSONResponse(payload)
                     tool = {tool.name: tool for tool in brokered_tools}.get(model_result.name)
                     if tool is None:
                         return _error("model requested unknown brokered tool", status=400, code="unknown_brokered_tool")
@@ -2759,7 +3008,7 @@ def create_foundry_app(
                         _validate_model_brokered_arguments(model_result.arguments)
                         _validate_model_arguments_for_tool(model_result.arguments, tool)
                     except AgentRunError as exc:
-                        return _error(str(exc), status=exc.status, code=exc.code)
+                        return _brokered_model_run_error(exc)
                     if len(_canonical_output_json(model_result.arguments).encode("utf-8")) > max_argument_bytes:
                         return _error(
                             "brokered function_call arguments are too large for pending state",
@@ -2814,6 +3063,7 @@ def create_foundry_app(
                             call=call,
                             previous_response_id=previous_response_id_for_output,
                             usage=model_result.usage,
+                            created_at=created_at,
                         )
                     )
                 finally:
@@ -2873,13 +3123,15 @@ def create_foundry_app(
                 )
             )
 
+        response_id = _new_response_id() if stream is not None else None
         try:
+            created_at = await stream.accept(response_id) if stream is not None else None
             result = await request.app.state.runtime.run(run_request)
         except AgentRunError as exc:
             return _non_brokered_agent_run_error(exc)
         except Exception:  # noqa: BLE001 - deterministic protocol envelope.
             return _non_brokered_unexpected_runtime_error()
 
-        return JSONResponse(_responses_payload(spec, result))
+        return JSONResponse(_responses_payload(spec, result, response_id=response_id, created_at=created_at))
 
     return app

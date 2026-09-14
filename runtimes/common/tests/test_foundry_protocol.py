@@ -91,11 +91,12 @@ def test_foundry_non_brokered_ignores_brokered_state_file_env(monkeypatch, tmp_p
     assert resp.json()["output"][0]["content"][0]["text"] == "echo: hi"
 
 
-def test_foundry_responses_tolerates_stream_flag_with_non_streaming_response():
+def test_foundry_responses_non_streaming_keeps_json_response():
     app = create_foundry_app(_spec(), EchoFactory())
     with TestClient(app) as client:
-        resp = client.post("/responses", json={"input": "hi", "stream": True})
+        resp = client.post("/responses", json={"input": "hi", "stream": False})
     assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/json"
     assert resp.json()["status"] == "completed"
     assert resp.json()["output"][0]["content"][0]["text"] == "echo: hi"
 

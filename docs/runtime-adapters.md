@@ -49,7 +49,9 @@ acceptance, SSE replay, and cancel endpoints.
 ACP mode opens no listener. It speaks newline-delimited ACP JSON-RPC on stdin
 and stdout. The child verifies the configured model and SHA-256 digest of the
 exact `/agent/agent.yaml` bytes before accepting a session. It rejects baked
-direct tools, `brokeredTools`, and context providers. At session creation it
+direct tools and `brokeredTools`. The Microsoft Agent Framework adapter can
+load [packaged skill instructions](instruction-skills.md); other context
+providers remain prohibited. At session creation it
 accepts at most one loopback HTTP MCP server with bearer authentication, which
 is the prompt-scoped broker created by the Orka supervisor.
 

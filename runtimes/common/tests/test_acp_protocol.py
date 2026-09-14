@@ -19,6 +19,7 @@ from agentkit_serve_common import acp
 from agentkit_serve_common.acp import ACPConfigurationError, ACPStdioServer
 from agentkit_serve_common.config import AgentSpec
 from agentkit_serve_common.conversation import ConversationTurn, RunRequest, ToolCallEvent
+from agentkit_serve_common.skills import _Skill, SkillCatalog
 from agentkit_serve_common.runtime import (
     AgentRunError,
     OfflineEchoRuntimeFactory,
@@ -2104,10 +2105,10 @@ def test_runtime_binding_rejects_profile_or_provider_mismatch(
                 "context": {
                     "providers": [
                         {
-                            "name": "skills",
-                            "type": "skills",
-                            "source": "filesystem",
-                            "path": "/agent/skills",
+                            "name": "search",
+                            "type": "search",
+                            "endpointEnv": "SEARCH_ENDPOINT",
+                            "indexEnv": "SEARCH_INDEX",
                         }
                     ]
                 }
@@ -2122,3 +2123,92 @@ def test_runtime_binding_rejects_baked_tool_and_context_paths(tmp_path, override
 
     with pytest.raises(ACPConfigurationError, match=message):
         acp.validate_acp_runtime_binding(b"unused", _spec(**override))
+
+
+def test_acp_binds_instruction_skill_snapshot_and_preserves_http_mcp(monkeypatch):
+    spec = _spec(context={"providers": [{
+        "type": "skills", "source": "filesystem", "path": "/agent/skills",
+    }]})
+    catalog = SkillCatalog((_Skill("inspection", "Inspect equipment.", "original instructions"),))
+    monkeypatch.setattr(SkillCatalog, "from_spec", classmethod(lambda cls, _: catalog))
+    monkeypatch.setenv(acp.ACP_AGENT_CONFIGURATION_DIGEST_ENV, "sha256:" + hashlib.sha256(b"exact").hexdigest())
+    monkeypatch.setenv(acp.ACP_MODEL_ENV, "test-model")
+    _set_provider_environment(monkeypatch)
+    acp.validate_acp_runtime_binding(b"exact", spec)
+    assert spec._packaged_skill_catalog is catalog
+    assert "_packaged_skill_catalog" not in spec.model_dump()
+    monkeypatch.setattr(SkillCatalog, "from_spec", classmethod(lambda cls, _: pytest.fail("snapshot must not be reloaded")))
+
+    class SkillsFactory(RecordingFactory):
+        def supports_acp_packaged_skills(self):
+            return True
+
+    async def exercise():
+        messages = []
+
+        async def send(message):
+            messages.append(dict(message))
+
+        runtime = RecordingRuntime([RunResult("done")])
+        factory = SkillsFactory(lambda: runtime, supports_http_mcp=True)
+        server = ACPStdioServer(spec, factory, send)
+        try:
+            initialized = await _send_to(server, messages, _initialize())
+            assert initialized["result"]["agentCapabilities"]["mcpCapabilities"] == {"http": True}
+            request = _new_session(mcp_servers=[_orka_mcp_server()])
+            request["params"]["context"] = {"providers": [{"type": "skills", "source": "filesystem", "path": "/workspace"}]}
+            request["params"]["_packaged_skill_catalog"] = {"inspection": "request instructions"}
+            session = await _send_to(server, messages, request)
+            assert "sessionId" in session["result"]
+            projected = factory.specs[0]
+            assert projected._packaged_skill_catalog is catalog
+            assert projected._packaged_skill_catalog.load_skill("inspection") == "original instructions"
+            assert projected.context.providers[0].path == "/agent/skills"
+            assert len(projected.tools) == 1
+            assert projected.tools[0].url_env.startswith("AGENTKIT_ACP_SESSION_")
+        finally:
+            await server.close()
+
+    asyncio.run(exercise())
+
+
+def test_acp_checks_config_binding_before_reading_skill_files(monkeypatch):
+    spec = _spec(context={"providers": [{
+        "type": "skills", "source": "filesystem", "path": "/agent/skills",
+    }]})
+    monkeypatch.setattr(SkillCatalog, "from_spec", classmethod(lambda cls, _: pytest.fail("unverified skills must not be read")))
+    monkeypatch.setenv(acp.ACP_AGENT_CONFIGURATION_DIGEST_ENV, "sha256:" + hashlib.sha256(b"expected").hexdigest())
+    with pytest.raises(ACPConfigurationError, match="exact agent config bytes"):
+        acp.validate_acp_runtime_binding(b"changed", spec)
+
+
+def test_agent_config_cannot_supply_a_packaged_skill_snapshot():
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        _spec(_packaged_skill_catalog={"inspection": "unverified instructions"})
+
+
+def test_acp_rejects_skills_on_an_unsupported_runtime(monkeypatch):
+    _set_provider_environment(monkeypatch)
+    spec = _spec(context={"providers": [{
+        "type": "skills", "source": "filesystem", "path": "/agent/skills",
+    }]})
+
+    async def exercise():
+        messages = []
+
+        async def send(message):
+            messages.append(dict(message))
+
+        factory = RecordingFactory(lambda: RecordingRuntime([]), supports_http_mcp=True)
+        server = ACPStdioServer(spec, factory, send)
+        try:
+            initialized = await _send_to(server, messages, _initialize())
+            assert initialized["result"]["agentCapabilities"]["mcpCapabilities"] == {}
+            session = await _send_to(server, messages, _new_session())
+            assert session["error"]["code"] == -32602
+            assert "does not support ACP packaged skills" in session["error"]["message"]
+            assert factory.specs == []
+        finally:
+            await server.close()
+
+    asyncio.run(exercise())

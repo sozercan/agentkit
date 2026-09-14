@@ -164,7 +164,7 @@ payloads. Ordinary client requests must not be able to submit tool results.
 Unknown response IDs, unknown call IDs, orphan tool outputs, duplicate conflicts,
 malformed outputs, missing or wrong continuation auth, and multiple tool outputs
 all return deterministic error envelopes. An identical duplicate continuation
-from the broker path returns the same final response idempotently.
+returns its original next response, even if later tool rounds have completed.
 
 The body field is an AgentKit/Orka compatibility extension rather than a standard
 OpenAI Responses field. Prove that the target Foundry gateway accepts and forwards
@@ -234,9 +234,20 @@ operations.
 
 ## Streaming
 
-The current route is non-streaming. If clients send `stream: true`, AgentKit
-returns the same normal JSON response rather than SSE. This keeps azd/direct curl
-smokes deterministic while making streaming support an explicit future step.
+`/responses` honors `stream: true` with server-sent events, both with and without
+`brokeredTools`.
+AgentKit sends `response.created` before starting model work, then sends
+`response.completed` or `response.failed` with the same response ID. These events
+include the effective `agent_session_id` when one is present. This lets Orka
+record which hosted response it accepted before waiting for the model.
+
+The stream contains acknowledgement and completion events, without token deltas.
+Validation errors before acknowledgement keep their normal HTTP error status.
+Disconnecting the stream cancels the active runtime or model request and releases
+any in-progress brokered state. Orka still uses authenticated session stop and idle
+checks to confirm hosted cleanup. Requests without `stream: true` keep the JSON
+response format. Streaming does not add persistence or replay behavior to runtimes
+without `brokeredTools`.
 
 ## Troubleshooting
 
@@ -367,22 +378,72 @@ deploy/foundry/scripts/local_brokered_conformance_container.sh \
   --transcript-dir ./foundry-brokered-agentkit-transcript
 ```
 
-## Lower-level model-loop fallback
+## Model-driven tool workflows
 
-Phase A4/A5 has an opt-in fallback when a high-level framework cannot prove
-pause/resume: set `AGENTKIT_FOUNDRY_BROKERED_MODEL_LOOP=1` in Foundry brokered
-mode. AgentKit then calls the configured OpenAI-compatible chat-completions
-model directly with the static safe `brokeredTools` as function schemas. If the
-model requests exactly one configured tool, AgentKit rewrites the model's tool
-call id to a stable hosted Responses `call_<response-id>_<sequence>` id and
-returns a `function_call` output item for Orka. On the Orka-authenticated
-`function_call_output` continuation, AgentKit resumes the model with a `tool`
-message and returns the final assistant message.
+Set `AGENTKIT_FOUNDRY_BROKERED_MODEL_LOOP=1` to let the model choose tools and
+work through a task. AgentKit calls the configured OpenAI-compatible Chat
+Completions model with the static `brokeredTools` schemas. For example, the
+agent can inspect telemetry, use the result to look up an incident, and then
+explain what it found.
 
-In this mode AgentKit-owned MCP/direct tools remain disabled; only the static
-safe brokered schemas are model-visible. The first implementation intentionally
-limits each turn to one brokered tool call and rejects unknown, multiple, or
-repeated model tool calls deterministically.
+Each operational tool call returns a `function_call` for Orka to execute. After
+Orka sends the matching `function_call_output`, AgentKit resumes the model. It
+can request another tool or return an answer. Every round gets a fresh response
+ID and call ID; the next result must match both. AgentKit validates each new
+call's name, arguments, and schema before returning it. Retrying the same result
+returns the cached next response without another model request. File-backed
+state preserves these completed rounds across restarts.
+
+The model can make up to 16 sequential tool calls per user turn. At the limit,
+AgentKit asks for a final answer without tools and rejects any further tool
+call. The model endpoint must support `parallel_tool_calls: false`, which asks
+for one tool call at a time. AgentKit also rejects parallel tool batches if a
+model ignores that setting. AgentKit-owned MCP and direct operational tools
+remain disabled.
+
+An HTTP 429 from the model service is retried up to twice within the same
+hosted response. AgentKit honors `retry-after-ms` or `Retry-After` delays of
+up to 60 seconds each. A longer server delay ends the response with
+`ModelUnavailable` and `upstream_status: 429`. Missing or malformed delay
+headers use short exponential backoff with jitter. Disconnecting the hosted
+stream cancels the wait. Other HTTP errors, transport failures, and invalid
+model responses are not retried. These model retries do not repeat Orka tool
+operations or submit a new hosted response.
+
+Agents can also use [bundled instruction skills](instruction-skills.md). With
+filesystem skills configured under `/agent/skills`, AgentKit advertises the
+local `load_skill` tool alongside the brokered schemas. It returns the packaged
+instructions from an immutable startup snapshot. Skill loads count toward the
+same 16-call budget; they do not invoke Orka or execute scripts. All operational
+calls described by those instructions still go through Orka.
+
+For Orka harness v2, use the companion
+[agent-runtime-foundry broker](https://github.com/orka-agents/agent-runtime-foundry/blob/main/docs/harness-v2.md).
+Give its `ORKA_FOUNDRY_BROKER_AGENTKIT_CONTINUATION_PROOF` the same value as the
+hosted agent's `AGENTKIT_FOUNDRY_BROKERED_CONTINUATION_PROOF`, using a secret of
+at least 32 bytes without whitespace. The broker adds this value only after
+checking ownership, the active lease, and the expected response and call. It
+also translates MCP results into AgentKit's approved/error envelope. Keep the
+proof out of the ACP child configuration. The gateway must forward the proof
+field; local tests cannot establish that a public Foundry deployment does so.
+See the shared-proof limitations above. Human tool approvals for external v2
+runtimes remain unsupported by Orka.
+
+## Hosted follow-up questions
+
+In model-loop mode, a follow-up user message can reference the final response ID
+from the previous turn. It must use the same effective hosted session identity.
+AgentKit retains recent user and assistant messages so the model can understand
+questions such as "Which incident was that?" Raw tool messages and system
+instructions are excluded from this retained dialogue. An assistant answer can
+still contain information derived from a tool result.
+
+History keeps complete recent exchanges within half the model-message byte
+limit or one eighth of the response-state byte limit, whichever is smaller.
+It shares the response store's TTL, capacity, and optional file persistence.
+Missing, expired, evicted, or mismatched session history is rejected. Requests
+without a session identity remain stateless. Pending tool calls must finish
+before a user can continue their response.
 
 ## Implementation status and evidence
 
@@ -398,9 +459,9 @@ requires deployed Foundry/Orka/Fibey state.
 | A2 static schemas and drift control | Implemented in Go writer/validator and Python runtime; export CLI added | `brokeredTools` ABI, `agentkit-brokered-tools`, `tests/test_config_validation.py`, `tests/test_brokered_schema.py`, Go config/ABI tests | Orka Tool CRDs must be exported during deployment and current digests verified before live runs. |
 | A3 deterministic brokered runtime | Implemented for local/fake hosted protocol integration | deterministic `/responses` brokered path and tests | Live Orka deterministic read/write smoke still required. |
 | A4 framework pause/resume decision | Lower-level OpenAI-compatible fallback implemented; high-level framework native hooks remain gated | `agentkit_serve_common.foundry_model_loop`, `AGENTKIT_FOUNDRY_BROKERED_MODEL_LOOP=1`, model-loop tests | Live model smoke for brokered read/write prompts. |
-| A5 first real model adapter brokered mode | Fallback model loop can emit/resume brokered calls from static safe schemas | model-loop tests in `tests/test_foundry_brokered_protocol.py` | Deployed real model read and write prompts, including declined/policy/error outcomes. |
+| A5 first real model adapter brokered mode | Model loop supports sequential brokered calls, local instruction skills, and bounded hosted dialogue | `tests/test_foundry_brokered_protocol.py`, `tests/test_foundry_tool_workflows.py` | Deployed real model read and write prompts, including policy/error outcomes. |
 | A6 live Orka integration | Not proven in this repo state | Local AgentKit/Foundry side helpers exist | Deploy AgentKit and Orka hosted-Responses adapter; run brokered read/write approval smoke. |
-| A7 Fibey | Not started; gates not satisfied | N/A | Requires A3/A5/A6 live gates first, then Fibey schemas/instructions/scenario. |
+| A7 Fibey | Runtime supports packaged skills and sequential tool workflows | Catalog/ACP/MAF skill tests and hosted workflow tests | Package the Fibey skills and schemas, then validate the deployed scenario. |
 | A8 hardening/docs/review | Local docs/tests/autoreview complete for current patch | This doc, `docs/agent-abi.md`, `docs/runtime-capabilities.md`; full tests/lint; `$autoreview` clean | Record live transcript and Orka/Fibey validation evidence before final completion. |
 
 Local verification commands used for the current AgentKit patch:
