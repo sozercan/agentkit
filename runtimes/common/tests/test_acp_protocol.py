@@ -7,7 +7,8 @@ import json
 import os
 import queue
 import threading
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import TracebackType
 from typing import Any
@@ -50,7 +51,7 @@ def _set_provider_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(acp.ACP_PROVIDER_TOKEN_ENV, "provider-session-token")
 
 
-def _initialize(request_id: int = 1) -> dict[str, Any]:
+def _initialize(request_id: int | str = 1) -> dict[str, Any]:
     return {
         "jsonrpc": "2.0",
         "id": request_id,
@@ -66,7 +67,7 @@ def _initialize(request_id: int = 1) -> dict[str, Any]:
     }
 
 
-def _new_session(request_id: int = 2, *, mcp_servers: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+def _new_session(request_id: int | str = 2, *, mcp_servers: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     return {
         "jsonrpc": "2.0",
         "id": request_id,
@@ -78,7 +79,7 @@ def _new_session(request_id: int = 2, *, mcp_servers: list[dict[str, Any]] | Non
     }
 
 
-def _prompt(request_id: int, session_id: str, text: str) -> dict[str, Any]:
+def _prompt(request_id: int | str, session_id: str, text: str) -> dict[str, Any]:
     return _prompt_content(
         request_id,
         session_id,
@@ -87,7 +88,7 @@ def _prompt(request_id: int, session_id: str, text: str) -> dict[str, Any]:
 
 
 def _prompt_content(
-    request_id: int,
+    request_id: int | str,
     session_id: str,
     content: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -245,8 +246,11 @@ class FeedingReader:
     def readline(self, limit: int) -> bytes:  # noqa: ARG002
         return self.lines.get()
 
-    def feed(self, message: dict[str, Any]) -> None:
-        self.lines.put(json.dumps(message, separators=(",", ":")).encode() + b"\n")
+    def feed(self, message: Any) -> None:
+        self.feed_line(json.dumps(message, separators=(",", ":")).encode() + b"\n")
+
+    def feed_line(self, line: bytes) -> None:
+        self.lines.put(line)
 
     def close(self) -> None:
         self.lines.put(b"")
@@ -287,19 +291,393 @@ class RecordingWriter:
             return list(self.parsed_messages)
 
 
-async def _wait_for_stdio_response(writer: RecordingWriter, request_id: int) -> dict[str, Any]:
+async def _wait_for_stdio_response(
+    writer: RecordingWriter,
+    request_id: int | str | None,
+    *,
+    occurrence: int = 1,
+) -> dict[str, Any]:
     async def wait() -> dict[str, Any]:
         while True:
             # Sleeping until a write avoids starving the writer thread with
             # repeated list scans. Clear before reading to retain racing writes.
             writer.updated.clear()
-            matches = [message for message in writer.messages() if message.get("id") == request_id]
-            if matches:
-                assert len(matches) == 1
-                return matches[0]
+            matches = [
+                message
+                for message in writer.messages()
+                if "id" in message and message["id"] == request_id
+            ]
+            if len(matches) >= occurrence:
+                assert len(matches) == occurrence
+                return matches[-1]
             await writer.updated.wait()
 
     return await asyncio.wait_for(wait(), timeout=5)
+
+
+@asynccontextmanager
+async def _stdio_connection(
+    factory: RecordingFactory,
+) -> AsyncIterator[tuple[FeedingReader, RecordingWriter]]:
+    reader = FeedingReader()
+    writer = RecordingWriter()
+    serve_task = asyncio.create_task(
+        acp.serve_acp_stdio(_spec(), factory, reader=reader, writer=writer)
+    )
+    try:
+        yield reader, writer
+    finally:
+        reader.close()
+        await asyncio.wait_for(serve_task, timeout=5)
+
+
+async def _assert_stdio_recovery(
+    reader: FeedingReader,
+    writer: RecordingWriter,
+    factory: RecordingFactory,
+    runtime: RecordingRuntime,
+) -> None:
+    # Rejected input must not construct a runtime or reach its provider/tool clients.
+    assert factory.specs == []
+    assert runtime.entered == 0
+    assert runtime.requests == []
+
+    reader.feed(_new_session(90))
+    created = await _wait_for_stdio_response(writer, 90)
+    session_id = created["result"]["sessionId"]
+    reader.feed(_prompt(91, session_id, "after rejection"))
+    completed = await _wait_for_stdio_response(writer, 91)
+
+    assert completed["result"] == {"stopReason": "end_turn"}
+    assert len(factory.specs) == 1
+    assert runtime.entered == 1
+    assert runtime.requests == [
+        RunRequest(prompt="after rejection", history=(), session_id=session_id),
+    ]
+    assert [message for message in writer.messages() if "method" in message] == [
+        {
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "recovered"},
+                },
+            },
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    ("message", "response_id", "code"),
+    [
+        pytest.param(b'{"jsonrpc":', None, -32700, id="malformed-json"),
+        pytest.param(b"\xff", None, -32700, id="invalid-utf8"),
+        pytest.param(None, None, -32600, id="null-envelope"),
+        pytest.param([_initialize()], None, -32600, id="batch-envelope"),
+        pytest.param({"id": 9, "method": "initialize"}, 9, -32600, id="missing-jsonrpc"),
+        pytest.param({**_initialize(9), "jsonrpc": "1.0"}, 9, -32600, id="wrong-jsonrpc"),
+        pytest.param({"jsonrpc": "1.0", "id": []}, None, -32600, id="bad-envelope-and-id"),
+        pytest.param({"jsonrpc": "2.0", "id": 9}, 9, -32600, id="missing-method"),
+        pytest.param({**_initialize(9), "method": ""}, 9, -32600, id="empty-method"),
+        pytest.param({**_initialize(9), "method": 1}, 9, -32600, id="non-string-method"),
+        pytest.param({**_initialize(9), "method": "unknown/method"}, 9, -32601, id="unknown-method"),
+        pytest.param({**_initialize(9), "params": []}, 9, -32602, id="non-object-params"),
+        *[
+            pytest.param({**_initialize(), "id": value}, None, -32600, id=f"{name}-id")
+            for name, value in [
+                ("null", None),
+                ("boolean", True),
+                ("fractional", 1.5),
+                ("array", []),
+                ("object", {}),
+            ]
+        ],
+    ],
+)
+def test_stdio_rejects_invalid_messages_and_recovers(monkeypatch, message, response_id, code):
+    _set_provider_environment(monkeypatch)
+    runtime = RecordingRuntime([RunResult("recovered")])
+    factory = RecordingFactory(lambda: runtime)
+
+    async def exercise() -> None:
+        async with _stdio_connection(factory) as (reader, writer):
+            if isinstance(message, bytes):
+                reader.feed_line(message + b"\n")
+            else:
+                reader.feed(message)
+            rejected = await _wait_for_stdio_response(writer, response_id)
+            assert set(rejected) == {"jsonrpc", "id", "error"}
+            assert rejected["jsonrpc"] == "2.0"
+            assert rejected["error"]["code"] == code
+            assert writer.messages() == [rejected]
+
+            reader.feed(_initialize("valid-initialize"))
+            initialized = await _wait_for_stdio_response(writer, "valid-initialize")
+            assert initialized["result"]["protocolVersion"] == 1
+            await _assert_stdio_recovery(reader, writer, factory, runtime)
+        assert runtime.exited == 1
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    "version",
+    [
+        pytest.param(None, id="missing-version"),
+        pytest.param(0, id="old-version"),
+        pytest.param(2, id="future-version"),
+        pytest.param("1", id="string-version"),
+        pytest.param(True, id="boolean-version"),
+        pytest.param(1.0, id="float-version"),
+    ],
+)
+def test_stdio_rejects_protocol_versions_without_initializing(monkeypatch, version):
+    _set_provider_environment(monkeypatch)
+    runtime = RecordingRuntime([RunResult("recovered")])
+    factory = RecordingFactory(lambda: runtime)
+
+    async def exercise() -> None:
+        async with _stdio_connection(factory) as (reader, writer):
+            request = _initialize()
+            if version is None:
+                del request["params"]["protocolVersion"]
+            else:
+                request["params"]["protocolVersion"] = version
+            reader.feed(request)
+            rejected = await _wait_for_stdio_response(writer, 1)
+            assert rejected["error"]["code"] == -32602
+
+            reader.feed(_new_session())
+            uninitialized = await _wait_for_stdio_response(writer, 2)
+            assert uninitialized["error"] == {
+                "code": -32600,
+                "message": "initialize must complete before session/new",
+            }
+            reader.feed(_initialize(3))
+            initialized = await _wait_for_stdio_response(writer, 3)
+            assert initialized["result"]["protocolVersion"] == 1
+            await _assert_stdio_recovery(reader, writer, factory, runtime)
+        assert runtime.exited == 1
+
+    asyncio.run(exercise())
+
+
+def test_stdio_rejects_session_before_initialize_and_recovers(monkeypatch):
+    _set_provider_environment(monkeypatch)
+    runtime = RecordingRuntime([RunResult("recovered")])
+    factory = RecordingFactory(lambda: runtime)
+
+    async def exercise() -> None:
+        async with _stdio_connection(factory) as (reader, writer):
+            reader.feed(_new_session())
+            rejected = await _wait_for_stdio_response(writer, 2)
+            assert rejected["error"] == {
+                "code": -32600,
+                "message": "initialize must complete before session/new",
+            }
+            reader.feed(_initialize())
+            initialized = await _wait_for_stdio_response(writer, 1)
+            assert initialized["result"]["protocolVersion"] == 1
+            await _assert_stdio_recovery(reader, writer, factory, runtime)
+        assert runtime.exited == 1
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("request_id", [3, "active-prompt"])
+def test_stdio_duplicate_active_id_preserves_original_prompt(monkeypatch, request_id):
+    _set_provider_environment(monkeypatch)
+
+    class GatedRuntime(RecordingRuntime):
+        def __init__(self) -> None:
+            super().__init__([RunResult("original answer"), RunResult("next answer")])
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def run(self, request: RunRequest) -> RunResult:
+            result = await super().run(request)
+            if len(self.requests) == 1:
+                self.started.set()
+                await self.release.wait()
+            return result
+
+    async def exercise() -> None:
+        runtime = GatedRuntime()
+        factory = RecordingFactory(lambda: runtime)
+        async with _stdio_connection(factory) as (reader, writer):
+            try:
+                reader.feed(_initialize())
+                await _wait_for_stdio_response(writer, 1)
+                reader.feed(_new_session())
+                created = await _wait_for_stdio_response(writer, 2)
+                session_id = created["result"]["sessionId"]
+
+                reader.feed(_prompt(request_id, session_id, "original prompt"))
+                await asyncio.wait_for(runtime.started.wait(), timeout=5)
+                reader.feed(_prompt(request_id, session_id, "duplicate prompt"))
+                rejected = await _wait_for_stdio_response(writer, request_id)
+                assert rejected["error"] == {
+                    "code": -32600,
+                    "message": "duplicate active JSON-RPC id",
+                }
+                assert len(runtime.requests) == 1
+                assert runtime.discarded_sessions == []
+                assert not any("method" in message for message in writer.messages())
+
+                runtime.release.set()
+                original = await _wait_for_stdio_response(writer, request_id, occurrence=2)
+                assert original["result"] == {"stopReason": "end_turn"}
+
+                reader.feed(_prompt(4, session_id, "next prompt"))
+                completed = await _wait_for_stdio_response(writer, 4)
+                assert completed["result"] == {"stopReason": "end_turn"}
+                assert runtime.requests == [
+                    RunRequest(prompt="original prompt", history=(), session_id=session_id),
+                    RunRequest(
+                        prompt="next prompt",
+                        history=(
+                            ConversationTurn(role="user", text="original prompt"),
+                            ConversationTurn(role="assistant", text="original answer"),
+                        ),
+                        session_id=session_id,
+                    ),
+                ]
+                assert runtime.discarded_sessions == []
+                assert len(factory.specs) == 1
+                assert [
+                    message
+                    for message in writer.messages()
+                    if message.get("id") == request_id
+                ] == [rejected, original]
+                assert [
+                    message["params"]["update"]["content"]["text"]
+                    for message in writer.messages()
+                    if message.get("method") == "session/update"
+                ] == ["original answer", "next answer"]
+            finally:
+                runtime.release.set()
+        assert runtime.exited == 1
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("params", "supports_http_mcp"),
+    [
+        pytest.param({"cwd": None}, True, id="null-cwd"),
+        pytest.param({"cwd": ""}, True, id="empty-cwd"),
+        pytest.param({"cwd": "."}, True, id="relative-cwd"),
+        pytest.param({"cwd": "/different-workspace"}, True, id="different-cwd"),
+        pytest.param({"additionalDirectories": [os.getcwd()]}, True, id="extra-directory"),
+        pytest.param({"additionalDirectories": "workspace"}, True, id="non-array-directories"),
+        pytest.param({"mcpServers": {}}, True, id="non-array-mcp"),
+        pytest.param(
+            {"mcpServers": [_orka_mcp_server(), {**_orka_mcp_server(), "name": "second"}]},
+            True,
+            id="multiple-mcp-servers",
+        ),
+        pytest.param({"mcpServers": [None]}, True, id="non-object-mcp"),
+        pytest.param(
+            {"mcpServers": [{**_orka_mcp_server(), "type": "stdio", "command": "tool"}]},
+            True,
+            id="unsupported-mcp-transport",
+        ),
+        pytest.param(
+            {"mcpServers": [{**_orka_mcp_server(), "command": "tool"}]},
+            True,
+            id="mcp-process-fields",
+        ),
+        pytest.param(
+            {"mcpServers": [{**_orka_mcp_server(), "name": ""}]},
+            True,
+            id="empty-mcp-name",
+        ),
+        pytest.param(
+            {"mcpServers": [_orka_mcp_server("https://example.com/mcp")]},
+            True,
+            id="external-mcp-url",
+        ),
+        pytest.param(
+            {"mcpServers": [_orka_mcp_server("http://127.0.0.1:bad/mcp")]},
+            True,
+            id="malformed-mcp-url",
+        ),
+        pytest.param(
+            {"mcpServers": [{**_orka_mcp_server(), "headers": {}}]},
+            True,
+            id="non-array-mcp-headers",
+        ),
+        pytest.param(
+            {"mcpServers": [{**_orka_mcp_server(), "headers": [None]}]},
+            True,
+            id="non-object-mcp-header",
+        ),
+        pytest.param(
+            {
+                "mcpServers": [{
+                    **_orka_mcp_server(),
+                    "headers": [
+                        {"name": "Authorization", "value": "Bearer first"},
+                        {"name": "authorization", "value": "Bearer second"},
+                    ],
+                }],
+            },
+            True,
+            id="duplicate-mcp-authorization",
+        ),
+        pytest.param(
+            {
+                "mcpServers": [{
+                    **_orka_mcp_server(),
+                    "headers": [{"name": "Authorization", "value": "Bearer token\r\nextra"}],
+                }],
+            },
+            True,
+            id="mcp-header-control-characters",
+        ),
+        pytest.param(
+            {
+                "mcpServers": [{
+                    **_orka_mcp_server(),
+                    "headers": [
+                        *_orka_mcp_server()["headers"],
+                        {"name": "invalid header", "value": "value"},
+                    ],
+                }],
+            },
+            True,
+            id="invalid-mcp-header-name",
+        ),
+        pytest.param(
+            {"mcpServers": [{**_orka_mcp_server(), "headers": []}]},
+            True,
+            id="missing-mcp-authorization",
+        ),
+        pytest.param({"mcpServers": [_orka_mcp_server()]}, False, id="runtime-without-http-mcp"),
+    ],
+)
+def test_stdio_rejects_invalid_session_configuration_and_recovers(
+    monkeypatch, params, supports_http_mcp,
+):
+    _set_provider_environment(monkeypatch)
+    runtime = RecordingRuntime([RunResult("recovered")])
+    factory = RecordingFactory(lambda: runtime, supports_http_mcp=supports_http_mcp)
+
+    async def exercise() -> None:
+        async with _stdio_connection(factory) as (reader, writer):
+            reader.feed(_initialize())
+            await _wait_for_stdio_response(writer, 1)
+            request = _new_session()
+            request["params"].update(params)
+            reader.feed(request)
+            rejected = await _wait_for_stdio_response(writer, 2)
+            assert rejected["error"]["code"] == -32602
+            await _assert_stdio_recovery(reader, writer, factory, runtime)
+        assert runtime.exited == 1
+
+    asyncio.run(exercise())
 
 
 def test_offline_echo_round_trip_uses_canonical_acp_shapes(monkeypatch):

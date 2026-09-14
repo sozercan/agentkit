@@ -37,8 +37,13 @@ The v2 path is strict:
 - Orka sends `AgentConfiguration: null`; the image-bound config is authoritative;
 - provider calls use the supervisor's loopback proxy, and tools use its one
   prompt-scoped loopback HTTP MCP server;
-- the child retains successful user/assistant history for Session continuation
-  and discards cancelled or failed prompt history.
+- the child retains successful user/assistant history for Session continuation.
+
+Before reusing a session after a successful prompt, the caller must use Orka's
+canonical `CreateWorkspaceDelta` operation to validate the workspace, including
+when no files changed. Failure, cancellation, and lease expiry retire the v2
+session. The ACP child's separate history rollback behavior does not make a
+retired supervisor session reusable.
 
 Deploy the composed image as an operator-owned v2 supervisor service, configure
 the standard `ORKA_ACP_*` profile, fence, token-file, and runtime identity
@@ -84,6 +89,75 @@ is not supported for external runtimes; repository input still uses
 See Orka's `website/docs/guides/bring-your-own-agent-runtime.md` and
 `config/samples/core_v1alpha1_agentruntime.yaml` for the registration and
 authentication contract.
+
+## Test the composed v2 runtime
+
+Run the shared offline/live entrypoint from the AgentKit checkout:
+
+```sh
+# Offline defaults to pydantic-ai, microsoft-agent-framework, and langgraph.
+scripts/orka-harness-v2-e2e.sh offline
+scripts/orka-harness-v2-e2e.sh offline microsoft-agent-framework
+
+# Live uses Microsoft Agent Framework and existing local Vekil authentication.
+VEKIL_CACHE_DIR="$HOME/.config/vekil" scripts/orka-harness-v2-e2e.sh live
+```
+
+Run in a Linux shell on the Docker daemon's host so the runner and daemon share
+the temporary registry's loopback address. The runner needs Git, make, curl, jq,
+Go 1.27, and Docker Buildx with a daemon-backed builder. Set `BUILDER` to select that builder. `PLATFORM`
+defaults to `linux/amd64` or `linux/arm64` according to the Docker daemon's
+architecture. Image, registry, and dependency downloads require network access.
+
+Each run fetches Orka at
+[`55cb3d5232b4a9b697e72471e346c0a6493d4c21`](https://github.com/orka-agents/orka/tree/55cb3d5232b4a9b697e72471e346c0a6493d4c21),
+whose `go.mod` declares Go 1.27. A sibling Orka checkout is unnecessary. The runner
+builds AgentKit from the current checkout through the Makefile flow, resolves each
+source agent image through a run-owned registry to an immutable digest, and uses
+that same digest for `AGENTKIT_RUNTIME_IMAGE` and `AGENTKIT_ADAPTER_DIGEST`. It
+composes the image with Orka's official AgentKit Dockerfile. The registered model
+and configuration digest match the baked model and exact `/agent/agent.yaml`
+bytes.
+
+The test driver uses Orka's native v2 client from within the pinned module. Every
+mode runs the production supervisor, real ACP child, framework clients, provider
+proxy, and prompt-scoped MCP proxy. Offline mode supplies deterministic local
+provider and controller/broker fixtures and needs no external model credentials.
+A passing offline run requires these observable results:
+
+- startup, health/capabilities, adapter identity, and the child's private process
+  identity match the registered profile;
+- a provider response carries a unique marker, an allowed MCP tool reaches the
+  broker with the expected arguments and correlation, and its receipt returns
+  to the provider and affects the answer;
+- two successful prompts share a session, with prior user/assistant history
+  appearing exactly once at the provider;
+- injected failures settle as failures, and a confirmed blocked broker call
+  settles on cancellation or lease expiry without a conflicting success;
+- wrong authentication, fences, model, or config identity start no unauthorized
+  provider/tool work, and session cleanup removes the child and private paths.
+
+Live mode uses Copilot through
+`ghcr.io/sozercan/vekil:v0.14.3@sha256:996b628fbe8c7a35d33e9d6bb855f2613228fc5c9b09498dae6ea6b208a0071b`.
+Supply `COPILOT_GITHUB_TOKEN` through the environment, or leave it unset and use
+`VEKIL_CACHE_DIR` for an existing local auth cache. The live assertions require a
+real model response, an MCP tool receipt, and a second successful prompt in the
+same session. Offline scenarios remain the deterministic lifecycle checks.
+Configured authentication, readiness, and inference errors fail the live run.
+CI reports an explicit skip when repository secret access is unavailable; that
+skip is not evidence of live coverage.
+
+Set `ARTIFACT_DIR` to retain sanitized JSON results, for example:
+
+```sh
+ARTIFACT_DIR=/tmp/agentkit-v2-results scripts/orka-harness-v2-e2e.sh offline
+```
+
+Read results by adapter and scenario. They record source/image digests, asserted
+outcomes, and safe diagnostics. Raw transcripts, bearer tokens, and session
+credentials are excluded. The runner removes its containers, networks, registry,
+and temporary resources on success, failure, or interruption. Existing harness
+v1 and OpenAI HTTP smoke checks run separately.
 
 ## Harness v1 observed mode
 
