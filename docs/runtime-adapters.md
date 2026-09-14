@@ -118,7 +118,8 @@ Startup-scoped model clients and long-lived MCP sessions still resolve their own
 startup credentials at runtime initialization; they are not rebuilt for every turn.
 
 - a missing or empty command fails before serving,
-- `AGENTKIT_MCP_TIMEOUT` controls MCP initialization timeout,
+- `AGENTKIT_MCP_TIMEOUT` controls MCP initialization timeout; MAF also uses it
+  for tool requests, including [Orka approval waits](orka-human-approval.md),
 - each tool subprocess receives only env vars declared in that tool's `env`,
 - undeclared `${VAR}` interpolation inside a declared env value is rejected, and
 - tool sessions are entered once for the app lifespan and reused across requests,

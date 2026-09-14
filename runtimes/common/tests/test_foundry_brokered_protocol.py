@@ -1852,15 +1852,15 @@ def test_foundry_brokered_decline_policy_rejection_and_execution_error_are_truth
     cases = [
         (
             {"approved": False, "error": {"code": "approval_declined", "message": "Human declined dispatch-work-order"}},
-            "approval_declined: Human declined dispatch-work-order",
+            "Brokered tool dispatch-work-order: approval_declined: The tool call was declined.",
         ),
         (
             {"approved": False, "error": {"code": "tool_policy_rejected", "message": "writes are disabled"}},
-            "tool_policy_rejected: writes are disabled",
+            "Brokered tool dispatch-work-order was not performed: tool_policy_rejected: writes are disabled",
         ),
         (
             {"approved": False, "error": {"code": "tool_execution_failed", "message": "downstream timed out"}},
-            "tool_execution_failed: downstream timed out",
+            "Brokered tool dispatch-work-order: tool_execution_failed: MCP tool execution failed.",
         ),
     ]
 
@@ -1871,7 +1871,7 @@ def test_foundry_brokered_decline_policy_rejection_and_execution_error_are_truth
             call = _call(initial)
             resp = client.post("/responses", json=_continuation(initial["id"], call["call_id"], payload), headers=CONTINUATION_AUTH)
         assert resp.status_code == 200, resp.text
-        assert _message_text(resp.json()) == f"Brokered tool dispatch-work-order was not performed: {expected}"
+        assert _message_text(resp.json()) == expected
 
 
 def test_foundry_brokered_rejects_multiple_tool_outputs_deterministically():

@@ -43,6 +43,12 @@ and auth wiring. Orka-specific names here describe the protocol contract AgentKi
 exposes; Orka remains responsible for policy, approval, idempotency, and
 side-effect governance.
 
+Orka v2's `supportsBrokeredToolApprovals` registration capability covers
+controller-managed approvals over the ACP child's MCP connection. It is separate
+from AgentKit's unsupported local `tool-approval` capability and the legacy v1
+brokered hooks below. See [Human approval for Orka tools](orka-human-approval.md)
+for the qualified direct MAF and hosted Foundry paths.
+
 ## Current support
 
 | Runtime | Capabilities |
