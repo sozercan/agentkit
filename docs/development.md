@@ -163,7 +163,7 @@ uv run --directory runtimes/common --extra dev pytest -q tests/test_acp_protocol
 
 The optional live job runs `scripts/live-copilot-agent-e2e.sh` when
 `COPILOT_GITHUB_TOKEN` is available and the run is allowed to access repository
-secrets. It uses `ghcr.io/sozercan/vekil:v0.14.3`, pinned by digest, to provide an
+secrets. It uses `ghcr.io/sozercan/vekil:v0.14.10`, pinned by digest, to provide an
 OpenAI-compatible endpoint and validates a real built AgentKit container through
 `/v1/chat/completions`.
 

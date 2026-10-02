@@ -207,7 +207,7 @@ phase=probe-build
 )
 
 registry_image='docker.io/library/registry:3@sha256:1be55279f18a2fe1a74edf2664cac61c1bea305b7b4642dab412e7affdcb3e33'
-vekil_image='ghcr.io/sozercan/vekil:v0.14.3@sha256:996b628fbe8c7a35d33e9d6bb855f2613228fc5c9b09498dae6ea6b208a0071b'
+vekil_image='ghcr.io/sozercan/vekil:v0.14.10@sha256:656eb73f6eeea2ca0c1277cdd7bb8eede72efc5cac2450cdc30a3b94bda44d4b'
 registry_name="$run_id-registry"
 registry_volume="$run_id-registry"
 network_name="$run_id-runtime"

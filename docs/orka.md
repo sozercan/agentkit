@@ -147,7 +147,7 @@ A passing offline run requires these observable results:
   provider/tool work, and session cleanup removes the child and private paths.
 
 Live mode uses Copilot through
-`ghcr.io/sozercan/vekil:v0.14.3@sha256:996b628fbe8c7a35d33e9d6bb855f2613228fc5c9b09498dae6ea6b208a0071b`.
+`ghcr.io/sozercan/vekil:v0.14.10@sha256:656eb73f6eeea2ca0c1277cdd7bb8eede72efc5cac2450cdc30a3b94bda44d4b`.
 Supply `COPILOT_GITHUB_TOKEN` through the environment, or leave it unset and use
 `VEKIL_CACHE_DIR` for an existing local auth cache. The live assertions require a
 real model response, an MCP tool receipt, and a second successful prompt in the
